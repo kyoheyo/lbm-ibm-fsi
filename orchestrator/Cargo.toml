@@ -8,12 +8,21 @@ description = "Rust orchestrator for the LBM+IBM+FSI solver"
 name = "lbm-ibm-fsi"
 path = "src/main.rs"
 
+[features]
+# Enable direct Python FFI via pyo3 (requires Python ≥ 3.11 dev headers).
+# When this feature is active the Rust binary embeds a Python interpreter and
+# can call lbm_pre / lbm_post functions in-process without creating temporary
+# files.  Build with: cargo build --features python-ffi
+python-ffi = ["dep:pyo3"]
+
 [dependencies]
 lbm-bindings = { path = "../bindings" }
 serde        = { version = "1", features = ["derive"] }
 toml         = "0.8"
 clap         = { version = "4", features = ["derive"] }
 anyhow       = "1"
+zip          = { version = "2.4", default-features = false, features = ["deflate"] }
+pyo3         = { version = "0.23", features = ["auto-initialize"], optional = true }
 
 [dev-dependencies]
 approx = "0.5"

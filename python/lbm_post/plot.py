@@ -203,7 +203,9 @@ def plot_vorticity(
 
     if symmetric:
         v = np.abs(omega).max()
-        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v)
+        # Guard against all-zero vorticity (e.g. uniform flow) where
+        # TwoSlopeNorm would receive vmin == vcenter == vmax == 0.
+        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v) if v > 0 else None
     else:
         norm = None
 
