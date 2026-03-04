@@ -24,9 +24,14 @@ mod ffi {
         Mrt = 1,
     }
 
-    /// 指向堆上 `lbm::LatticeGrid` 的不透明句柄
+    /// 指向堆上 `lbm::LatticeGrid` 的不透明句柄。
+    ///
+    /// 用空枚举（没有任何变体的 enum）而非 `struct LatticeGridHandle;`，
+    /// 是因为空枚举永远无法被实例化——Rust 编译器会在编译期阻止任何试图
+    /// 构造 `LatticeGridHandle` 值的代码。这从类型层面强制：只能持有指针，
+    /// 不能直接创建或解引用内部内容，与 C++ 的"前向声明不完整类型"等价。
     pub enum LatticeGridHandle {}
-    /// 指向堆上 `lbm::Solver` 的不透明句柄
+    /// 指向堆上 `lbm::Solver` 的不透明句柄（原理同 `LatticeGridHandle`）。
     pub enum SolverHandle {}
 
     /// 插件 ABI 使用的 C 兼容函数指针类型
@@ -95,6 +100,7 @@ pub enum CollisionModel {
 
 impl From<LatticeModel> for ffi::LatticeModelC {
     fn from(m: LatticeModel) -> Self {
+        // match 穷举所有变体，确保未来新增变体时编译期报错而非运行时 bug
         match m {
             LatticeModel::D2Q9  => ffi::LatticeModelC::D2Q9,
             LatticeModel::D3Q19 => ffi::LatticeModelC::D3Q19,
@@ -105,6 +111,7 @@ impl From<LatticeModel> for ffi::LatticeModelC {
 
 impl From<CollisionModel> for ffi::CollisionModelC {
     fn from(c: CollisionModel) -> Self {
+        // 通过 From trait 实现类型转换，调用方只需写 .into()，无需接触 ffi 模块内部类型
         match c {
             CollisionModel::Bgk => ffi::CollisionModelC::Bgk,
             CollisionModel::Mrt => ffi::CollisionModelC::Mrt,
@@ -125,8 +132,13 @@ unsafe impl Send for LbmGrid {}
 impl LbmGrid {
     pub fn new(nx: i32, ny: i32, nz: i32, model: LatticeModel) -> Self {
         let ptr = unsafe {
+            // model.into() 调用上方定义的 From<LatticeModel> for ffi::LatticeModelC，
+            // 将公开的安全枚举转换为 C ABI 使用的 #[repr(C)] 枚举，再传给 C++ 侧
             ffi::lbm_grid_new(nx, ny, nz, model.into())
         };
+        // assert! 在这里充当"安全网"：lbm_grid_new 只在内存不足或参数非法时返回 null，
+        // 提前以 panic 捕获失败（这属于编程错误，而非可恢复的运行时条件）。
+        // 若需要可恢复的错误处理，可将 new() 改为返回 Result<Self, &'static str>。
         assert!(!ptr.is_null(), "lbm_grid_new returned null");
         LbmGrid { ptr }
     }
@@ -139,7 +151,10 @@ impl LbmGrid {
     pub fn ux (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_ux (self.ptr, idx) } }
     pub fn uy (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_uy (self.ptr, idx) } }
 
-    /// 原始可变指针 — 仅供 `LbmSolver::step` 内部使用
+    /// 原始可变指针 — 仅供 `LbmSolver::step` 内部使用。
+    ///
+    /// `pub(crate)` 是 Rust 的受限可见性：此方法只在当前 crate（即 `lbm_bindings`）
+    /// 内部可见，外部使用者无法直接拿到裸指针，从而防止绕过安全封装。
     pub(crate) fn as_mut_ptr(&mut self) -> *mut ffi::LatticeGridHandle {
         self.ptr
     }
@@ -194,6 +209,10 @@ impl Drop for LbmSolver {
 /// 通过 `PluginCallbacks::default()` 构建，然后填入所需的字段，
 /// 最后调用 [`register_plugins`] 注册。
 ///
+/// `#[derive(Default)]`：自动生成 `default()` 方法，将所有 `Option` 字段初始化为
+/// `None`，将所有 `*mut c_void` 字段初始化为 `std::ptr::null_mut()`。
+/// 这样调用方只需填写需要激活的回调，其余字段保持默认值（空操作）。
+///
 /// # 示例
 ///
 /// ```no_run
@@ -234,6 +253,9 @@ pub struct PluginCallbacks {
 
 // SAFETY: PluginCallbacks 内部的原始指针是不透明的用户数据指针，
 // 其线程安全性由调用方负责保证。
+// `unsafe impl Send` 允许将此结构体的所有权转移到其他线程；
+// `unsafe impl Sync` 允许多个线程同时持有其不可变引用（读取函数指针）。
+// 两者都是"我作为封装作者承诺已手动验证安全性"的显式声明。
 unsafe impl Send for PluginCallbacks {}
 unsafe impl Sync for PluginCallbacks {}
 

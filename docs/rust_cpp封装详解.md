@@ -19,6 +19,8 @@
 10. [内存安全深度分析](#10-内存安全深度分析)
 11. [常见构建问题与解决方案](#11-常见构建问题与解决方案)
 12. [完整调用链一览](#12-完整调用链一览)
+13. [Rust 语言特性速查——读懂 `bindings/src/lib.rs`](#13-rust-语言特性速查读懂-bindingssrclibrs)
+14. [C++ 语言特性速查——读懂 `lbm_capi.cpp` 与 `solver.cpp`](#14-c-语言特性速查读懂-lbm_capicpp-与-solvercpp)
 
 ---
 
@@ -808,6 +810,270 @@ Rust: solver.step 返回，grid 中的 rho/u 已更新
 - **Rust 不知道 C++ 类的内存布局**，只通过不透明句柄访问。
 
 这就是"C ABI 桥"的全部精髓：**两种语言只在 C 函数调用这个最小公共接口上相遇，其余细节各自隐藏**。
+
+---
+
+## 13 Rust 语言特性速查——读懂 `bindings/src/lib.rs`
+
+> 本节面向对 Rust 语法尚不熟悉的读者，逐条解释 `lib.rs` 中出现的关键 Rust 特性。
+
+### 13.1 `#[repr(C)]` — 内存布局控制
+
+```rust
+#[repr(C)]
+pub enum LatticeModelC {
+    D2Q9  = 0,
+    D3Q19 = 1,
+    D3Q27 = 2,
+}
+```
+
+**默认情况下**，Rust 编译器可以任意调整枚举的内存表示（大小、变体编号、对齐方式），以便优化。这在纯 Rust 程序中没问题，但如果要把枚举值传给 C/C++ 函数，双方必须对"这个 `int` 代表哪个值"达成一致。
+
+`#[repr(C)]` 告诉 Rust 编译器：**按 C 的规则布局这个类型**，即变体从 0 开始连续编号，大小与 C 的 `int` 一致。这样 Rust 的 `LatticeModelC::D2Q9` 与 C++ 的 `lbm::LatticeModel::D2Q9`（值为 0）就完全对应，跨 ABI 边界传递时不会产生误解。
+
+**结论**：凡是要跨 FFI 边界传递的枚举，都必须加 `#[repr(C)]`。
+
+### 13.2 空枚举 `{}` — 不透明类型的惯用法
+
+```rust
+pub enum LatticeGridHandle {}  // 没有任何变体
+```
+
+**为什么不用 `struct LatticeGridHandle;`（单元结构体）？**
+
+- 单元结构体可以被实例化：`let _ = LatticeGridHandle;` 合法。
+- 空枚举**永远无法被实例化**（没有任何变体可以构造），Rust 编译器在编译期就会阻止任何试图创建它的代码。
+
+这等价于 C/C++ 中的"不完整类型前向声明"：
+
+```c
+// C 侧：只声明结构存在，不给出定义，外部代码只能持有指针
+struct LatticeGrid;
+typedef struct LatticeGrid LatticeGrid;
+```
+
+Rust 侧通过空枚举达到同样效果：**只能持有 `*mut LatticeGridHandle` 指针，不能创建或解引用**。
+
+### 13.3 裸指针 `*mut T` vs 引用 `&mut T`
+
+| 特性 | 裸指针 `*mut T` | 可变引用 `&mut T` |
+|------|----------------|-----------------|
+| 可为 null | ✓（需手动检查） | ✗（引用永远非空） |
+| 借用检查 | 无（`unsafe` 中使用） | 编译器强制执行 |
+| 生命周期追踪 | 无 | 编译器追踪 |
+| 典型用途 | FFI 边界、底层内存操作 | 普通 Rust 代码 |
+
+在 `LbmGrid` 中，`ptr: *mut ffi::LatticeGridHandle` 是裸指针，因为：
+1. C++ 返回 `LatticeGrid*`，可能为 null（分配失败）；
+2. 裸指针的使用必须在 `unsafe` 块内，提醒开发者这里需要额外注意安全性；
+3. Rust 的借用检查器不知道 C++ 对象的生命周期，必须由封装代码（`Drop`）手动管理。
+
+### 13.4 `impl From<A> for B` 与 `.into()` 语法糖
+
+```rust
+impl From<LatticeModel> for ffi::LatticeModelC {
+    fn from(m: LatticeModel) -> Self { … }
+}
+
+// 使用时：
+ffi::lbm_grid_new(nx, ny, nz, model.into())
+//                              ^^^^^^^^^^
+//                              编译器自动推断：需要 ffi::LatticeModelC，
+//                              LatticeModel 实现了 From<LatticeModel>，
+//                              因此调用 ffi::LatticeModelC::from(model)
+```
+
+`Into<T>` trait 是 `From<T>` 的镜像：只要实现了 `From<A> for B`，Rust 就会自动实现 `Into<B> for A`，所以 `model.into()` 等价于 `ffi::LatticeModelC::from(model)`。
+
+好处：调用者（第七层 orchestrator）不需要写任何转换代码，也不需要 `use` 引入 `ffi` 模块的内部类型。
+
+### 13.5 `impl Drop` — Rust 的 RAII
+
+```rust
+impl Drop for LbmGrid {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_grid_free(self.ptr) };
+    }
+}
+```
+
+`Drop` trait 是 Rust 实现 RAII（资源获取即初始化）的机制：**当变量离开作用域时，Rust 编译器自动调用 `drop()`**。
+
+与 C++ 的析构函数完全对应：
+
+```cpp
+// C++ 等价
+~LatticeGrid() { /* 自动析构，释放 vector 内存 */ }
+```
+
+Rust 保证：
+- `drop` 在变量生命周期结束时**恰好调用一次**（不会遗漏，也不会双重释放）；
+- `drop` 之后，Rust 的移动语义确保不再能访问已释放的 `ptr`（与 C++ 不同，C++ 析构后指针仍在作用域内）。
+
+### 13.6 `unsafe impl Send` / `unsafe impl Sync`
+
+```rust
+unsafe impl Send for LbmGrid {}
+```
+
+Rust 默认规定：**含有裸指针的类型不能跨线程传递**（`*mut T` 没有实现 `Send`）。这是因为编译器无法自动证明裸指针跨线程安全。
+
+`unsafe impl Send` 是封装作者对编译器的承诺：_"我已手动验证，这个类型跨线程传递是安全的（前提是调用方保证同步）"_。
+
+- `Send`：类型的**所有权**可以转移到其他线程；
+- `Sync`：类型的**不可变引用**可以被多个线程同时持有。
+
+加了 `unsafe` 的 `impl` 会绕过编译器的自动检查，因此必须由开发者负责正确性。
+
+### 13.7 `pub(crate)` 可见性
+
+```rust
+pub(crate) fn as_mut_ptr(&mut self) -> *mut ffi::LatticeGridHandle { … }
+```
+
+Rust 的可见性修饰符从窄到宽：
+
+| 修饰符 | 可见范围 |
+|--------|---------|
+| （无修饰） | 当前模块及其子模块 |
+| `pub(crate)` | 当前 crate 内所有模块 |
+| `pub(super)` | 父模块 |
+| `pub` | 任意外部 crate |
+
+`as_mut_ptr` 返回裸指针，只应在 `LbmSolver::step()` 内部调用，不应暴露给外部使用者。`pub(crate)` 精确表达了这一意图，同时允许同一 crate 内的 `LbmSolver` 调用它。
+
+### 13.8 `#[derive(Default)]` — 自动派生默认值
+
+```rust
+#[derive(Default, Clone, Copy)]
+pub struct PluginCallbacks { … }
+```
+
+`#[derive(Default)]` 让 Rust 自动生成 `PluginCallbacks::default()` 方法：
+- `Option<…>` 字段 → `None`
+- `*mut c_void` 字段 → `std::ptr::null_mut()`（空指针）
+
+这样调用方可以：
+
+```rust
+let mut cbs = PluginCallbacks::default();  // 所有插件均为"未注册"状态
+cbs.boundary_fn = Some(my_bc);             // 只激活边界条件插件
+register_plugins(cbs);
+```
+
+而不需要手动初始化每一个字段。
+
+---
+
+## 14 C++ 语言特性速查——读懂 `lbm_capi.cpp` 与 `solver.cpp`
+
+> 本节面向对 C++ 尚不熟悉的读者，逐条解释核心 C++ 代码中的关键特性。
+
+### 14.1 `extern "C"` — 禁止名称修饰
+
+```cpp
+extern "C" {
+    lbm::LatticeGrid* lbm_grid_new(int nx, int ny, int nz, int model_id);
+}
+```
+
+C++ 编译器默认对函数名进行"名称修饰"（name mangling），在符号表中写入包含参数类型的复杂名称，例如：
+
+```
+_ZN3lbm6Solver4stepEv   // ← GCC 对 lbm::Solver::step() 的修饰名
+```
+
+`extern "C"` 告诉编译器：**这个函数按 C 规则导出，符号名就是函数名本身**：
+
+```
+lbm_grid_new            // ← 稳定的 C 符号名，Rust 能直接声明
+```
+
+没有 `extern "C"` 时，每次重新编译或换编译器都可能产生不同的修饰名，Rust 链接器就找不到这些符号。
+
+### 14.2 `new (std::nothrow)` — 异常安全的堆分配
+
+```cpp
+return new (std::nothrow) lbm::LatticeGrid(nx, ny, nz, model);
+//         ^^^^^^^^^^^^^ "nothrow placement new"
+```
+
+普通 `new T(…)` 在内存分配失败时会**抛出 `std::bad_alloc` 异常**。问题是：C ABI 边界没有异常处理机制——如果异常从 C++ 函数传播到 Rust 代码，行为是**未定义的**（通常直接崩溃）。
+
+`new (std::nothrow)` 是 C++ 标准库提供的"不抛异常版本"：内存不足时返回 `nullptr` 而非抛出异常。调用方（Rust 侧）通过检查返回值是否为 `nullptr` 来处理失败。
+
+**规则**：凡是在 `extern "C"` 函数内分配内存，必须用 `new (std::nothrow)` 或 `try/catch` 捕获所有异常，防止异常逃逸到 C ABI 边界。
+
+### 14.3 `static_cast<T>` — C++ 安全类型转换
+
+```cpp
+auto model = static_cast<lbm::LatticeModel>(model_id);
+```
+
+C++ 提供四种类型转换运算符（比 C 风格的 `(T)x` 更安全）：
+
+| 运算符 | 用途 |
+|--------|------|
+| `static_cast<T>` | 编译期已知的合法转换（`int → enum`，`double → float` 等） |
+| `dynamic_cast<T>` | 运行时多态向下转型（需要虚函数表） |
+| `reinterpret_cast<T>` | 位级重新解释（最危险，慎用） |
+| `const_cast<T>` | 去除/添加 `const` 修饰 |
+
+`static_cast<lbm::LatticeModel>(model_id)` 将 `int` 转为枚举，编译器会检查转换是否合法。注意：C++ 不检查枚举值是否在有效范围内，因此代码在 `static_cast` 之前先做了范围检查：
+
+```cpp
+if (model_id < 0 || model_id > 2) return nullptr;  // 先验证，再转换
+auto model = static_cast<lbm::LatticeModel>(model_id);
+```
+
+### 14.4 `const T*` vs `T*` — const 正确性
+
+```cpp
+int lbm_grid_nx(const lbm::LatticeGrid* g) { return g ? g->nx : 0; }
+//              ^^^^^
+double lbm_grid_rho(const lbm::LatticeGrid* g, int idx) { … }
+```
+
+- `const lbm::LatticeGrid* g`：指针 `g` 指向的对象是只读的，函数不能通过 `g` 修改 `LatticeGrid` 的内容。
+- `lbm::LatticeGrid* g`：函数可能修改 `LatticeGrid` 的内容（例如 `lbm_solver_step`）。
+
+在 Rust 侧，这对应：
+- `*const LatticeGridHandle` → `const T*`（只读）
+- `*mut LatticeGridHandle` → `T*`（可读写）
+
+遵循 const 正确性的好处：编译器能在编译期发现"不该修改却修改了"的错误，而不是等到运行时。
+
+### 14.5 局部静态单例模式
+
+```cpp
+static PluginRegistry& instance() {
+    static PluginRegistry reg;  // 局部静态变量
+    return reg;
+}
+```
+
+这是 C++11 引入的**线程安全局部静态初始化**（也称 Meyers Singleton）：
+
+1. **首次调用** `instance()` 时，`reg` 被构造，并一直存活到程序结束；
+2. C++11 标准保证：如果多个线程同时第一次调用 `instance()`，构造过程是线程安全的（编译器生成必要的互斥锁）；
+3. **后续调用**直接返回已构造的引用，无额外开销。
+
+与普通全局变量相比，局部静态单例的优势是**初始化顺序有保证**：只有在第一次调用时才初始化，不存在"全局对象初始化顺序不确定"（Static Initialization Order Fiasco）的问题。
+
+### 14.6 `[[nodiscard]]` — 强制检查返回值
+
+```cpp
+[[nodiscard]] int size() const { return nx * ny * nz; }
+```
+
+C++17 的 `[[nodiscard]]` 属性告诉编译器：**调用方必须使用这个函数的返回值**。如果调用方写了：
+
+```cpp
+grid.size();  // ← 返回值被丢弃，没有用于任何计算
+```
+
+编译器会产生警告（`warning: ignoring return value`）。这防止了常见错误，例如忘记检查 `lbm_grid_new` 的返回值是否为 `nullptr`。
 
 ---
 
