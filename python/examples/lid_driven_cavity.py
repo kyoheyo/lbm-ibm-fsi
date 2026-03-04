@@ -25,7 +25,19 @@ Run::
 Outputs are written to  examples/output/lid_cavity/ .
 """
 
+import sys
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Path bootstrap: ensure lbm_pre / lbm_post are importable regardless of the
+# working directory from which this script is invoked.
+# __file__ → .../python/examples/lid_driven_cavity.py
+# .parent  → .../python/examples/
+# .parent  → .../python/          ← the package root
+# ---------------------------------------------------------------------------
+_PYTHON_DIR = Path(__file__).resolve().parent.parent
+if str(_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR))
 
 OUTPUT_DIR = Path(__file__).parent / "output" / "lid_cavity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,12 +60,16 @@ print(f"[1/5] Config written → {config_path}")
 from lbm_pre.mesh import MeshBuilder
 
 mesh_path = OUTPUT_DIR / "domain.msh"
-with MeshBuilder(100, 100).set_mesh_size(5.0) as mb:
-    mb.build().write(mesh_path)
-info = mb.info() if mb._built else None
-print(f"[2/5] Mesh written  → {mesh_path}")
-if info is not None:
-    print(f"      nodes={info.n_nodes}  elements={info.n_elements}")
+try:
+    with MeshBuilder(100, 100).set_mesh_size(5.0) as mb:
+        mb.build().write(mesh_path)
+    info = mb.info() if mb._built else None
+    print(f"[2/5] Mesh written  → {mesh_path}")
+    if info is not None:
+        print(f"      nodes={info.n_nodes}  elements={info.n_elements}")
+except ImportError as gmsh_err:
+    print(f"[2/5] Mesh skipped  — {gmsh_err}")
+    info = None
 
 # ---------------------------------------------------------------------------
 # 3. Generate synthetic "solver output"

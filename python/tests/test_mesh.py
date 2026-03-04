@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+gmsh = pytest.importorskip("gmsh", reason="gmsh is not installed")
+
 from lbm_pre.mesh import MeshBuilder, MeshInfo, export_surface_nodes
 
 
