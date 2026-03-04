@@ -1,0 +1,44 @@
+# Build artifacts
+build/
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Rust generated
+target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Simulation output
+*.vtu
+*.vtk
+*.pvtu
+*.h5
+*.hdf5
+output/
+results/
+
+# Log files
+*.log
