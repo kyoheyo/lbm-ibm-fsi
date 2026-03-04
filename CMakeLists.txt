@@ -10,10 +10,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 编译开关（cargo build 时由 build.rs 覆盖默认值，详见文档）
-option(ENABLE_MPI    "Enable MPI parallelism"   ON)
-option(ENABLE_OPENMP "Enable OpenMP parallelism" ON)
-option(ENABLE_CUDA   "Enable CUDA GPU backend"   OFF)
-option(BUILD_TESTS   "Build unit tests"          ON)
+# 可在命令行通过 -D<选项>=ON/OFF 覆盖，或在 cargo build 时通过 LBM_ENABLE_* 环境变量覆盖
+option(ENABLE_MPI    "Enable MPI parallelism"   ON)   # cargo build 默认 OFF
+option(ENABLE_OPENMP "Enable OpenMP parallelism" ON)  # cargo build 默认 OFF
+option(ENABLE_CUDA   "Enable CUDA GPU backend"   OFF) # 当前后端尚未实现，预留扩展
+option(BUILD_TESTS   "Build unit tests"          ON)  # cargo build 固定传入 OFF
 
 # GCC/Clang 优化与警告
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -47,6 +48,6 @@ endif()
 add_subdirectory(core)
 
 if(BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(core/tests)
+    enable_testing()               # 初始化 CTest 框架，使 add_test() 生效
+    add_subdirectory(core/tests)   # 编译 test_lbm 可执行文件并注册测试用例
 endif()
