@@ -51,3 +51,11 @@ delta_kernel = "four_point"
 [output]
 write_interval = 500
 directory      = "output/lid_cavity"
+
+[python]
+# After the simulation finishes, automatically visualise the flow field.
+# The solver passes the output directory as the first positional argument.
+# Set pythonpath to the python/ sub-directory so lbm_post is importable
+# without a pip install (adjust the path if running from a different location).
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
