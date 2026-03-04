@@ -1,0 +1,53 @@
+# Lid-driven cavity flow with a flexible filament in the centre
+# Classic benchmark: Re = U*L/ν = 1.0 * 100 / 0.01 = 100
+
+[simulation]
+n_steps        = 10000
+dt             = 1.0          # lattice time units
+lattice_model  = "D2Q9"
+collision_model = "MRT"       # MRT is more stable at lower viscosity
+
+[fluid]
+nx = 100
+ny = 100
+nz = 1
+nu = 0.01                     # kinematic viscosity (lattice units)
+rho0 = 1.0
+
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_velocity"
+  face    = "north"
+  ux      = 0.1               # lid velocity
+  uy      = 0.0
+
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "south"
+
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "west"
+
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "east"
+
+[structure]
+young_modulus  = 1.0e3
+second_moment  = 1.0e-6
+density        = 1.5
+area           = 0.01
+length         = 0.3
+n_elements     = 10
+
+[ibm]
+geometry   = "filament"
+x0         = 50.0            # centre of domain in lattice units
+y0         = 30.0
+size       = 30.0            # filament length (lattice units)
+n_markers  = 30
+delta_kernel = "four_point"
+
+[output]
+write_interval = 500
+directory      = "output/lid_cavity"

@@ -1,0 +1,19 @@
+[package]
+name = "lbm-ibm-fsi"
+version = "0.1.0"
+edition = "2021"
+description = "Rust orchestrator for the LBM+IBM+FSI solver"
+
+[[bin]]
+name = "lbm-ibm-fsi"
+path = "src/main.rs"
+
+[dependencies]
+lbm-bindings = { path = "../bindings" }
+serde        = { version = "1", features = ["derive"] }
+toml         = "0.8"
+clap         = { version = "4", features = ["derive"] }
+anyhow       = "1"
+
+[dev-dependencies]
+approx = "0.5"

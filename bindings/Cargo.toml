@@ -1,0 +1,11 @@
+[package]
+name = "lbm-bindings"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FFI bindings to the C++ LBM core library"
+links = "lbm_core"
+
+[build-dependencies]
+cmake = "0.1"
+
+[dependencies]

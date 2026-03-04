@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "orchestrator",
+    "bindings",
+]
+resolver = "2"
