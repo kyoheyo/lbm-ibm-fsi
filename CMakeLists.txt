@@ -69,6 +69,37 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # ---------------------------------------------------------------------------
+# MSVC 专用设置（Windows 平台）
+# ---------------------------------------------------------------------------
+# CMAKE_MSVC_RUNTIME_LIBRARY 控制所有目标链接的 MSVC C++ 运行时库：
+#   MultiThreadedDLL      → /MD  （Release 多线程 DLL 运行时，msvcrt.lib）
+#   MultiThreadedDebugDLL → /MDd （Debug   多线程 DLL 运行时，msvcrtd.lib）
+#   MultiThreaded         → /MT  （Release 静态运行时）
+#   MultiThreadedDebug    → /MTd （Debug   静态运行时）
+#
+# 问题根源（LNK1120 调试版构建失败，发布版成功）：
+#   cmake Debug 配置默认使用 /MDd，编译出的 lbm_core.lib 会引用
+#   msvcrtd.dll 中专有的调试符号（如 _calloc_dbg、__acrt_iob_func 等）。
+#   Rust 工具链在 Windows 上无论 `cargo build` 还是 `cargo build --release`
+#   都始终传递 /MD 给 link.exe，不会携带 msvcrtd.lib，导致这些调试版符号
+#   无法解析，从而引发 LNK2001（未解析的外部符号）和最终的 LNK1120。
+#   `cargo build --release` 之所以成功，是因为 Release 配置默认用 /MD，
+#   与 Rust 一致；Debug 配置用 /MDd，与 Rust 不一致，故失败。
+#
+# 修复方式：强制所有 cmake 配置（Debug / Release / RelWithDebInfo 等）
+#   都使用 MultiThreadedDLL（/MD），确保与 Rust 链接时运行时库一致。
+#   C++ 调试信息（PDB、调试符号）仍由 CMAKE_BUILD_TYPE=Debug 保留，
+#   只是运行时库从 /MDd 改为 /MD，不影响断点和变量查看。
+#
+# /EHsc：启用标准 C++ 同步异常处理。Visual Studio 生成器会自动添加此选项，
+#   但 cmake-rs crate 在部分配置下会选择 Ninja 生成器，此时不会自动添加，
+#   因此显式设置以保证一致性。
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    add_compile_options(/EHsc)
+endif()
+
+# ---------------------------------------------------------------------------
 # MPI 依赖查找
 # ---------------------------------------------------------------------------
 # 若 ENABLE_MPI=ON，查找系统中安装的 MPI 实现（OpenMPI、MPICH 等）。

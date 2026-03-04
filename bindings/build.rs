@@ -47,6 +47,25 @@ fn main() {
     //   3. cmake --install <out_dir>/build --prefix <out_dir>
     //      （将 liblbm_core.a 安装到 <out_dir>/lib/）
     // 返回值 `dst` 是 CMake 的安装前缀，即 <out_dir>。
+    // ------------------------------------------------------------------
+    // 确定 cmake 配置类型（与 Cargo 编译配置对应）
+    // ------------------------------------------------------------------
+    // MSVC 多配置生成器（Visual Studio）在同一构建树中支持多种配置，
+    // cmake-rs crate 会在 `cmake --build` 时通过 `--config Debug/Release`
+    // 选择具体配置。此处根据 Cargo 的 OPT_LEVEL 推断配置类型：
+    //   - OPT_LEVEL = 0（cargo build）              → Debug
+    //   - OPT_LEVEL = 1/2/3（cargo build --release）→ Release
+    // 将结果传入 cmake 的 CMAKE_BUILD_TYPE（单配置生成器如 Ninja 会用到），
+    // 以及 cmake-rs 内部决定 `--config` 参数的 build_arg。
+    // 注意：即使选择 Debug 配置，由于上方 CMakeLists.txt 已强制
+    // CMAKE_MSVC_RUNTIME_LIBRARY = MultiThreadedDLL，编译器依然使用
+    // /MD 而非 /MDd，从而与 Rust 链接器保持运行时库一致。
+    let cmake_build_type = if std::env::var("OPT_LEVEL").unwrap_or_default() == "0" {
+        "Debug"
+    } else {
+        "Release"
+    };
+
     let dst = cmake::Config::new(repo_root)
         // 关闭 C++ 测试构建：Rust 构建链路中只需要 liblbm_core.a，
         // 不需要编译 test_lbm 可执行文件，禁用可显著加快构建速度。
@@ -58,6 +77,9 @@ fn main() {
         // 默认值是 ON，与此处行为不同——参见项目文档中的对比表。
         .define("ENABLE_MPI",    std::env::var("LBM_ENABLE_MPI").unwrap_or_else(|_| "OFF".into()))
         .define("ENABLE_OPENMP", std::env::var("LBM_ENABLE_OPENMP").unwrap_or_else(|_| "OFF".into()))
+        // 将 cmake 构建类型与 Cargo 配置对齐（Debug / Release），
+        // 使单配置生成器（如 Ninja）也能获得正确的优化/调试信息设置。
+        .define("CMAKE_BUILD_TYPE", cmake_build_type)
         .build();
 
     // ------------------------------------------------------------------
