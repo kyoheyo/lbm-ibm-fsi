@@ -13,8 +13,8 @@
 // 与 Cargo 的交互协议
 // ============================================================
 // 本脚本通过向标准输出打印以 `cargo:` 开头的特殊指令与 Cargo 通信：
-//   cargo:rustc-link-search=native=<路径>  → 告诉 rustc 在该目录中搜索 .a 文件
-//   cargo:rustc-link-lib=static=<名称>     → 告诉 rustc 链接 lib<名称>.a 静态库
+//   cargo:rustc-link-search=native=<路径>  → 告诉 rustc 在该目录中搜索 .a / .lib 文件
+//   cargo:rustc-link-lib=static=<名称>     → 告诉 rustc 链接 lib<名称>.a（Unix）/ <名称>.lib（Windows）静态库
 //   cargo:rustc-link-lib=<名称>            → 告诉 rustc 链接动态系统库
 //   cargo:rerun-if-changed=<路径>          → 若指定路径变化则重新运行本脚本
 //   cargo:rerun-if-env-changed=<变量名>    → 若环境变量变化则重新运行本脚本
@@ -63,15 +63,18 @@ fn main() {
     // ------------------------------------------------------------------
     // 第三步：向 rustc 发出链接器搜索路径指令
     // ------------------------------------------------------------------
-    // cmake::Config::build() 安装完成后，liblbm_core.a 位于：
-    //   <dst>/lib/liblbm_core.a
-    // 以下指令告诉 rustc 在该目录中搜索 .a / .so 文件。
+    // cmake::Config::build() 安装完成后，C++ 静态库位于：
+    //   <dst>/lib/liblbm_core.a  （Unix：Linux / macOS）
+    //   <dst>/lib/lbm_core.lib   （Windows：MSVC）
+    // 以下指令告诉 rustc 在该目录中搜索 .a / .lib 文件。
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
 
     // ------------------------------------------------------------------
     // 第四步：声明静态链接 C++ 核心库
     // ------------------------------------------------------------------
-    // 告诉 rustc 链接 liblbm_core.a（`static=` 前缀表示静态链接）。
+    // 告诉 rustc 链接 C++ 核心静态库：
+    //   Unix（Linux / macOS）：liblbm_core.a  （`static=` 前缀表示静态链接）
+    //   Windows（MSVC）       ：lbm_core.lib
     // 该库由上方 CMake 步骤编译生成，包含所有 C++ 计算内核：
     //   LBM 格子 Boltzmann 求解器 + IBM 浸入边界法 + FSI 流固耦合 +
     //   C ABI 桥接层 + 插件注册中心
@@ -81,13 +84,23 @@ fn main() {
     // 第五步：链接 C++ 标准库（平台相关）
     // ------------------------------------------------------------------
     // C++ 代码使用了标准库容器（std::vector、std::array 等），
-    // 必须链接对应的 C++ 运行时库，否则会出现符号未定义错误。
-    //   - macOS（Apple Clang）：使用 libc++
-    //   - Linux / Windows（GCC / MSVC）：使用 libstdc++
-    #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=c++");
-    #[cfg(not(target_os = "macos"))]
-    println!("cargo:rustc-link-lib=stdc++");
+    // 在非 Windows 平台上必须显式链接对应的 C++ 运行时库，
+    // 否则会出现符号未定义错误。
+    //
+    //   - macOS（Apple Clang）：使用 libc++  → cargo:rustc-link-lib=c++
+    //   - Linux 及其他 Unix（GCC / Clang）：使用 libstdc++ → cargo:rustc-link-lib=stdc++
+    //   - Windows（MSVC）：C++ 运行时（msvcrt.lib / libcmt.lib）由 MSVC 工具链
+    //     自动链接，无需显式声明；若声明 stdc++ 反而会导致
+    //     LNK1181"cannot open input file 'stdc++.lib'"错误。
+    //
+    // 使用 CARGO_CFG_TARGET_OS 环境变量（而非 #[cfg(target_os)]）在运行时
+    // 查询目标平台，使交叉编译场景也能正确处理。
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "macos" | "ios" => println!("cargo:rustc-link-lib=c++"),
+        "windows"       => {} // MSVC 自动链接 C++ 运行时，无需显式声明
+        _               => println!("cargo:rustc-link-lib=stdc++"), // Linux、FreeBSD 等 Unix
+    }
 
     // ------------------------------------------------------------------
     // 第六步：增量构建守卫

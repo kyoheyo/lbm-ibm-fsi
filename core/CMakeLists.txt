@@ -2,15 +2,16 @@
 # core/CMakeLists.txt — C++ 计算核心库
 # ===========================================================================
 # 作用：
-#   将 core/src/ 下的全部 C++ 源文件编译并打包为静态库 liblbm_core.a，
+#   将 core/src/ 下的全部 C++ 源文件编译并打包为静态库，
 #   并向依赖该库的目标（包括 Rust bindings crate）暴露头文件路径。
 #
 # 执行时机：
 #   由顶层 CMakeLists.txt 中的 add_subdirectory(core) 触发，
 #   在顶层文件完成全局配置（编译器标准、MPI/OpenMP 查找）之后执行。
 #
-# 产物：
-#   <CMAKE_BINARY_DIR>/lib/liblbm_core.a
+# 产物（名称随平台变化）：
+#   <CMAKE_BINARY_DIR>/lib/liblbm_core.a   （Unix：Linux / macOS，GCC / Clang）
+#   <CMAKE_BINARY_DIR>/lib/lbm_core.lib    （Windows：MSVC）
 #   （CMAKE_BINARY_DIR 由顶层 cmake -B <build_dir> 参数指定，
 #    通过 cargo build 时为 Cargo 管理的临时目录下的 out/build/）
 # ===========================================================================
