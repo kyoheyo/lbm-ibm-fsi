@@ -11,6 +11,7 @@ set(CORE_SOURCES
     src/fsi/structure.cpp
     src/fsi/coupling.cpp
     src/capi/lbm_capi.cpp
+    src/plugins/plugin_registry.cpp
 )
 
 add_library(lbm_core STATIC ${CORE_SOURCES})

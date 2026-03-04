@@ -16,6 +16,9 @@ pub struct Config {
     /// Optional Python integration (subprocess scripts + FFI plotting)
     #[serde(default)]
     pub python: PythonConfig,
+    /// Optional plugin selection (boundary / mesh / motion / flexible)
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -159,6 +162,61 @@ impl Default for PythonConfig {
 }
 
 // ---------------------------------------------------------------------------
+/// Plugin selection configuration.
+///
+/// Each field names a built-in plugin (or custom external plugin) to activate
+/// for the corresponding extension point.  An empty string or absent field
+/// means "use the default / no plugin".
+///
+/// ## Available extension points
+///
+/// | Field | Interface | When called | Use-case examples |
+/// |-------|-----------|-------------|-------------------|
+/// | `boundary` | `IBoundaryPlugin` | After standard BCs each step | Convective outlet, open pressure, NRBC |
+/// | `mesh` | `IMeshPlugin` | After streaming each step | Adaptive refinement, stretched grid |
+/// | `motion` | `IMotionPlugin` | Before collision each step | Moving wall, 6-DOF rigid body, ALE |
+/// | `flexible` | `IFlexibleSolverPlugin` | After streaming each step | Kirchhoff plate, co-rotational beam |
+///
+/// ## TOML example
+///
+/// ```toml
+/// [plugins]
+/// boundary = "convective_outlet"  # name printed in startup log
+/// mesh     = ""                   # no adaptive mesh
+/// motion   = "prescribed_sine"
+/// flexible = ""                   # use built-in BeamSolver
+/// ```
+///
+/// Plugins with non-empty names are logged at startup.  Actual plugin logic
+/// is registered via Rust code before the simulation loop; the name field is
+/// informational only and does not auto-load shared libraries.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PluginsConfig {
+    /// Name of the custom boundary-condition plugin (empty = none).
+    #[serde(default)]
+    pub boundary: String,
+    /// Name of the mesh-handling / adaptive-refinement plugin (empty = none).
+    #[serde(default)]
+    pub mesh: String,
+    /// Name of the moving-mesh / moving-body plugin (empty = none).
+    #[serde(default)]
+    pub motion: String,
+    /// Name of the alternative flexible-body solver plugin (empty = none).
+    #[serde(default)]
+    pub flexible: String,
+}
+
+impl PluginsConfig {
+    /// Returns true if at least one plugin name is configured.
+    pub fn any_active(&self) -> bool {
+        !self.boundary.is_empty()
+            || !self.mesh.is_empty()
+            || !self.motion.is_empty()
+            || !self.flexible.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 fn default_lattice_model()      -> String { "D2Q9".to_string() }
@@ -227,6 +285,8 @@ mod tests {
         assert!(cfg.python.post_script.is_none());
         assert!(cfg.output.plot_interval.is_none());
         assert!(!cfg.output.enable_csv_monitor);
+        // [plugins] section absent → all names default to empty
+        assert!(!cfg.plugins.any_active());
     }
 
     #[test]
@@ -260,5 +320,59 @@ mod tests {
         assert_eq!(cfg.python.pythonpath.as_deref(), Some("python"));
         assert_eq!(cfg.output.plot_interval, Some(50));
         assert!(cfg.output.enable_csv_monitor);
+    }
+
+    #[test]
+    fn test_plugins_config_parse() {
+        let toml_str = r#"
+            [simulation]
+            n_steps = 100
+            dt = 1.0
+
+            [fluid]
+            nx = 16
+            ny = 16
+            nu = 0.1
+
+            [output]
+            write_interval = 10
+
+            [plugins]
+            boundary = "convective_outlet"
+            mesh     = "adaptive_uniform"
+            motion   = "prescribed_sine"
+            flexible = "kirchhoff_love_plate"
+        "#;
+
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plugins.boundary, "convective_outlet");
+        assert_eq!(cfg.plugins.mesh,     "adaptive_uniform");
+        assert_eq!(cfg.plugins.motion,   "prescribed_sine");
+        assert_eq!(cfg.plugins.flexible, "kirchhoff_love_plate");
+        assert!(cfg.plugins.any_active());
+    }
+
+    #[test]
+    fn test_plugins_config_defaults() {
+        // When [plugins] section is absent, all names should be empty.
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plugins.boundary, "");
+        assert_eq!(cfg.plugins.mesh,     "");
+        assert_eq!(cfg.plugins.motion,   "");
+        assert_eq!(cfg.plugins.flexible, "");
+        assert!(!cfg.plugins.any_active());
     }
 }

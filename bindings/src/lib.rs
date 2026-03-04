@@ -29,6 +29,14 @@ mod ffi {
     /// Opaque handle to a `lbm::Solver` on the heap
     pub enum SolverHandle {}
 
+    /// C-compatible function-pointer types used by the plugin ABI.
+    pub type BoundaryFn  = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
+    pub type MeshFn      = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
+    pub type MotionFn    = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void,
+                                                 f64, c_int, *mut std::ffi::c_void);
+    pub type FlexibleFn  = unsafe extern "C" fn(*mut std::ffi::c_void, f64, c_int,
+                                                 *mut std::ffi::c_void);
+
     extern "C" {
         // --- LatticeGrid ---
         pub fn lbm_grid_new(nx: c_int, ny: c_int, nz: c_int,
@@ -48,8 +56,23 @@ mod ffi {
         pub fn lbm_solver_free(s: *mut SolverHandle);
         pub fn lbm_solver_step(s: *mut SolverHandle,
                                g: *mut LatticeGridHandle);
+        pub fn lbm_solver_step_n(s: *mut SolverHandle,
+                                  g: *mut LatticeGridHandle,
+                                  step_index: c_int,
+                                  dt: f64);
+
+        // --- Plugin registration ---
+        pub fn lbm_set_plugins(
+            boundary_fn:   Option<BoundaryFn>,  boundary_data:  *mut std::ffi::c_void,
+            mesh_fn:       Option<MeshFn>,      mesh_data:      *mut std::ffi::c_void,
+            motion_fn:     Option<MotionFn>,    motion_data:    *mut std::ffi::c_void,
+            flexible_fn:   Option<FlexibleFn>,  flexible_data:  *mut std::ffi::c_void,
+        );
     }
 }
+
+// ---------------------------------------------------------------------------
+use std::ffi::{c_int, c_void};
 
 // ---------------------------------------------------------------------------
 // Safe public types
@@ -148,6 +171,12 @@ impl LbmSolver {
     pub fn step(&mut self, grid: &mut LbmGrid) {
         unsafe { ffi::lbm_solver_step(self.ptr, grid.as_mut_ptr()) };
     }
+
+    /// Step with an explicit step index and time step size so that
+    /// registered plugins receive accurate timing information.
+    pub fn step_n(&mut self, grid: &mut LbmGrid, step_index: i32, dt: f64) {
+        unsafe { ffi::lbm_solver_step_n(self.ptr, grid.as_mut_ptr(), step_index, dt) };
+    }
 }
 
 impl Drop for LbmSolver {
@@ -157,7 +186,82 @@ impl Drop for LbmSolver {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin registration
+// ---------------------------------------------------------------------------
+
+/// Holder for optional C function-pointer plugin callbacks.
+///
+/// Build this struct with `PluginCallbacks::default()` and then fill in the
+/// fields you need before calling [`register_plugins`].
+///
+/// # Example
+///
+/// ```no_run
+/// use lbm_bindings::PluginCallbacks;
+///
+/// unsafe extern "C" fn my_bc(grid: *mut std::ffi::c_void, step: i32,
+///                             _data: *mut std::ffi::c_void) {
+///     // cast grid → &mut lbm::LatticeGrid and apply custom BC
+///     let _ = (grid, step);
+/// }
+///
+/// let mut cbs = PluginCallbacks::default();
+/// cbs.boundary_fn = Some(my_bc);
+/// lbm_bindings::register_plugins(cbs);
+/// ```
+#[derive(Default, Clone, Copy)]
+pub struct PluginCallbacks {
+    /// Called after built-in BCs each step.
+    pub boundary_fn:   Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+    /// Opaque data pointer forwarded to `boundary_fn`.
+    pub boundary_data: *mut c_void,
+
+    /// Called after streaming/macroscopic update each step (adaptive mesh).
+    pub mesh_fn:       Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+    /// Opaque data pointer forwarded to `mesh_fn`.
+    pub mesh_data:     *mut c_void,
+
+    /// Called before collision to update body positions (moving mesh/body).
+    pub motion_fn:     Option<unsafe extern "C" fn(*mut c_void, *mut c_void, f64, c_int, *mut c_void)>,
+    /// Opaque data pointer forwarded to `motion_fn`.
+    pub motion_data:   *mut c_void,
+
+    /// Alternative flexible-body solver, called after streaming.
+    pub flexible_fn:   Option<unsafe extern "C" fn(*mut c_void, f64, c_int, *mut c_void)>,
+    /// Opaque data pointer forwarded to `flexible_fn`.
+    pub flexible_data: *mut c_void,
+}
+
+// SAFETY: the raw pointers inside PluginCallbacks are opaque user-data
+// pointers whose thread-safety is the caller's responsibility.
+unsafe impl Send for PluginCallbacks {}
+unsafe impl Sync for PluginCallbacks {}
+
+/// Register plugin callbacks with the global `PluginRegistry` singleton.
+///
+/// This is a thin wrapper around `lbm_set_plugins` in the C ABI.  Pass
+/// `None` for any callback that should remain inactive (the default).
+///
+/// # Safety
+///
+/// The function pointers, if provided, must remain valid for the duration
+/// of the simulation (i.e. until they are replaced by another call to this
+/// function or the process exits).
+pub fn register_plugins(cbs: PluginCallbacks) {
+    unsafe {
+        ffi::lbm_set_plugins(
+            cbs.boundary_fn, cbs.boundary_data,
+            cbs.mesh_fn,     cbs.mesh_data,
+            cbs.motion_fn,   cbs.motion_data,
+            cbs.flexible_fn, cbs.flexible_data,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C ABI implementation (defined in a companion .cpp file compiled by build.rs)
 // ---------------------------------------------------------------------------
 // The actual implementations of lbm_grid_new / lbm_solver_step etc. live in
-// core/src/capi/lbm_capi.cpp and are compiled into lbm_core.a.
+// core/src/capi/lbm_capi.cpp and core/src/plugins/plugin_registry.cpp,
+// compiled into lbm_core.a.
+

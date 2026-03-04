@@ -80,6 +80,28 @@ fn main() -> Result<()> {
     println!("ω      : {:.6}", cfg.omega());
 
     // -----------------------------------------------------------------------
+    // Plugin startup log
+    // -----------------------------------------------------------------------
+    if cfg.plugins.any_active() {
+        println!("Plugins:");
+        if !cfg.plugins.boundary.is_empty() {
+            println!("  boundary  = \"{}\"  (IBoundaryPlugin)", cfg.plugins.boundary);
+        }
+        if !cfg.plugins.mesh.is_empty() {
+            println!("  mesh      = \"{}\"  (IMeshPlugin)", cfg.plugins.mesh);
+        }
+        if !cfg.plugins.motion.is_empty() {
+            println!("  motion    = \"{}\"  (IMotionPlugin)", cfg.plugins.motion);
+        }
+        if !cfg.plugins.flexible.is_empty() {
+            println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
+        }
+        // NOTE: To register a plugin implementation, call
+        //   lbm_bindings::register_plugins(PluginCallbacks { boundary_fn: Some(my_fn), .. })
+        // before the simulation loop.  Plugin names above are informational only.
+    }
+
+    // -----------------------------------------------------------------------
     // Python FFI: extend sys.path so lbm_pre / lbm_post are importable
     // -----------------------------------------------------------------------
     if let Some(ref extra_path) = cfg.python.pythonpath {
