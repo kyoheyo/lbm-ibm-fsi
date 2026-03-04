@@ -1,12 +1,12 @@
-//! Safe Rust wrappers around the C++ LBM core library.
+//! C++ LBM 核心库的安全 Rust 封装。
 //!
-//! The C++ library exposes a thin C ABI (`extern "C"`) so that Rust's FFI can
-//! call it without a C++ name-mangling dependency.  The raw `ffi` module
-//! contains the `unsafe` declarations; all public types in this module are
-//! safe wrappers.
+//! C++ 库通过细薄的 C ABI（`extern "C"`）对外暴露接口，
+//! 使 Rust 的 FFI 能够在不依赖 C++ 名称修饰（name mangling）的情况下调用它。
+//! 内部的 `ffi` 模块包含 `unsafe` 声明；
+//! 本模块对外公开的所有类型均为安全封装。
 
 // ---------------------------------------------------------------------------
-// C ABI declarations
+// C ABI 声明
 // ---------------------------------------------------------------------------
 mod ffi {
     use std::ffi::c_int;
@@ -24,12 +24,12 @@ mod ffi {
         Mrt = 1,
     }
 
-    /// Opaque handle to a `lbm::LatticeGrid` on the heap
+    /// 指向堆上 `lbm::LatticeGrid` 的不透明句柄
     pub enum LatticeGridHandle {}
-    /// Opaque handle to a `lbm::Solver` on the heap
+    /// 指向堆上 `lbm::Solver` 的不透明句柄
     pub enum SolverHandle {}
 
-    /// C-compatible function-pointer types used by the plugin ABI.
+    /// 插件 ABI 使用的 C 兼容函数指针类型
     pub type BoundaryFn  = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
     pub type MeshFn      = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
     pub type MotionFn    = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void,
@@ -61,7 +61,7 @@ mod ffi {
                                   step_index: c_int,
                                   dt: f64);
 
-        // --- Plugin registration ---
+        // --- 插件注册 ---
         pub fn lbm_set_plugins(
             boundary_fn:   Option<BoundaryFn>,  boundary_data:  *mut std::ffi::c_void,
             mesh_fn:       Option<MeshFn>,      mesh_data:      *mut std::ffi::c_void,
@@ -75,10 +75,10 @@ mod ffi {
 use std::ffi::{c_int, c_void};
 
 // ---------------------------------------------------------------------------
-// Safe public types
+// 安全的公开类型
 // ---------------------------------------------------------------------------
 
-/// Lattice model selector
+/// 格子模型选择器
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatticeModel {
     D2Q9,
@@ -86,7 +86,7 @@ pub enum LatticeModel {
     D3Q27,
 }
 
-/// Collision model selector
+/// 碰撞模型选择器
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollisionModel {
     Bgk,
@@ -113,13 +113,13 @@ impl From<CollisionModel> for ffi::CollisionModelC {
 }
 
 // ---------------------------------------------------------------------------
-/// Safe wrapper around `lbm::LatticeGrid`
+/// `lbm::LatticeGrid` 的安全封装
 pub struct LbmGrid {
     ptr: *mut ffi::LatticeGridHandle,
 }
 
-// SAFETY: the C++ LatticeGrid is heap-allocated and not shared across threads
-// unless the caller explicitly synchronises access.
+// SAFETY: C++ LatticeGrid 在堆上分配，未跨线程共享；
+// 若调用方需要多线程访问，需自行保证同步。
 unsafe impl Send for LbmGrid {}
 
 impl LbmGrid {
@@ -139,7 +139,7 @@ impl LbmGrid {
     pub fn ux (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_ux (self.ptr, idx) } }
     pub fn uy (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_uy (self.ptr, idx) } }
 
-    /// Raw mutable pointer — used only by `LbmSolver::step`
+    /// 原始可变指针 — 仅供 `LbmSolver::step` 内部使用
     pub(crate) fn as_mut_ptr(&mut self) -> *mut ffi::LatticeGridHandle {
         self.ptr
     }
@@ -152,7 +152,7 @@ impl Drop for LbmGrid {
 }
 
 // ---------------------------------------------------------------------------
-/// Safe wrapper around `lbm::Solver`
+/// `lbm::Solver` 的安全封装
 pub struct LbmSolver {
     ptr: *mut ffi::SolverHandle,
 }
@@ -172,8 +172,8 @@ impl LbmSolver {
         unsafe { ffi::lbm_solver_step(self.ptr, grid.as_mut_ptr()) };
     }
 
-    /// Step with an explicit step index and time step size so that
-    /// registered plugins receive accurate timing information.
+    /// 带显式步骤索引和时间步长的推进接口，
+    /// 使已注册的插件能够获得准确的时间信息。
     pub fn step_n(&mut self, grid: &mut LbmGrid, step_index: i32, dt: f64) {
         unsafe { ffi::lbm_solver_step_n(self.ptr, grid.as_mut_ptr(), step_index, dt) };
     }
@@ -186,22 +186,22 @@ impl Drop for LbmSolver {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin registration
+// 插件注册
 // ---------------------------------------------------------------------------
 
-/// Holder for optional C function-pointer plugin callbacks.
+/// 可选 C 函数指针插件回调的持有结构体。
 ///
-/// Build this struct with `PluginCallbacks::default()` and then fill in the
-/// fields you need before calling [`register_plugins`].
+/// 通过 `PluginCallbacks::default()` 构建，然后填入所需的字段，
+/// 最后调用 [`register_plugins`] 注册。
 ///
-/// # Example
+/// # 示例
 ///
 /// ```no_run
 /// use lbm_bindings::PluginCallbacks;
 ///
 /// unsafe extern "C" fn my_bc(grid: *mut std::ffi::c_void, step: i32,
 ///                             _data: *mut std::ffi::c_void) {
-///     // cast grid → &mut lbm::LatticeGrid and apply custom BC
+///     // 将 grid 转换为 &mut lbm::LatticeGrid 并应用自定义边界条件
 ///     let _ = (grid, step);
 /// }
 ///
@@ -211,42 +211,41 @@ impl Drop for LbmSolver {
 /// ```
 #[derive(Default, Clone, Copy)]
 pub struct PluginCallbacks {
-    /// Called after built-in BCs each step.
+    /// 每步标准边界条件执行完毕后调用的回调函数。
     pub boundary_fn:   Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
-    /// Opaque data pointer forwarded to `boundary_fn`.
+    /// 转发给 `boundary_fn` 的不透明用户数据指针。
     pub boundary_data: *mut c_void,
 
-    /// Called after streaming/macroscopic update each step (adaptive mesh).
+    /// 每步流式迁移/宏观量更新后调用的回调函数（自适应网格）。
     pub mesh_fn:       Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
-    /// Opaque data pointer forwarded to `mesh_fn`.
+    /// 转发给 `mesh_fn` 的不透明用户数据指针。
     pub mesh_data:     *mut c_void,
 
-    /// Called before collision to update body positions (moving mesh/body).
+    /// 每步碰撞前调用以更新固体位置的回调函数（运动网格/固体）。
     pub motion_fn:     Option<unsafe extern "C" fn(*mut c_void, *mut c_void, f64, c_int, *mut c_void)>,
-    /// Opaque data pointer forwarded to `motion_fn`.
+    /// 转发给 `motion_fn` 的不透明用户数据指针。
     pub motion_data:   *mut c_void,
 
-    /// Alternative flexible-body solver, called after streaming.
+    /// 替代/补充柔性体求解器的回调函数，在流式迁移后调用。
     pub flexible_fn:   Option<unsafe extern "C" fn(*mut c_void, f64, c_int, *mut c_void)>,
-    /// Opaque data pointer forwarded to `flexible_fn`.
+    /// 转发给 `flexible_fn` 的不透明用户数据指针。
     pub flexible_data: *mut c_void,
 }
 
-// SAFETY: the raw pointers inside PluginCallbacks are opaque user-data
-// pointers whose thread-safety is the caller's responsibility.
+// SAFETY: PluginCallbacks 内部的原始指针是不透明的用户数据指针，
+// 其线程安全性由调用方负责保证。
 unsafe impl Send for PluginCallbacks {}
 unsafe impl Sync for PluginCallbacks {}
 
-/// Register plugin callbacks with the global `PluginRegistry` singleton.
+/// 向全局 `PluginRegistry` 单例注册插件回调。
 ///
-/// This is a thin wrapper around `lbm_set_plugins` in the C ABI.  Pass
-/// `None` for any callback that should remain inactive (the default).
+/// 这是对 C ABI 中 `lbm_set_plugins` 的薄封装。
+/// 对不需要激活的回调传入 `None`（默认值）即可。
 ///
-/// # Safety
+/// # 安全性
 ///
-/// The function pointers, if provided, must remain valid for the duration
-/// of the simulation (i.e. until they are replaced by another call to this
-/// function or the process exits).
+/// 若提供了函数指针，它们在仿真期间（即下次调用本函数覆盖它们或
+/// 进程退出之前）必须保持有效。
 pub fn register_plugins(cbs: PluginCallbacks) {
     unsafe {
         ffi::lbm_set_plugins(
@@ -259,9 +258,9 @@ pub fn register_plugins(cbs: PluginCallbacks) {
 }
 
 // ---------------------------------------------------------------------------
-// C ABI implementation (defined in a companion .cpp file compiled by build.rs)
+// C ABI 实现说明
 // ---------------------------------------------------------------------------
-// The actual implementations of lbm_grid_new / lbm_solver_step etc. live in
-// core/src/capi/lbm_capi.cpp and core/src/plugins/plugin_registry.cpp,
-// compiled into lbm_core.a.
-
+// lbm_grid_new / lbm_solver_step 等函数的实际实现位于：
+//   core/src/capi/lbm_capi.cpp     — 格子网格与求解器函数
+//   core/src/plugins/plugin_registry.cpp — 插件注册函数
+// 两者均被编译进 liblbm_core.a，由 build.rs 链接到本 crate。

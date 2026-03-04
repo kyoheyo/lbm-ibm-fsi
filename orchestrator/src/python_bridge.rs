@@ -1,35 +1,33 @@
-//! Python FFI bridge — calls `lbm_pre` / `lbm_post` Python functions
-//! in-process using pyo3, without creating any intermediate files.
+//! Python FFI 桥接模块 — 使用 pyo3 在进程内调用 `lbm_pre` / `lbm_post` Python 函数，
+//! 无需创建任何中间文件。
 //!
-//! This module is compiled only when the `python-ffi` Cargo feature is
-//! enabled (`cargo build --features python-ffi`).
+//! 本模块仅在启用了 `python-ffi` Cargo 特性时编译
+//! （`cargo build --features python-ffi`）。
 //!
-//! # Architecture
+//! # 架构
 //!
 //! ```text
-//! Rust orchestrator (main.rs)
+//! Rust 主控程序（main.rs）
 //!     │
 //!     ├─ markers_from_geometry()  ──pyo3──▶  lbm_pre.bridge.geometry_markers_raw()
-//!     │        returns (Vec<f64>, Vec<f64>, Vec<f64>) directly in memory
+//!     │        直接在内存中返回 (Vec<f64>, Vec<f64>, Vec<f64>)
 //!     │
 //!     └─ plot_field()  ────────────pyo3──▶  lbm_post.bridge.plot_field_raw()
-//!              passes &[f64] slices; Python reshapes into numpy arrays and
-//!              saves PNG — no .npz file written by Rust
+//!              传递 &[f64] 切片；Python 将其重塑为二维 NumPy 数组并保存 PNG
+//!              —— Rust 侧不生成 .npz 文件
 //! ```
 //!
-//! # Python path
+//! # Python 路径
 //!
-//! The `python/` directory of the repository must be on `sys.path` for the
-//! imports to succeed.  Call [`add_python_path`] once at start-up, or set
-//! `pythonpath` in the `[python]` TOML section.
+//! 仓库根目录下的 `python/` 目录必须在 `sys.path` 中，导入才能成功。
+//! 可在启动时调用 [`add_python_path`]，或在 TOML 的 `[python]` 段设置 `pythonpath`。
 
 use anyhow::Result;
 
-/// Prepend `extra_path` to `sys.path` so that `lbm_pre` and `lbm_post` are
-/// importable when they have not been installed via `pip`.
+/// 将 `extra_path` 前置到 `sys.path`，使 `lbm_pre` 和 `lbm_post`
+/// 在未通过 `pip` 安装时仍可导入。
 ///
-/// This is a no-op (succeeds silently) when the `python-ffi` feature is
-/// disabled.
+/// 未启用 `python-ffi` 特性时此函数为无操作（静默成功）。
 pub fn add_python_path(extra_path: &str) -> Result<()> {
     #[cfg(feature = "python-ffi")]
     {
@@ -50,24 +48,23 @@ pub fn add_python_path(extra_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Call `lbm_pre.bridge.geometry_markers_raw()` and return the IBM Lagrangian
-/// marker positions and arc-length elements as Rust `Vec<f64>`.
+/// 调用 `lbm_pre.bridge.geometry_markers_raw()` 并将 IBM 拉格朗日标记点
+/// 的位置和弧长元素以 Rust `Vec<f64>` 形式返回。
 ///
-/// No CSV file is written — the data is transferred directly through the
-/// Python C API.
+/// 不写出 CSV 文件 — 数据直接通过 Python C API 传递。
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `geometry`  – `"circle"` or `"filament"`
-/// * `x0`, `y0`  – centre (circle) or start point (filament) in lattice units
-/// * `size`      – radius (circle) or length (filament) in lattice units
-/// * `n_markers` – number of Lagrangian markers
+/// * `geometry`  — `"circle"` 或 `"filament"`
+/// * `x0`, `y0`  — 圆心（圆形）或起点（丝状体），单位为格子长度
+/// * `size`      — 半径（圆形）或长度（丝状体），单位为格子长度
+/// * `n_markers` — 拉格朗日标记点数量
 ///
-/// # Returns
+/// # 返回值
 ///
-/// `(x, y, ds)` where each `Vec<f64>` has length `n_markers`.
+/// `(x, y, ds)` — 每个 `Vec<f64>` 长度均为 `n_markers`。
 ///
-/// Returns an error when the `python-ffi` feature is not active.
+/// 未启用 `python-ffi` 特性时返回错误。
 pub fn markers_from_geometry(
     geometry: &str,
     x0: f64,
@@ -103,24 +100,23 @@ pub fn markers_from_geometry(
     }
 }
 
-/// Call `lbm_post.bridge.plot_field_raw()` to save a contour PNG.
+/// 调用 `lbm_post.bridge.plot_field_raw()` 保存等值线 PNG 图。
 ///
-/// Field arrays (`rho`, `ux`, `uy`) are passed as flat row-major slices of
-/// length `nx * ny` — no `.npz` file is created on the Rust side.  Python
-/// reshapes them into 2-D NumPy arrays and saves the figure to
-/// `<out_dir>/<field>_<NNNNNN>.png`.
+/// 流场数组（`rho`、`ux`、`uy`）以长度为 `nx * ny` 的平坦行主序切片传递
+/// —— Rust 侧不创建 `.npz` 文件。Python 将其重塑为二维 NumPy 数组
+/// 并将图像保存到 `<out_dir>/<field>_<NNNNNN>.png`。
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `rho`, `ux`, `uy` – flat (row-major) field slices, length `nx * ny`
-/// * `nx`, `ny`        – grid dimensions
-/// * `step`            – time-step index (used in the file name)
-/// * `time`            – physical time (used as an axis label)
-/// * `out_dir`         – output directory
-/// * `field`           – which field to plot:
+/// * `rho`, `ux`, `uy` — 平坦（行主序）场切片，长度为 `nx * ny`
+/// * `nx`, `ny`        — 网格尺寸
+/// * `step`            — 时间步索引（用于文件命名）
+/// * `time`            — 物理时间（用作坐标轴标签）
+/// * `out_dir`         — 输出目录
+/// * `field`           — 绘制哪个场：
 ///   `"velocity_magnitude"` | `"vorticity"` | `"pressure"` | `"streamlines"`
 ///
-/// Returns an error when the `python-ffi` feature is not active.
+/// 未启用 `python-ffi` 特性时返回错误。
 pub fn plot_field(
     rho: &[f64],
     ux: &[f64],
@@ -158,4 +154,3 @@ pub fn plot_field(
         )
     }
 }
-

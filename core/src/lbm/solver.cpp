@@ -9,10 +9,11 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
+// 构造函数：将分布函数初始化为静止平衡态（rho=1，u=0）
+// ---------------------------------------------------------------------------
 Solver::Solver(LatticeGrid& grid, double omega, CollisionModel cm)
     : grid_(grid), omega_(omega), cm_(cm)
 {
-    // Initialise f to equilibrium at rest (rho=1, u=0)
     const int n = grid_.size();
     const int d = grid_.dim();
 
@@ -45,12 +46,16 @@ Solver::Solver(LatticeGrid& grid, double omega, CollisionModel cm)
 }
 
 // ---------------------------------------------------------------------------
+// 单时间步：碰撞 + 流式迁移
+// ---------------------------------------------------------------------------
 void Solver::step()
 {
     collide();
     stream();
 }
 
+// ---------------------------------------------------------------------------
+// 碰撞：根据选定的模型分发到具体实现
 // ---------------------------------------------------------------------------
 void Solver::collide()
 {
@@ -61,6 +66,8 @@ void Solver::collide()
     }
 }
 
+// ---------------------------------------------------------------------------
+// BGK 碰撞（单松弛时间）
 // ---------------------------------------------------------------------------
 void Solver::collide_bgk()
 {
@@ -84,10 +91,10 @@ void Solver::collide_bgk()
                 double feq = f_eq(d2q9::W[a], ri, c, ui, d);
                 double f_a = grid_.f[i * d2q9::Q + a];
 
-                // BGK collision
+                // BGK 碰撞：f_a* = f_a - ω(f_a - f_eq)
                 f_a += -omega_ * (f_a - feq);
 
-                // Guo forcing correction
+                // Guo 体力修正
                 apply_guo_forcing(i, Fi, &f_a);
                 grid_.f[i * d2q9::Q + a] = f_a;
             }
@@ -118,22 +125,22 @@ void Solver::collide_bgk()
 }
 
 // ---------------------------------------------------------------------------
-// MRT collision (D2Q9 only — uses the standard 9x9 transformation matrix)
+// MRT 碰撞（多松弛时间，仅 D2Q9）— 使用标准 9×9 变换矩阵
 // ---------------------------------------------------------------------------
 void Solver::collide_mrt()
 {
     if (grid_.model != LatticeModel::D2Q9) {
-        // Fall back to BGK for 3-D until MRT matrices are implemented
+        // 三维情形暂未实现 MRT 矩阵，回退到 BGK
         collide_bgk();
         return;
     }
 
-    // Standard D2Q9 MRT relaxation rates
+    // D2Q9 标准 MRT 松弛率
     // s = [s0, s1, s2, s3, s4, s5, s6, s7, s8]
-    // Viscosity-related: s7 = s8 = omega_
+    // 与粘度相关的分量：s7 = s8 = omega_
     const double s[d2q9::Q] = {1.0, 1.4, 1.4, 1.0, 1.2, 1.0, 1.2, omega_, omega_};
 
-    // D2Q9 transformation matrix M
+    // D2Q9 变换矩阵 M
     static const double M[d2q9::Q][d2q9::Q] = {
         { 1,  1,  1,  1,  1,  1,  1,  1,  1},
         {-4, -1, -1, -1, -1,  2,  2,  2,  2},
@@ -157,7 +164,7 @@ void Solver::collide_mrt()
         const double* ui = &grid_.u[i * d];
         const double  ri = grid_.rho[i];
 
-        // Project to moment space: m = M * f
+        // 投影到矩空间：m = M * f
         double m[d2q9::Q] = {};
         for (int k = 0; k < d2q9::Q; ++k) {
             for (int a = 0; a < d2q9::Q; ++a) {
@@ -165,7 +172,7 @@ void Solver::collide_mrt()
             }
         }
 
-        // Compute equilibrium moments: m_eq
+        // 计算平衡矩：m_eq
         double m_eq[d2q9::Q];
         const double ux = ui[0];
         const double uy = ui[1];
@@ -180,14 +187,13 @@ void Solver::collide_mrt()
         m_eq[7] = ri * (ux * ux - uy * uy);
         m_eq[8] = ri * ux * uy;
 
-        // Relaxation in moment space: m* = m - S(m - m_eq)
+        // 在矩空间中进行松弛：m* = m - S(m - m_eq)
         double m_star[d2q9::Q];
         for (int k = 0; k < d2q9::Q; ++k) {
             m_star[k] = m[k] - s[k] * (m[k] - m_eq[k]);
         }
 
-        // Back-project: f* = M^{-1} m*  (M^{-1} = M^T / 36 for normalised M)
-        // Use the known inverse coefficients for the standard D2Q9 MRT matrix
+        // 反投影：f* = M^{-1} m*（归一化 D2Q9 MRT 矩阵有已知逆系数）
         static const double Mi[d2q9::Q][d2q9::Q] = {
             { 1.0/9,  -1.0/9,  1.0/9,  0,     0,     0,     0,     0,     0    },
             { 1.0/9,  -1.0/36, -1.0/18, 1.0/6, -1.0/6, 0,     0,     1.0/4, 0    },
@@ -211,22 +217,24 @@ void Solver::collide_mrt()
 }
 
 // ---------------------------------------------------------------------------
-// Guo et al. (2002) forcing term:  F_a = w_a (1 - ω/2) [(c_a - u)/cs² + (c_a·u)c_a/cs⁴] · F
-// Applied as a correction to f_a after BGK relaxation.
+// Guo et al. (2002) 体力格式：
+//   F_a = w_a (1 - ω/2) [(c_a - u)/cs² + (c_a·u)c_a/cs⁴] · F
+// 在 BGK 松弛后作为对 f_a 的修正项加入。
 // ---------------------------------------------------------------------------
 void Solver::apply_guo_forcing(int node, const double* F, double* /*f_a_ptr*/)
 {
-    // The correction is accumulated into grid_.force and handled
-    // during the equilibrium computation via the velocity shift:
+    // 修正量通过速度偏移累积到 grid_.force 中并在 compute_macroscopic() 中处理：
     //   u_eff = u + F*dt/(2*rho)
-    // This is already captured in compute_macroscopic() being called
-    // before collide(), provided the caller follows the standard sequence.
-    // A full Guo correction requires per-direction term; implemented below.
+    // 只要调用方遵循标准时序（在 collide() 前调用 compute_macroscopic()），
+    // 此方式已在平衡值计算中隐式捕获。
+    // 完整的 Guo 修正需要逐方向项；下方为占位实现。
     (void)node;
     (void)F;
-    // TODO: Implement per-direction Guo correction when non-zero forces present.
+    // TODO: 当存在非零体力时实现逐方向 Guo 修正。
 }
 
+// ---------------------------------------------------------------------------
+// 流式迁移：将分布函数沿各离散速度方向传播
 // ---------------------------------------------------------------------------
 void Solver::stream()
 {
@@ -242,7 +250,7 @@ void Solver::stream()
             for (int i = 0; i < nx; ++i) {
                 const int src = grid_.idx(i, j);
                 for (int a = 0; a < d2q9::Q; ++a) {
-                    // Destination node (periodic wrap)
+                    // 目标节点（周期性取模）
                     int di = (i + d2q9::C[a][0] + nx) % nx;
                     int dj = (j + d2q9::C[a][1] + ny) % ny;
                     int dst = grid_.idx(di, dj);
@@ -270,6 +278,7 @@ void Solver::stream()
         }
     }
 
+    // 将迁移后的临时缓冲区与主缓冲区交换，并更新宏观量
     std::swap(grid_.f, grid_.f_tmp);
     grid_.compute_macroscopic();
 }

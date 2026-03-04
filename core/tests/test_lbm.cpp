@@ -1,21 +1,21 @@
-// Test: LBM solver conserves mass and approaches equilibrium
+// 测试：LBM 求解器守恒质量并趋向平衡态
 #include "lbm/lattice.hpp"
 #include "lbm/solver.hpp"
 #include <cmath>
 #include <cstdio>
 #include <numeric>
 
-// Helper
+// 辅助函数：近似相等判断
 static bool approx(double a, double b, double tol = 1e-10) {
     return std::abs(a - b) < tol;
 }
 
-// Test 1: Total mass (sum of rho) is conserved under collision+streaming
+// 测试 1：碰撞 + 流式迁移后总质量（ρ 之和）守恒
 static int test_mass_conservation()
 {
     const int nx = 16, ny = 16;
     lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
-    // Perturb density slightly
+    // 轻微扰动密度
     for (int i = 0; i < g.size(); ++i) g.rho[i] = 1.0 + 0.01 * (i % 5);
 
     const double omega = 1.0;
@@ -31,7 +31,7 @@ static int test_mass_conservation()
     return ok ? 0 : 1;
 }
 
-// Test 2: f_eq integrates to rho
+// 测试 2：f_eq 对所有方向求和等于 rho（归一化验证）
 static int test_feq_normalisation()
 {
     const double rho = 1.2;

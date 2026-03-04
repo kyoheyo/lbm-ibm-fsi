@@ -10,45 +10,45 @@ use config::Config;
 use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver};
 
 // ---------------------------------------------------------------------------
-/// LBM + IBM + FSI solver
+/// LBM + IBM + FSI 求解器
 ///
-/// Two output strategies run in parallel during the simulation loop:
+/// 仿真循环中并行运行两种输出策略：
 ///
-/// 1. **High-frequency NPZ snapshots** (every `write_interval` steps):
-///    the full Eulerian field (ρ, ux, uy) is written by Rust natively to
-///    `<output.directory>/fluid_<NNNNNN>.npz`, readable by
-///    `lbm_post.vtk_reader.NpzReader`.
+/// 1. **高频：NPZ 快照**（每 `write_interval` 步）：
+///    完整欧拉场（ρ、ux、uy）由 Rust 原生写出到
+///    `<output.directory>/fluid_<NNNNNN>.npz`，可被
+///    `lbm_post.vtk_reader.NpzReader` 读取。
 ///
-/// 2. **Per-step CSV monitor log** (when `output.enable_csv_monitor = true`):
-///    scalar quantities are appended to `<output.directory>/monitor.csv`
-///    every step — lightweight time-series recording.
+/// 2. **逐步：CSV 监控日志**（当 `output.enable_csv_monitor = true`）：
+///    每步将标量量追加到 `<output.directory>/monitor.csv` ——
+///    轻量级时间序列记录。
 ///
-/// Additionally, when the `python-ffi` Cargo feature is active:
+/// 此外，当 `python-ffi` Cargo 特性启用时：
 ///
-/// 3. **Low-frequency contour plots** (every `output.plot_interval` steps):
-///    field arrays are passed in-memory to `lbm_post.bridge.plot_field_raw()`
-///    via pyo3 — no intermediate `.npz` files are created for plotting.
+/// 3. **低频：Python FFI 等值线图**（每 `output.plot_interval` 步）：
+///    场数组在内存中传递给 `lbm_post.bridge.plot_field_raw()`
+///    —— 不创建中间 `.npz` 文件。
 ///
-/// 4. **IBM marker generation** (once at start-up, when `[ibm]` is present):
-///    `lbm_pre.bridge.geometry_markers_raw()` returns marker coordinates
-///    directly to Rust without producing a CSV file.
+/// 4. **IBM 标记点生成**（启动时，若存在 `[ibm]` 段）：
+///    `lbm_pre.bridge.geometry_markers_raw()` 直接返回标记点坐标，
+///    不生成 CSV 文件。
 ///
-/// The `python.pre_script` / `python.post_script` subprocess mode is always
-/// available regardless of the `python-ffi` feature flag.
+/// 无论是否启用 `python-ffi` 特性，
+/// `python.pre_script` / `python.post_script` 子进程模式始终可用。
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Path to the TOML configuration file
+    /// TOML 配置文件路径
     #[arg(short, long, default_value = "configs/lid_driven_cavity.toml")]
     config: PathBuf,
 
-    /// Override the number of time steps
+    /// 覆盖时间步数
     #[arg(short, long)]
     steps: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
-/// Run a Python script as a subprocess and wait for it to finish.
+/// 以子进程方式运行 Python 脚本并等待其结束。
 fn run_python_subprocess(interpreter: &str, script: &str, args: &[&str]) -> Result<()> {
     println!("  [python subprocess] {} {} {}", interpreter, script, args.join(" "));
     let status = std::process::Command::new(interpreter)
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     println!("ω      : {:.6}", cfg.omega());
 
     // -----------------------------------------------------------------------
-    // Plugin startup log
+    // 插件启动日志
     // -----------------------------------------------------------------------
     if cfg.plugins.any_active() {
         println!("Plugins:");
@@ -96,23 +96,23 @@ fn main() -> Result<()> {
         if !cfg.plugins.flexible.is_empty() {
             println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
         }
-        // NOTE: To register a plugin implementation, call
+        // 注意：若要注册插件实现，请在仿真循环前调用：
         //   lbm_bindings::register_plugins(PluginCallbacks { boundary_fn: Some(my_fn), .. })
-        // before the simulation loop.  Plugin names above are informational only.
+        // 上方的插件名称仅供提示，不自动加载共享库。
     }
 
     // -----------------------------------------------------------------------
-    // Python FFI: extend sys.path so lbm_pre / lbm_post are importable
+    // Python FFI：扩展 sys.path 使 lbm_pre / lbm_post 可导入
     // -----------------------------------------------------------------------
     if let Some(ref extra_path) = cfg.python.pythonpath {
-        // add_python_path is a no-op (returns Ok) when python-ffi is disabled
+        // 未启用 python-ffi 特性时，add_python_path 为无操作（返回 Ok）
         if let Err(e) = python_bridge::add_python_path(extra_path) {
             eprintln!("[python-ffi] sys.path extension failed: {e}");
         }
     }
 
     // -----------------------------------------------------------------------
-    // Pre-processing: subprocess script
+    // 预处理：Python 子进程脚本
     // -----------------------------------------------------------------------
     if let Some(ref script) = cfg.python.pre_script.clone() {
         println!("\n--- Pre-processing (Python subprocess) ---");
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // IBM marker generation via Python FFI (no CSV file produced)
+    // 通过 Python FFI 生成 IBM 标记点（不产生 CSV 文件）
     // -----------------------------------------------------------------------
     #[cfg(feature = "python-ffi")]
     {
@@ -140,8 +140,8 @@ fn main() -> Result<()> {
                         x.len(), x_min, x_max, y_min, y_max,
                         ds.first().copied().unwrap_or(0.0),
                     );
-                    // TODO: forward (x, y, ds) to the C++ IBM kernel once
-                    //       that interface is exposed through lbm_bindings.
+                    // TODO: 待 lbm_bindings 暴露对应接口后，
+                    //       将 (x, y, ds) 转发给 C++ IBM 核心。
                     let _ = (x, y, ds);
                 }
                 Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
         _     => CollisionModel::Bgk,
     };
 
-    // Initialise fluid grid
+    // 初始化流体格子网格
     let mut grid = LbmGrid::new(
         cfg.fluid.nx as i32,
         cfg.fluid.ny as i32,
@@ -168,10 +168,10 @@ fn main() -> Result<()> {
         model,
     );
 
-    // Initialise solver
+    // 初始化求解器
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
 
-    // Create output directory
+    // 创建输出目录
     std::fs::create_dir_all(&cfg.output.directory)?;
 
     let csv_path = format!("{}/monitor.csv", cfg.output.directory);
@@ -187,14 +187,14 @@ fn main() -> Result<()> {
 
         let time = (step + 1) as f64 * cfg.simulation.dt;
 
-        // -- High-frequency: native Rust NPZ snapshot ----------------------
+        // -- 高频：原生 Rust NPZ 快照 ----------------------------------------
         if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
             println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
             output::write_snapshot_npz(&grid, step + 1, time, &cfg.output.directory)
                 .with_context(|| format!("Failed to write snapshot at step {}", step + 1))?;
         }
 
-        // -- Per-step: lightweight CSV monitor log -------------------------
+        // -- 逐步：轻量级 CSV 监控日志 -----------------------------------------
         if cfg.output.enable_csv_monitor {
             let n = (grid.nx() * grid.ny()) as usize;
             let ke: f64 = (0..n)
@@ -210,7 +210,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))?;
         }
 
-        // -- Low-frequency: Python FFI contour plot (python-ffi feature) ---
+        // -- 低频：Python FFI 等值线图（python-ffi 特性）-----------------------
         #[cfg(feature = "python-ffi")]
         if let Some(pi) = cfg.output.plot_interval {
             if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
@@ -238,7 +238,7 @@ fn main() -> Result<()> {
     println!("\nSimulation complete.");
 
     // -----------------------------------------------------------------------
-    // Post-processing: subprocess script
+    // 后处理：Python 子进程脚本
     // -----------------------------------------------------------------------
     if let Some(ref script) = cfg.python.post_script.clone() {
         println!("\n--- Post-processing (Python subprocess) ---");

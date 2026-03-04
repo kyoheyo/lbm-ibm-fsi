@@ -1,37 +1,37 @@
 #pragma once
 /// @file plugins/mesh_plugin.hpp
-/// @brief Extension interface for custom mesh handling (e.g. adaptive refinement).
+/// @brief 自定义网格处理（例如自适应细化）的扩展接口。
 ///
-/// ## How to add a new mesh handling method
+/// ## 如何添加新的网格处理方法
 ///
-/// The LBM core uses a uniform Cartesian Eulerian grid, so "mesh adaptation"
-/// in this context means any algorithm that **modifies the grid topology,
-/// node layout, or grid-spacing information** at run time.  Typical use-cases:
+/// LBM 核心使用均匀笛卡尔欧拉网格，因此此处的"网格自适应"
+/// 指在运行时**修改网格拓扑、节点布局或网格间距信息**的算法。
+/// 典型使用场景：
 ///
-/// - Stretched / non-uniform lattice spacing
-/// - Dynamic block refinement (locally refine cells near a boundary layer)
-/// - Overset / Chimera grid coupling
+/// - 拉伸 / 非均匀格子间距
+/// - 动态块细化（在边界层附近局部细化网格格子）
+/// - 覆盖网格 / Chimera 网格耦合
 ///
-/// ### Steps
-/// 1. Subclass `IMeshPlugin`.
-/// 2. Override `initialize()` to set up data structures before the loop.
-/// 3. Override `adapt()` to evolve the mesh each step (or every N steps).
-/// 4. Register:
+/// ### 步骤
+/// 1. 继承 `IMeshPlugin`。
+/// 2. 重写 `initialize()` 以在仿真循环前建立数据结构。
+/// 3. 重写 `adapt()` 以在每步（或每 N 步）演化网格。
+/// 4. 注册：
 ///    ```cpp
 ///    MyMeshPlugin plugin;
 ///    PluginRegistry::instance().set_mesh_plugin(&plugin);
 ///    ```
 ///
-/// ### Example skeleton
+/// ### 骨架示例
 /// ```cpp
 /// #include "plugins/mesh_plugin.hpp"
 /// class StretchedZMesh : public lbm::IMeshPlugin {
 /// public:
 ///     void initialize(lbm::LatticeGrid& grid, const void* /*cfg*/) override {
-///         // Pre-compute stretched coordinates stored as user data
+///         // 预计算作为用户数据存储的拉伸坐标
 ///     }
 ///     void adapt(lbm::LatticeGrid& grid, int step) override {
-///         // Optionally re-balance after every 1000 steps
+///         // 每 1000 步后可选地重新平衡
 ///         if (step % 1000 == 0) rebalance(grid);
 ///     }
 ///     const char* name() const override { return "stretched_z"; }
@@ -42,29 +42,29 @@
 
 namespace lbm {
 
-/// Abstract interface for a custom mesh-refinement / mesh-handling plugin.
+/// 自定义网格细化 / 网格处理插件的抽象接口。
 ///
-/// Implement this interface to add a new mesh partitioning strategy or
-/// adaptive-refinement scheme without modifying the core solver.
+/// 实现此接口可在不修改核心求解器的情况下添加新的网格划分策略
+/// 或自适应细化方案。
 class IMeshPlugin {
 public:
     virtual ~IMeshPlugin() = default;
 
-    /// One-time setup called **before** the time-integration loop begins.
+    /// 时间积分循环**开始前**调用的一次性初始化。
     ///
-    /// @param grid  The lattice grid (may be re-sized or restructured here).
-    /// @param cfg   Optional pointer to plugin-specific configuration data.
-    ///              Cast to a concrete type inside the implementation.
+    /// @param grid  格子网格（可在此处调整大小或重构）。
+    /// @param cfg   指向插件特定配置数据的可选指针。
+    ///              在实现内部转换为具体类型。
     virtual void initialize(LatticeGrid& grid, const void* cfg = nullptr) = 0;
 
-    /// Per-step mesh adaptation hook, called **after** streaming and
-    /// macroscopic update in `Solver::step()`.
+    /// 每步网格自适应钩子，在 `Solver::step()` 中流式迁移和
+    /// 宏观量更新**之后**调用。
     ///
-    /// @param grid  The lattice grid.
-    /// @param step  Current simulation step index (0-based).
+    /// @param grid  格子网格。
+    /// @param step  当前仿真步骤索引（从 0 开始）。
     virtual void adapt(LatticeGrid& grid, int step) = 0;
 
-    /// Short identifier (e.g. "adaptive_uniform", "stretched_z").
+    /// 短标识符（例如 `"adaptive_uniform"`、`"stretched_z"`）。
     virtual const char* name() const = 0;
 };
 

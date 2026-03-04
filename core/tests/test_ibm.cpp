@@ -1,4 +1,4 @@
-// Test: IBM marker creation and delta-function properties
+// 测试：IBM 标记点创建与 δ 函数特性
 #include "ibm/marker.hpp"
 #include "ibm/interpolation.hpp"
 #include <cmath>
@@ -9,7 +9,7 @@ static bool approx(double a, double b, double tol = 1e-10) {
     return std::abs(a - b) < tol;
 }
 
-// Test 1: Circle marker count matches request
+// 测试 1：圆形标记点数量与请求数量一致
 static int test_circle_marker_count()
 {
     const int n = 64;
@@ -19,7 +19,7 @@ static int test_circle_marker_count()
     return ok ? 0 : 1;
 }
 
-// Test 2: Circle markers lie on the circle
+// 测试 2：圆形标记点均位于指定圆周上
 static int test_circle_marker_positions()
 {
     const double cx = 0.5, cy = 0.5, r = 0.25;
@@ -35,7 +35,7 @@ static int test_circle_marker_positions()
     return ok ? 0 : 1;
 }
 
-// Test 3: Delta function integrates to ~1 over its support
+// 测试 3：δ 函数在其支撑域上的积分近似等于 1
 static int test_delta_normalisation()
 {
     const double h = 1.0;
@@ -52,7 +52,7 @@ static int test_delta_normalisation()
     return ok ? 0 : 1;
 }
 
-// Test 4: Filament marker spacing is uniform
+// 测试 4：丝状体标记点间距均匀
 static int test_filament_spacing()
 {
     const int n = 11;

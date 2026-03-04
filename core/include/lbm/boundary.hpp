@@ -4,38 +4,38 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
-// Boundary condition types
+// 边界条件类型
 // ---------------------------------------------------------------------------
 enum class BCType {
-    BounceBack,     ///< No-slip wall (simple bounce-back)
-    ZouHe_Velocity, ///< Zou-He velocity inlet/outlet
-    ZouHe_Pressure, ///< Zou-He pressure inlet/outlet
-    Periodic,       ///< Handled implicitly during streaming
+    BounceBack,     ///< 无滑移壁面（简单反弹）
+    ZouHe_Velocity, ///< Zou-He 速度进/出口
+    ZouHe_Pressure, ///< Zou-He 压力进/出口
+    Periodic,       ///< 周期边界（在流式迁移中隐式处理）
 };
 
 // ---------------------------------------------------------------------------
-// Face enum — which face of the rectangular domain
+// 面（Face）枚举 — 矩形计算域的六个面
 // ---------------------------------------------------------------------------
 enum class Face { West, East, South, North, Bottom, Top };
 
 // ---------------------------------------------------------------------------
-// BoundaryCondition descriptor
+// 边界条件描述符
 // ---------------------------------------------------------------------------
 struct BoundaryCondition {
     BCType type;
     Face   face;
 
-    /// Prescribed velocity (ZouHe_Velocity)
+    /// 指定速度（用于 ZouHe_Velocity）
     double ux = 0.0;
     double uy = 0.0;
     double uz = 0.0;
 
-    /// Prescribed density (ZouHe_Pressure)
+    /// 指定密度（用于 ZouHe_Pressure）
     double rho = 1.0;
 };
 
 // ---------------------------------------------------------------------------
-// Apply all registered boundary conditions to the grid
+// 将所有已注册的边界条件应用到网格
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
                                 const std::vector<BoundaryCondition>& bcs);

@@ -1,21 +1,18 @@
-//! Native Rust output routines for the LBM orchestrator.
+//! LBM 主控程序的原生 Rust 输出模块。
 //!
-//! Two complementary output strategies are implemented:
+//! 实现了两种互补的输出策略：
 //!
-//! ## High-frequency: NPZ snapshot files
+//! ## 高频：NPZ 快照文件
 //!
-//! [`write_snapshot_npz`] writes the complete Eulerian field (ρ, ux, uy) to a
-//! NumPy-compatible `.npz` archive every `write_interval` time steps.  The
-//! format is readable by `lbm_post.vtk_reader.NpzReader` without any
-//! additional tools.
+//! [`write_snapshot_npz`] 每隔 `write_interval` 步将完整欧拉场（ρ、ux、uy）
+//! 写入兼容 NumPy 格式的 `.npz` 压缩归档文件。
+//! 该格式可直接被 `lbm_post.vtk_reader.NpzReader` 读取，无需额外工具。
 //!
-//! ## Per-step: CSV monitor log
+//! ## 逐步：CSV 监控日志
 //!
-//! [`append_monitor_csv`] appends a single row of scalar quantities to a
-//! lightweight CSV file every time step (or at whatever frequency the caller
-//! chooses).  This is suitable for time-series data such as drag coefficient,
-//! lift coefficient, bulk kinetic energy, etc., which need to be recorded at
-//! every step but consume negligible storage.
+//! [`append_monitor_csv`] 每个时间步（或调用方选定的频率）向轻量级 CSV
+//! 文件追加一行标量数据，适用于需要逐步记录但存储量极小的时间序列，
+//! 例如阻力系数、升力系数、体积平均动能等。
 
 use std::io::Write as IoWrite;
 use std::path::Path;
@@ -24,22 +21,22 @@ use anyhow::{Context, Result};
 use lbm_bindings::LbmGrid;
 
 // ---------------------------------------------------------------------------
-// NPZ snapshot writer
+// NPZ 快照写出器
 // ---------------------------------------------------------------------------
 
-/// Write one Eulerian field snapshot as a NumPy `.npz` archive.
+/// 将一个欧拉场快照写为 NumPy `.npz` 压缩归档文件。
 ///
-/// The archive contains the arrays expected by `lbm_post.vtk_reader.NpzReader`:
+/// 归档中包含 `lbm_post.vtk_reader.NpzReader` 所期望的数组：
 ///
-/// | Key      | Shape       | Dtype   | Description           |
-/// |----------|-------------|---------|-----------------------|
-/// | `rho`    | `(ny, nx)`  | float64 | density               |
-/// | `ux`     | `(ny, nx)`  | float64 | x-velocity            |
-/// | `uy`     | `(ny, nx)`  | float64 | y-velocity            |
-/// | `step`   | scalar      | int64   | time-step index       |
-/// | `time`   | scalar      | float64 | physical time         |
+/// | 键名     | 形状        | 数据类型  | 说明           |
+/// |----------|-------------|-----------|----------------|
+/// | `rho`    | `(ny, nx)`  | float64   | 密度           |
+/// | `ux`     | `(ny, nx)`  | float64   | x 方向速度     |
+/// | `uy`     | `(ny, nx)`  | float64   | y 方向速度     |
+/// | `step`   | 标量        | int64     | 时间步索引     |
+/// | `time`   | 标量        | float64   | 物理时间       |
 ///
-/// File name: `<directory>/fluid_<NNNNNN>.npz`
+/// 文件名格式：`<directory>/fluid_<NNNNNN>.npz`
 pub fn write_snapshot_npz(
     grid: &LbmGrid,
     step: u64,
@@ -50,7 +47,7 @@ pub fn write_snapshot_npz(
     let ny = grid.ny() as usize;
     let n  = nx * ny;
 
-    // Collect field arrays from the C++ grid (row-major: index = j*nx + i)
+    // 从 C++ 格子网格收集场数组（行主序：索引 = j*nx + i）
     let mut rho = Vec::with_capacity(n);
     let mut ux  = Vec::with_capacity(n);
     let mut uy  = Vec::with_capacity(n);
@@ -87,20 +84,19 @@ pub fn write_snapshot_npz(
 }
 
 // ---------------------------------------------------------------------------
-// CSV monitor log writer
+// CSV 监控日志写出器
 // ---------------------------------------------------------------------------
 
-/// Append one row to a CSV monitor log.
+/// 向 CSV 监控日志追加一行数据。
 ///
-/// If the file does not yet exist it is created and a header row is written
-/// first.  Otherwise the row is simply appended.
+/// 若文件不存在则创建并先写入标题行；否则直接追加数据行。
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `path`   – path to the CSV file (e.g. `"output/monitor.csv"`)
-/// * `step`   – current time-step index
-/// * `time`   – current physical time
-/// * `fields` – slice of `(name, value)` pairs written as extra columns
+/// * `path`   — CSV 文件路径（例如 `"output/monitor.csv"`）
+/// * `step`   — 当前时间步索引
+/// * `time`   — 当前物理时间
+/// * `fields` — `(列名, 值)` 元组切片，写为额外列
 pub fn append_monitor_csv(
     path: &str,
     step: u64,
@@ -110,7 +106,7 @@ pub fn append_monitor_csv(
     let p = Path::new(path);
     let needs_header = !p.exists();
 
-    // Open in append mode (create if absent)
+    // 以追加模式打开（不存在则创建）
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -137,21 +133,20 @@ pub fn append_monitor_csv(
 }
 
 // ---------------------------------------------------------------------------
-// NumPy .npy encoding helpers
+// NumPy .npy 编码辅助函数
 // ---------------------------------------------------------------------------
-// The .npy format (v1.0) is:
-//   magic (6 B)  +  version (2 B)  +  HEADER_LEN (u16 LE)  +  header  +  data
-// The preamble is 10 bytes; the total of preamble + header must be padded to
-// a multiple of 64 bytes.
+// .npy 格式（v1.0）：
+//   魔数（6 字节）+ 版本号（2 字节）+ HEADER_LEN（u16 小端）+ 头部 + 数据
+// 前导部分共 10 字节；前导 + 头部总长度必须是 64 字节的倍数。
 
-/// Encode a `f64` slice as a `.npy` byte buffer with the given shape.
+/// 将 `f64` 切片编码为指定形状的 `.npy` 字节缓冲区。
 pub fn npy_f64(data: &[f64], shape: &[usize]) -> Vec<u8> {
     npy_encode(data, "<f8", shape, |v: &f64, buf: &mut Vec<u8>| {
         buf.extend_from_slice(&v.to_le_bytes());
     })
 }
 
-/// Encode an `i64` slice as a `.npy` byte buffer with the given shape.
+/// 将 `i64` 切片编码为指定形状的 `.npy` 字节缓冲区。
 pub fn npy_i64(data: &[i64], shape: &[usize]) -> Vec<u8> {
     npy_encode(data, "<i8", shape, |v: &i64, buf: &mut Vec<u8>| {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -177,8 +172,8 @@ fn npy_encode<T>(
         "{{'descr': '{dtype_str}', 'fortran_order': False, 'shape': {shape_str}, }}"
     );
 
-    // Pad so that 10 (preamble) + header_len is a multiple of 64
-    let raw_len = raw_header.len() + 1; // +1 for trailing '\n'
+    // 填充使得 10（前导）+ header_len 是 64 的倍数
+    let raw_len = raw_header.len() + 1; // +1 为末尾 '\n'
     let total_pre = 10_usize + raw_len;
     let pad = if total_pre % 64 == 0 { 0 } else { 64 - (total_pre % 64) };
     let header_len = raw_len + pad;
@@ -191,8 +186,8 @@ fn npy_encode<T>(
     let mut buf = Vec::with_capacity(10 + header_len + data_bytes);
 
     buf.extend_from_slice(b"\x93NUMPY");
-    buf.push(0x01); // version major
-    buf.push(0x00); // version minor
+    buf.push(0x01); // 版本号主版本
+    buf.push(0x00); // 版本号次版本
     let hlen = header_len as u16;
     buf.extend_from_slice(&hlen.to_le_bytes());
     buf.extend_from_slice(&header_bytes);
@@ -207,28 +202,27 @@ fn npy_encode<T>(
 mod tests {
     use super::*;
 
-    /// Verify that the .npy header produced by `npy_f64` can be parsed by
-    /// checking the magic bytes, version, and total alignment.
+    /// 验证 `npy_f64` 生成的 .npy 头部中魔数、版本号和对齐均正确。
     #[test]
     fn test_npy_magic_and_alignment() {
         let buf = npy_f64(&[1.0_f64, 2.0, 3.0, 4.0], &[2, 2]);
-        // Magic
+        // 魔数
         assert_eq!(&buf[0..6], b"\x93NUMPY");
-        // Version 1.0
+        // 版本 1.0
         assert_eq!(buf[6], 1);
         assert_eq!(buf[7], 0);
-        // Total header region (preamble 10 B + header_len) must be % 64 == 0
+        // 前导（10 字节）+ header_len 必须是 64 的倍数
         let hlen = u16::from_le_bytes([buf[8], buf[9]]) as usize;
         assert_eq!((10 + hlen) % 64, 0);
-        // Data region must contain 4 x 8 = 32 bytes
+        // 数据区必须包含 4 × 8 = 32 字节
         assert_eq!(buf.len(), 10 + hlen + 32);
     }
 
     #[test]
     fn test_npy_scalar_shape() {
-        // A 0-D array (scalar) uses shape `()`
+        // 0 维数组（标量）使用形状 `()`
         let buf = npy_i64(&[42_i64], &[]);
-        // Should contain the 8-byte LE value of 42
+        // 应包含 42 的 8 字节小端表示
         let hlen = u16::from_le_bytes([buf[8], buf[9]]) as usize;
         let data = &buf[10 + hlen..];
         assert_eq!(data.len(), 8);
@@ -263,7 +257,7 @@ mod tests {
         append_monitor_csv(p, 2, 2.0, &[("ke", 0.2)]).unwrap();
         let text = std::fs::read_to_string(&csv_path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        // 1 header + 2 data rows
+        // 1 行标题 + 2 行数据
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("step,time"));
     }

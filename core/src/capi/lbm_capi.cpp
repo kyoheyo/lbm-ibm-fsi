@@ -1,5 +1,4 @@
-// C ABI wrapper — allows Rust (and any C consumer) to call the C++ core
-// without C++ name mangling.
+// C ABI 封装层 — 允许 Rust（及任何 C 消费者）在不依赖 C++ 名称修饰的情况下调用 C++ 核心库
 #include "lbm/lattice.hpp"
 #include "lbm/solver.hpp"
 #include "plugins/plugin_registry.hpp"
@@ -7,7 +6,7 @@
 #include <new>
 
 // ---------------------------------------------------------------------------
-// C-callback typedefs (must match plugin_registry.cpp)
+// C 回调函数类型别名（必须与 plugin_registry.cpp 中的声明一致）
 // ---------------------------------------------------------------------------
 extern "C" {
 
@@ -18,7 +17,7 @@ typedef void (*lbm_motion_fn)   (void* grid, void* markers,
 typedef void (*lbm_flexible_fn) (void* markers, double dt, int step,
                                   void* userdata);
 
-// Declared in plugin_registry.cpp
+// 声明于 plugin_registry.cpp
 void lbm_set_plugins(
     lbm_boundary_fn   boundary_fn,  void* boundary_data,
     lbm_mesh_adapt_fn mesh_fn,      void* mesh_data,
@@ -30,17 +29,19 @@ void lbm_set_plugins(
 extern "C" {
 
 // ---------------------------------------------------------------------------
-// LatticeGrid
+// LatticeGrid 函数
 // ---------------------------------------------------------------------------
 
+/// 在堆上创建 LatticeGrid 并返回指针；若分配失败返回 nullptr。
 lbm::LatticeGrid* lbm_grid_new(int nx, int ny, int nz, int model_id)
 {
-    // Validate model_id to avoid UB from out-of-range enum cast
+    // 验证 model_id 以避免越界枚举转换产生未定义行为
     if (model_id < 0 || model_id > 2) return nullptr;
     auto model = static_cast<lbm::LatticeModel>(model_id);
     return new (std::nothrow) lbm::LatticeGrid(nx, ny, nz, model);
 }
 
+/// 释放由 lbm_grid_new 创建的 LatticeGrid。
 void lbm_grid_free(lbm::LatticeGrid* g)
 {
     delete g;
@@ -50,18 +51,21 @@ int lbm_grid_nx(const lbm::LatticeGrid* g) { return g ? g->nx : 0; }
 int lbm_grid_ny(const lbm::LatticeGrid* g) { return g ? g->ny : 0; }
 int lbm_grid_nz(const lbm::LatticeGrid* g) { return g ? g->nz : 0; }
 
+/// 返回节点 idx 处的宏观密度 ρ；越界时返回 0。
 double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
     return g->rho[idx];
 }
 
+/// 返回节点 idx 处的 x 方向速度；越界时返回 0。
 double lbm_grid_ux(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
     return g->u[idx * g->dim() + 0];
 }
 
+/// 返回节点 idx 处的 y 方向速度；越界时返回 0。
 double lbm_grid_uy(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
@@ -69,65 +73,66 @@ double lbm_grid_uy(const lbm::LatticeGrid* g, int idx)
 }
 
 // ---------------------------------------------------------------------------
-// Solver
+// Solver 函数
 // ---------------------------------------------------------------------------
 
+/// 创建求解器并返回指针；指针无效或参数非法时返回 nullptr。
 lbm::Solver* lbm_solver_new(lbm::LatticeGrid* g, double omega, int cm_id)
 {
     if (!g) return nullptr;
-    // Validate collision model id
+    // 验证碰撞模型 id
     if (cm_id < 0 || cm_id > 1) return nullptr;
     auto cm = static_cast<lbm::CollisionModel>(cm_id);
     return new (std::nothrow) lbm::Solver(*g, omega, cm);
 }
 
+/// 释放由 lbm_solver_new 创建的 Solver。
 void lbm_solver_free(lbm::Solver* s)
 {
     delete s;
 }
 
-/// Advance the simulation by one step and invoke any registered plugins.
+/// 推进仿真一步并调用所有已注册的插件。
 ///
-/// This is the simplified overload that passes `step_index = 0` and `dt = 1.0`
-/// to all plugins.  If plugins need accurate step count or physical time
-/// (e.g. prescribed-motion trajectories, adaptive schedules), prefer
-/// `lbm_solver_step_n()` instead, which accepts explicit step_index and dt.
+/// 这是简化版接口，向所有插件传递 `step_index = 0` 和 `dt = 1.0`。
+/// 若插件需要准确的步骤计数或物理时间（例如规定运动轨迹、自适应调度），
+/// 请改用 `lbm_solver_step_n()`，它接受显式的 step_index 和 dt。
 ///
-/// Plugin call order within a single step:
-///   1. `IMotionPlugin::update()`       — update body/mesh positions (pre-collision)
-///   2. `Solver::step()`                — standard LBM collision + streaming
-///   3. `IBoundaryPlugin::apply()`      — custom boundary condition (post-streaming)
-///   4. `IMeshPlugin::adapt()`          — mesh adaptation (post-streaming)
-///   5. `IFlexibleSolverPlugin::step()` — flexible body advance (post-streaming)
+/// 单步内插件调用顺序：
+///   1. `IMotionPlugin::update()`       — 更新固体/网格位置（碰撞前）
+///   2. `Solver::step()`                — 标准 LBM 碰撞 + 流式迁移
+///   3. `IBoundaryPlugin::apply()`      — 自定义边界条件（流式迁移后）
+///   4. `IMeshPlugin::adapt()`          — 网格自适应（流式迁移后）
+///   5. `IFlexibleSolverPlugin::step()` — 柔性体推进（流式迁移后）
 void lbm_solver_step(lbm::Solver* s, lbm::LatticeGrid* g)
 {
     if (!s || !g) return;
 
     auto& reg = lbm::PluginRegistry::instance();
 
-    // 1. Motion plugin: update body/marker positions before collision
-    //    (no MarkerSet handle available via this ABI — pass nullptr)
+    // 1. 运动插件：碰撞前更新固体/标记点位置
+    //    （此 ABI 无 MarkerSet 句柄 — 传入 nullptr）
     reg.update_motion(*g, nullptr, /*dt=*/1.0, /*step=*/0);
 
-    // 2. Standard LBM step (collision + streaming + macroscopic update)
-    // The solver holds a reference to the grid passed at construction.
+    // 2. 标准 LBM 步骤（碰撞 + 流式迁移 + 宏观量更新）
+    // 求解器持有构造时传入的网格引用，此处变量 g 仅用于一致性
     (void)g;
     s->step();
 
-    // 3. Custom boundary condition plugin
+    // 3. 自定义边界条件插件
     reg.apply_boundary(*g, /*step=*/0);
 
-    // 4. Mesh adaptation plugin
+    // 4. 网格自适应插件
     reg.adapt_mesh(*g, /*step=*/0);
 
-    // 5. Flexible-body plugin (no MarkerSet via this simplified ABI)
+    // 5. 柔性体插件（此简化 ABI 无 MarkerSet）
     reg.step_flexible(nullptr, /*dt=*/1.0, /*step=*/0);
 }
 
-/// Extended solver step that forwards step index and dt to plugins.
+/// 带显式步骤索引和时间步长的扩展求解器步骤，将准确时间信息转发给插件。
 ///
-/// Prefer this over `lbm_solver_step()` when plugins need accurate
-/// time information (motion trajectories, adaptive schedule, etc.).
+/// 当插件需要准确的时间信息（运动轨迹、自适应调度等）时，
+/// 优先使用此函数而非 `lbm_solver_step()`。
 void lbm_solver_step_n(lbm::Solver* s, lbm::LatticeGrid* g,
                         int step_index, double dt)
 {
@@ -143,4 +148,3 @@ void lbm_solver_step_n(lbm::Solver* s, lbm::LatticeGrid* g,
 }
 
 } // extern "C"
-

@@ -9,22 +9,23 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
-// Simple bounce-back on a face
+// 简单反弹边界条件（施加在某一面上）
 // ---------------------------------------------------------------------------
 static void apply_bounce_back(LatticeGrid& g, Face face)
 {
     if (g.model != LatticeModel::D2Q9) {
-        // 3-D bounce-back omitted for brevity — extend similarly
+        // 三维反弹暂未实现，可仿照 D2Q9 扩展
         return;
     }
 
     const int nx = g.nx;
     const int ny = g.ny;
 
+    // 对单个节点应用反弹：将所有方向的分布函数替换为其反方向值
     auto bb_node = [&](int i, int j) {
         const int n = g.idx(i, j);
         for (int a = 1; a < d2q9::Q; ++a) {
-            // Reverse the direction
+            // 将方向 a 替换为其反方向 OPP[a]
             g.f[n * d2q9::Q + a] = g.f[n * d2q9::Q + d2q9::OPP[a]];
         }
     };
@@ -60,8 +61,8 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 }
 
 // ---------------------------------------------------------------------------
-// Zou-He velocity boundary condition (2-D, North face example)
-// Reference: Zou & He, Phys. Fluids 9(6), 1997
+// Zou-He 速度边界条件（二维，North 面示例）
+// 参考文献：Zou & He, Phys. Fluids 9(6), 1997
 // ---------------------------------------------------------------------------
 static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
 {
@@ -79,8 +80,8 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
         for (int i = 0; i < nx; ++i) {
             const int n = g.idx(i, ny - 1);
             double* f = &g.f[n * d2q9::Q];
-            // Known incoming: f[4], f[7], f[8]
-            // Unknown: f[2], f[5], f[6]
+            // 已知入射方向：f[4], f[7], f[8]
+            // 未知出射方向：f[2], f[5], f[6]
             double rho_w = (f[0] + f[1] + f[3]
                           + 2.0 * (f[4] + f[7] + f[8]))
                          / (1.0 + uy);
@@ -96,10 +97,12 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
             g.u[n * 2 + 1] = uy;
         }
     }
-    // Additional faces (West, East, South) follow the same pattern —
-    // extend as needed for specific problem setups.
+    // 其他面（West、East、South）遵循相同模式——
+    // 根据具体问题配置按需扩展。
 }
 
+// ---------------------------------------------------------------------------
+// 应用所有已注册的边界条件
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
                                 const std::vector<BoundaryCondition>& bcs)
@@ -113,10 +116,10 @@ void apply_boundary_conditions(LatticeGrid& grid,
                 apply_zou_he_velocity(grid, bc);
                 break;
             case BCType::ZouHe_Pressure:
-                // TODO: implement pressure BC
+                // TODO: 实现压力边界条件
                 break;
             case BCType::Periodic:
-                // Handled by periodic wrap in streaming
+                // 周期边界在流式迁移的周期性取模中隐式处理
                 break;
         }
     }

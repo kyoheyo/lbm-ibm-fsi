@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 // ---------------------------------------------------------------------------
-// Top-level simulation configuration (loaded from a TOML file)
+// 顶层仿真配置（从 TOML 文件加载）
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Clone)]
@@ -13,50 +13,50 @@ pub struct Config {
     pub structure: Option<StructureConfig>,
     pub ibm: Option<IbmConfig>,
     pub output: OutputConfig,
-    /// Optional Python integration (subprocess scripts + FFI plotting)
+    /// 可选 Python 集成（子进程脚本 + FFI 绘图）
     #[serde(default)]
     pub python: PythonConfig,
-    /// Optional plugin selection (boundary / mesh / motion / flexible)
+    /// 可选插件选择（边界条件 / 网格 / 运动 / 柔性体）
     #[serde(default)]
     pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SimulationConfig {
-    /// Total number of time steps
+    /// 总时间步数
     pub n_steps: u64,
-    /// Physical time step size
+    /// 物理时间步长
     pub dt: f64,
-    /// Lattice model: "D2Q9", "D3Q19", or "D3Q27"
+    /// 格子模型：`"D2Q9"`、`"D3Q19"` 或 `"D3Q27"`
     #[serde(default = "default_lattice_model")]
     pub lattice_model: String,
-    /// Collision model: "BGK" or "MRT"
+    /// 碰撞模型：`"BGK"` 或 `"MRT"`
     #[serde(default = "default_collision_model")]
     pub collision_model: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FluidConfig {
-    /// Grid dimensions
+    /// 网格尺寸
     pub nx: u32,
     pub ny: u32,
     #[serde(default = "default_nz")]
     pub nz: u32,
-    /// Kinematic viscosity (lattice units)
+    /// 运动粘度（格子单位）
     pub nu: f64,
-    /// Initial uniform density
+    /// 初始均匀密度
     #[serde(default = "default_rho")]
     pub rho0: f64,
-    /// Boundary conditions
+    /// 边界条件列表
     #[serde(default)]
     pub boundary_conditions: Vec<BoundaryConditionConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BoundaryConditionConfig {
-    /// "bounce_back", "zou_he_velocity", "zou_he_pressure"
+    /// `"bounce_back"`、`"zou_he_velocity"` 或 `"zou_he_pressure"`
     pub bc_type: String,
-    /// "west", "east", "south", "north", "bottom", "top"
+    /// `"west"`、`"east"`、`"south"`、`"north"`、`"bottom"` 或 `"top"`
     pub face: String,
     #[serde(default)]
     pub ux: f64,
@@ -70,83 +70,82 @@ pub struct BoundaryConditionConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StructureConfig {
-    /// Young's modulus
+    /// 杨氏模量
     pub young_modulus: f64,
-    /// Second moment of area
+    /// 截面惯性矩
     pub second_moment: f64,
-    /// Structural density
+    /// 结构密度
     pub density: f64,
-    /// Cross-sectional area
+    /// 截面面积
     pub area: f64,
-    /// Rest length
+    /// 静止长度
     pub length: f64,
-    /// Number of finite elements
+    /// 有限元单元数
     pub n_elements: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbmConfig {
-    /// "circle" or "filament"
+    /// `"circle"` 或 `"filament"`
     pub geometry: String,
-    /// Centre x (circle) or start x (filament)
+    /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）
     pub x0: f64,
-    /// Centre y (circle) or start y (filament)
+    /// 中心 y 坐标（圆形）或起点 y 坐标（丝状体）
     pub y0: f64,
-    /// Radius (circle) or length (filament)
+    /// 半径（圆形）或长度（丝状体）
     pub size: f64,
-    /// Number of Lagrangian markers
+    /// 拉格朗日标记点数量
     pub n_markers: u32,
-    /// Delta kernel: "two_point" or "four_point"
+    /// Delta 核函数：`"two_point"` 或 `"four_point"`
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
-    /// Write a NumPy `.npz` snapshot every this many time steps.
-    /// This is the **high-frequency** native-Rust output path.
+    /// 每隔多少时间步写出一个 NumPy `.npz` 快照。
+    /// 这是**高频**原生 Rust 输出路径。
     pub write_interval: u64,
-    /// Output directory for snapshots and plots
+    /// 快照和图像的输出目录
     #[serde(default = "default_output_dir")]
     pub directory: String,
-    /// How often (in steps) to invoke the Python FFI plotter for contour images.
-    /// `None` (or absent from TOML) disables in-process plotting.
-    /// This is the **low-frequency** Python-FFI output path.
+    /// 每隔多少步调用 Python FFI 绘图器生成等值线图（步数）。
+    /// `None`（或 TOML 中缺失）表示禁用进程内绘图。
+    /// 这是**低频** Python FFI 输出路径。
     #[serde(default)]
     pub plot_interval: Option<u64>,
-    /// Append a CSV row of monitor-point values every step when `true`.
-    /// Provides a **per-step lightweight** time-series output.
+    /// 为 `true` 时每步向 CSV 文件追加一行监控量数据。
+    /// 提供**逐步轻量级**时间序列输出。
     #[serde(default)]
     pub enable_csv_monitor: bool,
 }
 
-/// Python integration configuration.
+/// Python 集成配置。
 ///
-/// Supports two complementary modes:
+/// 支持两种互补模式：
 ///
-/// 1. **Subprocess mode** (`pre_script` / `post_script`): the Rust orchestrator
-///    launches a separate Python process before/after the simulation loop.
-///    Suitable for heavy pre/post-processing tasks (mesh generation, full
-///    post-processing pipelines) that can tolerate process-spawn overhead.
+/// 1. **子进程模式**（`pre_script` / `post_script`）：Rust 主控程序
+///    在仿真循环前/后启动独立的 Python 子进程。
+///    适用于可以接受进程启动开销的重型预/后处理任务（网格生成、
+///    完整后处理流水线）。
 ///
-/// 2. **FFI mode** (`plot_interval` in `[output]`): pyo3 calls Python functions
-///    in-process with direct memory transfer — field arrays are passed as
-///    Python lists without creating temporary files.  Requires the
-///    `python-ffi` Cargo feature.
+/// 2. **FFI 模式**（`[output]` 中的 `plot_interval`）：pyo3 在进程内
+///    直接调用 Python 函数，内存中传递数据——流场数组以 Python list
+///    形式传递，不创建临时文件。需要 `python-ffi` Cargo 特性。
 #[derive(Debug, Deserialize, Clone)]
 pub struct PythonConfig {
-    /// Python interpreter used for subprocess calls (default: "python3")
+    /// 子进程调用使用的 Python 解释器（默认：`"python3"`）
     #[serde(default = "default_python_interpreter")]
     pub interpreter: String,
-    /// Pre-processing script run before the simulation loop.
-    /// Receives the config file path as its first positional argument.
+    /// 仿真循环前执行的预处理脚本。
+    /// 脚本接受配置文件路径作为第一个位置参数。
     pub pre_script: Option<String>,
-    /// Post-processing script run after the simulation loop.
-    /// Receives the output directory as its first positional argument.
+    /// 仿真循环后执行的后处理脚本。
+    /// 脚本接受输出目录作为第一个位置参数。
     pub post_script: Option<String>,
-    /// Extra directory prepended to `sys.path` when using the FFI mode
-    /// so that `lbm_pre` / `lbm_post` are importable without a pip install.
-    /// Typically set to the `python/` sub-directory of the repository root.
+    /// 使用 FFI 模式时预置到 `sys.path` 的额外目录，
+    /// 使 `lbm_pre` / `lbm_post` 无需 pip 安装即可导入。
+    /// 通常设为仓库根目录下的 `python/` 子目录。
     pub pythonpath: Option<String>,
 }
 
@@ -162,52 +161,50 @@ impl Default for PythonConfig {
 }
 
 // ---------------------------------------------------------------------------
-/// Plugin selection configuration.
+/// 插件选择配置。
 ///
-/// Each field names a built-in plugin (or custom external plugin) to activate
-/// for the corresponding extension point.  An empty string or absent field
-/// means "use the default / no plugin".
+/// 每个字段命名一个内置插件（或自定义外部插件）以激活对应扩展点。
+/// 空字符串或缺失字段表示"使用默认值 / 不使用插件"。
 ///
-/// ## Available extension points
+/// ## 可用扩展点
 ///
-/// | Field | Interface | When called | Use-case examples |
-/// |-------|-----------|-------------|-------------------|
-/// | `boundary` | `IBoundaryPlugin` | After standard BCs each step | Convective outlet, open pressure, NRBC |
-/// | `mesh` | `IMeshPlugin` | After streaming each step | Adaptive refinement, stretched grid |
-/// | `motion` | `IMotionPlugin` | Before collision each step | Moving wall, 6-DOF rigid body, ALE |
-/// | `flexible` | `IFlexibleSolverPlugin` | After streaming each step | Kirchhoff plate, co-rotational beam |
+/// | 字段 | 接口 | 调用时机 | 使用场景示例 |
+/// |------|------|----------|------------|
+/// | `boundary` | `IBoundaryPlugin` | 每步标准边界条件后 | 对流出口、开放压力、NRBC |
+/// | `mesh` | `IMeshPlugin` | 每步流式迁移后 | 自适应细化、拉伸网格 |
+/// | `motion` | `IMotionPlugin` | 每步碰撞前 | 运动壁面、6 自由度刚体、ALE |
+/// | `flexible` | `IFlexibleSolverPlugin` | 每步流式迁移后 | Kirchhoff 板、协转梁 |
 ///
-/// ## TOML example
+/// ## TOML 示例
 ///
 /// ```toml
 /// [plugins]
-/// boundary = "convective_outlet"  # name printed in startup log
-/// mesh     = ""                   # no adaptive mesh
+/// boundary = "convective_outlet"  # 启动日志中打印的名称
+/// mesh     = ""                   # 无自适应网格
 /// motion   = "prescribed_sine"
-/// flexible = ""                   # use built-in BeamSolver
+/// flexible = ""                   # 使用内置 BeamSolver
 /// ```
 ///
-/// Plugins with non-empty names are logged at startup.  Actual plugin logic
-/// is registered via Rust code before the simulation loop; the name field is
-/// informational only and does not auto-load shared libraries.
+/// 名称非空的插件会在启动时打印日志。实际插件逻辑在仿真循环前通过
+/// Rust 代码注册；名称字段仅供提示，不自动加载共享库。
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct PluginsConfig {
-    /// Name of the custom boundary-condition plugin (empty = none).
+    /// 自定义边界条件插件名称（空 = 不使用）。
     #[serde(default)]
     pub boundary: String,
-    /// Name of the mesh-handling / adaptive-refinement plugin (empty = none).
+    /// 网格处理 / 自适应细化插件名称（空 = 不使用）。
     #[serde(default)]
     pub mesh: String,
-    /// Name of the moving-mesh / moving-body plugin (empty = none).
+    /// 运动网格 / 运动固体插件名称（空 = 不使用）。
     #[serde(default)]
     pub motion: String,
-    /// Name of the alternative flexible-body solver plugin (empty = none).
+    /// 替代柔性体求解器插件名称（空 = 不使用）。
     #[serde(default)]
     pub flexible: String,
 }
 
 impl PluginsConfig {
-    /// Returns true if at least one plugin name is configured.
+    /// 若至少一个插件名称已配置则返回 true。
     pub fn any_active(&self) -> bool {
         !self.boundary.is_empty()
             || !self.mesh.is_empty()
@@ -217,7 +214,7 @@ impl PluginsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Defaults
+// 默认值函数
 // ---------------------------------------------------------------------------
 fn default_lattice_model()      -> String { "D2Q9".to_string() }
 fn default_collision_model()    -> String { "BGK".to_string() }
@@ -229,7 +226,7 @@ fn default_python_interpreter() -> String { "python3".to_string() }
 
 // ---------------------------------------------------------------------------
 impl Config {
-    /// Load configuration from a TOML file
+    /// 从 TOML 文件加载配置
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -237,7 +234,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
-    /// Compute the LBM relaxation frequency ω from kinematic viscosity ν
+    /// 由运动粘度 ν 计算 LBM 松弛频率 ω
     ///   ν = cs² (1/ω - 1/2) = (1/3)(1/ω - 1/2)
     ///   ⟹ ω = 1 / (3ν + 0.5)
     pub fn omega(&self) -> f64 {
@@ -279,13 +276,13 @@ mod tests {
         assert_eq!(cfg.fluid.nx, 64);
         assert!((cfg.fluid.rho0 - 1.0_f64).abs() < 1e-12);
         assert_eq!(cfg.simulation.lattice_model, "D2Q9");
-        // [python] section is optional; defaults should apply
+        // [python] 段可选；默认值应生效
         assert_eq!(cfg.python.interpreter, "python3");
         assert!(cfg.python.pre_script.is_none());
         assert!(cfg.python.post_script.is_none());
         assert!(cfg.output.plot_interval.is_none());
         assert!(!cfg.output.enable_csv_monitor);
-        // [plugins] section absent → all names default to empty
+        // [plugins] 段缺失 → 所有名称默认为空字符串
         assert!(!cfg.plugins.any_active());
     }
 
@@ -354,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_plugins_config_defaults() {
-        // When [plugins] section is absent, all names should be empty.
+        // [plugins] 段缺失时，所有名称应默认为空字符串。
         let toml_str = r#"
             [simulation]
             n_steps = 10

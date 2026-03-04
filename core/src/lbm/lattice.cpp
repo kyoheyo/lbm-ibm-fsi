@@ -9,19 +9,23 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
+// LatticeGrid 构造函数：分配并初始化所有存储
+// ---------------------------------------------------------------------------
 LatticeGrid::LatticeGrid(int nx_, int ny_, int nz_, LatticeModel model_)
     : nx(nx_), ny(ny_), nz(nz_), model(model_)
 {
     q = (model == LatticeModel::D2Q9) ? d2q9::Q : d3q19::Q;
     const int n = size();
     const int d = dim();
-    f.assign(n * q, 0.0);
-    f_tmp.assign(n * q, 0.0);
-    rho.assign(n, 1.0);
-    u.assign(n * d, 0.0);
-    force.assign(n * d, 0.0);
+    f.assign(n * q, 0.0);          // 分布函数初始化为零（构造函数后立刻覆盖为平衡值）
+    f_tmp.assign(n * q, 0.0);      // 流式迁移临时缓冲区
+    rho.assign(n, 1.0);            // 密度初始化为 1（格子单位）
+    u.assign(n * d, 0.0);          // 速度初始化为零
+    force.assign(n * d, 0.0);      // 体力初始化为零
 }
 
+// ---------------------------------------------------------------------------
+// 由分布函数计算宏观量（密度 ρ 和速度 u）
 // ---------------------------------------------------------------------------
 void LatticeGrid::compute_macroscopic()
 {
@@ -64,13 +68,15 @@ void LatticeGrid::compute_macroscopic()
 }
 
 // ---------------------------------------------------------------------------
+// Maxwell-Boltzmann 平衡分布函数
+// ---------------------------------------------------------------------------
 double f_eq(double w, double rho,
             const double* c,
             const double* u_vec,
             int d)
 {
     // f_eq = w * rho * [1 + (c·u)/cs² + (c·u)²/(2cs⁴) - u²/(2cs²)]
-    // cs² = 1/3 for standard lattice
+    // 标准格子声速平方 cs² = 1/3
     constexpr double cs2 = 1.0 / 3.0;
     constexpr double cs4 = cs2 * cs2;
 

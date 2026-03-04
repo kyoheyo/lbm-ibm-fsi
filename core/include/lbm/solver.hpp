@@ -4,27 +4,27 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
-// Collision operator selection
+// 碰撞算子选择
 // ---------------------------------------------------------------------------
 enum class CollisionModel {
-    BGK,  ///< Single-relaxation-time (Bhatnagar-Gross-Krook)
-    MRT,  ///< Multiple-relaxation-time (more stable at low viscosity)
+    BGK,  ///< 单松弛时间碰撞算子（Bhatnagar-Gross-Krook）
+    MRT,  ///< 多松弛时间碰撞算子（低粘度下更稳定）
 };
 
 // ---------------------------------------------------------------------------
-// LBM Solver — owns a LatticeGrid and advances the simulation in time
+// LBM 求解器 — 持有 LatticeGrid 引用，逐步推进仿真
 // ---------------------------------------------------------------------------
 class Solver {
 public:
     Solver(LatticeGrid& grid, double omega, CollisionModel cm = CollisionModel::BGK);
 
-    /// Single time step: collision + streaming + BC application
+    /// 单时间步：碰撞 + 流式迁移 + 边界条件应用
     void step();
 
-    /// Collision step only (modifies f in place)
+    /// 仅执行碰撞步骤（原地修改 f）
     void collide();
 
-    /// Streaming step: propagate f → f_tmp, then swap
+    /// 流式迁移步骤：将 f 传播到 f_tmp，然后交换
     void stream();
 
     double omega() const { return omega_; }
@@ -32,13 +32,13 @@ public:
 
 private:
     LatticeGrid&   grid_;
-    double         omega_;       ///< Relaxation frequency  ω = 1/τ
+    double         omega_;       ///< 松弛频率  ω = 1/τ
     CollisionModel cm_;
 
     void collide_bgk();
     void collide_mrt();
 
-    // Guo's forcing scheme — adds body-force correction during collision
+    // Guo 体力格式 — 在碰撞过程中添加体力修正项
     void apply_guo_forcing(int node, const double* F, double* f_post);
 };
 
