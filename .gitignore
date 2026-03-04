@@ -42,3 +42,17 @@ results/
 
 # Log files
 *.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+*.dist-info/
+.pytest_cache/
+.mypy_cache/
+
+# Python example / test output (generated plots and snapshots)
+python/examples/output/
