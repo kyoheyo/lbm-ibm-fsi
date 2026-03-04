@@ -34,7 +34,8 @@ mod ffi {
     /// 指向堆上 `lbm::Solver` 的不透明句柄（原理同 `LatticeGridHandle`）。
     pub enum SolverHandle {}
 
-    /// 插件 ABI 使用的 C 兼容函数指针类型
+    /// 插件 ABI 使用的 C 兼容函数指针类型。
+    /// 对应 lbm_capi.cpp / plugin_registry.cpp 中的同名 typedef（lbm_boundary_fn 等）。
     pub type BoundaryFn  = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
     pub type MeshFn      = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, *mut std::ffi::c_void);
     pub type MotionFn    = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void,
@@ -43,7 +44,9 @@ mod ffi {
                                                  *mut std::ffi::c_void);
 
     extern "C" {
-        // --- LatticeGrid ---
+        // --- LatticeGrid — 实现于 core/src/capi/lbm_capi.cpp ---
+        // 对应 C++ 函数: lbm_grid_new / lbm_grid_free / lbm_grid_nx 等
+        // Rust 安全封装: LbmGrid（见下方）
         pub fn lbm_grid_new(nx: c_int, ny: c_int, nz: c_int,
                             model: LatticeModelC) -> *mut LatticeGridHandle;
         pub fn lbm_grid_free(g: *mut LatticeGridHandle);
@@ -54,7 +57,9 @@ mod ffi {
         pub fn lbm_grid_ux(g: *const LatticeGridHandle, idx: c_int) -> f64;
         pub fn lbm_grid_uy(g: *const LatticeGridHandle, idx: c_int) -> f64;
 
-        // --- Solver ---
+        // --- Solver — 实现于 core/src/capi/lbm_capi.cpp ---
+        // 对应 C++ 函数: lbm_solver_new / lbm_solver_free / lbm_solver_step 等
+        // Rust 安全封装: LbmSolver（见下方）
         pub fn lbm_solver_new(g: *mut LatticeGridHandle,
                               omega: f64,
                               cm: CollisionModelC) -> *mut SolverHandle;
@@ -66,7 +71,9 @@ mod ffi {
                                   step_index: c_int,
                                   dt: f64);
 
-        // --- 插件注册 ---
+        // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
+        // 对应 C++ 函数: lbm_set_plugins
+        // Rust 安全封装: register_plugins()（见本文件底部）
         pub fn lbm_set_plugins(
             boundary_fn:   Option<BoundaryFn>,  boundary_data:  *mut std::ffi::c_void,
             mesh_fn:       Option<MeshFn>,      mesh_data:      *mut std::ffi::c_void,
@@ -162,6 +169,8 @@ impl LbmGrid {
 
 impl Drop for LbmGrid {
     fn drop(&mut self) {
+        // C++ 侧: delete g → ~LatticeGrid() 析构，释放所有 std::vector 内存
+        // 对应 lbm_capi.cpp: lbm_grid_free()
         unsafe { ffi::lbm_grid_free(self.ptr) };
     }
 }
@@ -177,6 +186,8 @@ unsafe impl Send for LbmSolver {}
 impl LbmSolver {
     pub fn new(grid: &mut LbmGrid, omega: f64, cm: CollisionModel) -> Self {
         let ptr = unsafe {
+            // cm.into(): From<CollisionModel> → ffi::CollisionModelC，同 LbmGrid::new 中的 model.into()
+            // C++ 侧: new (std::nothrow) lbm::Solver(*g, omega, cm) — lbm_capi.cpp: lbm_solver_new()
             ffi::lbm_solver_new(grid.as_mut_ptr(), omega, cm.into())
         };
         assert!(!ptr.is_null(), "lbm_solver_new returned null");
@@ -184,18 +195,24 @@ impl LbmSolver {
     }
 
     pub fn step(&mut self, grid: &mut LbmGrid) {
+        // C++ 侧按序执行: update_motion → Solver::step → apply_boundary → adapt_mesh → step_flexible
+        // 详见 lbm_capi.cpp: lbm_solver_step()；step_index=0, dt=1.0（简化接口）
         unsafe { ffi::lbm_solver_step(self.ptr, grid.as_mut_ptr()) };
     }
 
     /// 带显式步骤索引和时间步长的推进接口，
     /// 使已注册的插件能够获得准确的时间信息。
     pub fn step_n(&mut self, grid: &mut LbmGrid, step_index: i32, dt: f64) {
+        // C++ 侧同 step()，但将 step_index 和 dt 原样转发给各插件
+        // 详见 lbm_capi.cpp: lbm_solver_step_n()
         unsafe { ffi::lbm_solver_step_n(self.ptr, grid.as_mut_ptr(), step_index, dt) };
     }
 }
 
 impl Drop for LbmSolver {
     fn drop(&mut self) {
+        // C++ 侧: delete s → ~Solver() 析构
+        // 对应 lbm_capi.cpp: lbm_solver_free()
         unsafe { ffi::lbm_solver_free(self.ptr) };
     }
 }
@@ -269,6 +286,9 @@ unsafe impl Sync for PluginCallbacks {}
 /// 若提供了函数指针，它们在仿真期间（即下次调用本函数覆盖它们或
 /// 进程退出之前）必须保持有效。
 pub fn register_plugins(cbs: PluginCallbacks) {
+    // C++ 侧: lbm_set_plugins() — core/src/plugins/plugin_registry.cpp
+    // 将各函数指针写入对应的静态适配器槽（BoundaryAdapter / MeshAdapter 等），
+    // 再通过 PluginRegistry::set_*_plugin() 注册到单例
     unsafe {
         ffi::lbm_set_plugins(
             cbs.boundary_fn, cbs.boundary_data,

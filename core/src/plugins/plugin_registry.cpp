@@ -20,19 +20,24 @@
 
 // ---------------------------------------------------------------------------
 // C 函数指针回调类型（必须与 lbm_capi.cpp 中的声明一致）
+// Rust 对应类型: ffi::BoundaryFn / MeshFn / MotionFn / FlexibleFn — bindings/src/lib.rs
 // ---------------------------------------------------------------------------
 extern "C" {
 
 typedef void (*lbm_boundary_fn) (void* grid, int step,
                                   void* userdata);
+// Rust 对应: ffi::BoundaryFn
 typedef void (*lbm_mesh_adapt_fn)(void* grid, int step,
                                   void* userdata);
+// Rust 对应: ffi::MeshFn
 typedef void (*lbm_motion_fn)   (void* grid, void* markers,
                                   double dt, int step,
                                   void* userdata);
+// Rust 对应: ffi::MotionFn
 typedef void (*lbm_flexible_fn) (void* markers,
                                   double dt, int step,
                                   void* userdata);
+// Rust 对应: ffi::FlexibleFn
 
 } // extern "C"
 
@@ -117,6 +122,7 @@ static FlexibleAdapter g_flexible_adapter;
 extern "C" {
 
 /// 一次性注册全部四个可选插件回调。
+/// Rust 封装: register_plugins() — bindings/src/lib.rs
 ///
 /// 对不需要激活的回调传入 `nullptr`。
 /// 第二次调用本函数会替换所有之前的注册。

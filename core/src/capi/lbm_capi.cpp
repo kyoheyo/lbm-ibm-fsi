@@ -7,17 +7,22 @@
 
 // ---------------------------------------------------------------------------
 // C 回调函数类型别名（必须与 plugin_registry.cpp 中的声明一致）
+// Rust 对应类型: ffi::BoundaryFn / MeshFn / MotionFn / FlexibleFn — bindings/src/lib.rs
 // ---------------------------------------------------------------------------
 extern "C" {
 
 typedef void (*lbm_boundary_fn) (void* grid, int step, void* userdata);
+// Rust 对应: ffi::BoundaryFn
 typedef void (*lbm_mesh_adapt_fn)(void* grid, int step, void* userdata);
+// Rust 对应: ffi::MeshFn
 typedef void (*lbm_motion_fn)   (void* grid, void* markers,
                                   double dt, int step, void* userdata);
+// Rust 对应: ffi::MotionFn
 typedef void (*lbm_flexible_fn) (void* markers, double dt, int step,
                                   void* userdata);
+// Rust 对应: ffi::FlexibleFn
 
-// 声明于 plugin_registry.cpp
+// 声明于 plugin_registry.cpp；Rust 封装: register_plugins() — bindings/src/lib.rs
 void lbm_set_plugins(
     lbm_boundary_fn   boundary_fn,  void* boundary_data,
     lbm_mesh_adapt_fn mesh_fn,      void* mesh_data,
@@ -33,6 +38,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 /// 在堆上创建 LatticeGrid 并返回指针；若分配失败返回 nullptr。
+/// Rust 封装: LbmGrid::new() — bindings/src/lib.rs
 lbm::LatticeGrid* lbm_grid_new(int nx, int ny, int nz, int model_id)
 {
     // 验证 model_id 以避免越界枚举转换产生未定义行为
@@ -42,16 +48,19 @@ lbm::LatticeGrid* lbm_grid_new(int nx, int ny, int nz, int model_id)
 }
 
 /// 释放由 lbm_grid_new 创建的 LatticeGrid。
+/// Rust 触发: <LbmGrid as Drop>::drop() (RAII 自动调用)
 void lbm_grid_free(lbm::LatticeGrid* g)
 {
     delete g;
 }
 
+// Rust 封装: LbmGrid::nx() / ny() / nz() — bindings/src/lib.rs
 int lbm_grid_nx(const lbm::LatticeGrid* g) { return g ? g->nx : 0; }
 int lbm_grid_ny(const lbm::LatticeGrid* g) { return g ? g->ny : 0; }
 int lbm_grid_nz(const lbm::LatticeGrid* g) { return g ? g->nz : 0; }
 
 /// 返回节点 idx 处的宏观密度 ρ；越界时返回 0。
+/// Rust 封装: LbmGrid::rho()
 double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
@@ -59,6 +68,7 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 }
 
 /// 返回节点 idx 处的 x 方向速度；越界时返回 0。
+/// Rust 封装: LbmGrid::ux()
 double lbm_grid_ux(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
@@ -66,6 +76,7 @@ double lbm_grid_ux(const lbm::LatticeGrid* g, int idx)
 }
 
 /// 返回节点 idx 处的 y 方向速度；越界时返回 0。
+/// Rust 封装: LbmGrid::uy()
 double lbm_grid_uy(const lbm::LatticeGrid* g, int idx)
 {
     if (!g || idx < 0 || idx >= g->size()) return 0.0;
@@ -77,6 +88,7 @@ double lbm_grid_uy(const lbm::LatticeGrid* g, int idx)
 // ---------------------------------------------------------------------------
 
 /// 创建求解器并返回指针；指针无效或参数非法时返回 nullptr。
+/// Rust 封装: LbmSolver::new() — bindings/src/lib.rs
 lbm::Solver* lbm_solver_new(lbm::LatticeGrid* g, double omega, int cm_id)
 {
     if (!g) return nullptr;
@@ -87,12 +99,14 @@ lbm::Solver* lbm_solver_new(lbm::LatticeGrid* g, double omega, int cm_id)
 }
 
 /// 释放由 lbm_solver_new 创建的 Solver。
+/// Rust 触发: <LbmSolver as Drop>::drop() (RAII 自动调用)
 void lbm_solver_free(lbm::Solver* s)
 {
     delete s;
 }
 
 /// 推进仿真一步并调用所有已注册的插件。
+/// Rust 封装: LbmSolver::step() — bindings/src/lib.rs
 ///
 /// 这是简化版接口，向所有插件传递 `step_index = 0` 和 `dt = 1.0`。
 /// 若插件需要准确的步骤计数或物理时间（例如规定运动轨迹、自适应调度），
@@ -130,6 +144,7 @@ void lbm_solver_step(lbm::Solver* s, lbm::LatticeGrid* g)
 }
 
 /// 带显式步骤索引和时间步长的扩展求解器步骤，将准确时间信息转发给插件。
+/// Rust 封装: LbmSolver::step_n() — bindings/src/lib.rs
 ///
 /// 当插件需要准确的时间信息（运动轨迹、自适应调度等）时，
 /// 优先使用此函数而非 `lbm_solver_step()`。
