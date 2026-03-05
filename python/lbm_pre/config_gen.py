@@ -63,7 +63,15 @@ def reynolds_to_nu(Re: float, U: float, L: float) -> float:
 
 @dataclass
 class BoundaryConditionConfig:
-    bc_type: Literal["bounce_back", "zou_he_velocity", "zou_he_pressure"] = "bounce_back"
+    bc_type: Literal[
+        "bounce_back",           # 半步长反弹（halfway bounce-back），无滑移固壁，2 阶精度
+        "bounce_back_full_way",  # 全步长反弹（on-node），无滑移固壁，1 阶精度
+        "zou_he_velocity",       # Zou-He 速度边界条件（进/出口规定速度）
+        "zou_he_pressure",       # Zou-He 压力边界条件（进/出口规定密度/压力）
+        "fully_developed",       # 充分发展出口（零法向梯度，拷贝上游一层 f）
+        "free_outlet",           # 自由出口（与 fully_developed 等价）
+        "guo_extrapolation",     # 郭照立非平衡外推格式（Guo et al., 2002）
+    ] = "bounce_back"
     face: Literal["west", "east", "south", "north", "bottom", "top"] = "south"
     ux: float = 0.0
     uy: float = 0.0
