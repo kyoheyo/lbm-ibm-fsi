@@ -1,4 +1,5 @@
 #include "lbm/solver.hpp"
+#include "lbm/boundary.hpp"
 #include <cmath>
 #include <stdexcept>
 
@@ -46,12 +47,24 @@ Solver::Solver(LatticeGrid& grid, double omega, CollisionModel cm)
 }
 
 // ---------------------------------------------------------------------------
-// 单时间步：碰撞 + 流式迁移
+// 单时间步：碰撞 + 流式迁移 + 注册的边界条件
 // ---------------------------------------------------------------------------
 void Solver::step()
 {
     collide();
     stream();
+    // 施加通过 add_boundary_condition() 注册的边界条件
+    if (!bcs_.empty()) {
+        apply_boundary_conditions(grid_, bcs_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 注册一个边界条件（每步 step() 后自动施加）
+// ---------------------------------------------------------------------------
+void Solver::add_boundary_condition(const BoundaryCondition& bc)
+{
+    bcs_.push_back(bc);
 }
 
 // ---------------------------------------------------------------------------

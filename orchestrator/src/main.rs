@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use config::Config;
-use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver};
+use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face};
 
 // ---------------------------------------------------------------------------
 /// LBM + IBM + FSI 求解器
@@ -170,6 +170,52 @@ fn main() -> Result<()> {
 
     // 初始化求解器
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
+
+    // -----------------------------------------------------------------------
+    // 注册边界条件（将 TOML 配置中的 [[fluid.boundary_conditions]] 传入 C++ 核心）
+    //
+    // 这是流场结果正确的关键步骤：若跳过此步骤，边界条件将不会被施加，
+    // 所有节点保持初始平衡态（u=0），流场云图值均为零。
+    // -----------------------------------------------------------------------
+    for bc_cfg in &cfg.fluid.boundary_conditions {
+        let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
+            "zou_he_velocity"  => BcType::ZouHeVelocity,
+            "zou_he_pressure"  => BcType::ZouHePressure,
+            "periodic"         => BcType::Periodic,
+            "bounce_back"      => BcType::BounceBack,
+            other => {
+                eprintln!(
+                    "  [warn] unknown bc_type {:?}; defaulting to BounceBack",
+                    other
+                );
+                BcType::BounceBack
+            }
+        };
+        let face = match bc_cfg.face.to_lowercase().as_str() {
+            "east"   => Face::East,
+            "south"  => Face::South,
+            "north"  => Face::North,
+            "bottom" => Face::Bottom,
+            "top"    => Face::Top,
+            "west"   => Face::West,
+            other => {
+                eprintln!(
+                    "  [warn] unknown face {:?}; defaulting to West",
+                    other
+                );
+                Face::West
+            }
+        };
+        solver.add_boundary_condition(
+            bc_type, face,
+            bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
+            bc_cfg.rho,
+        );
+        println!(
+            "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
+            bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
+        );
+    }
 
     // 创建输出目录
     std::fs::create_dir_all(&cfg.output.directory)?;

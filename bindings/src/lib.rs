@@ -70,6 +70,13 @@ mod ffi {
                                   g: *mut LatticeGridHandle,
                                   step_index: c_int,
                                   dt: f64);
+        /// 向求解器注册一个边界条件，每步 step() 后自动施加。
+        /// bc_type: 0=BounceBack 1=ZouHe_Velocity 2=ZouHe_Pressure 3=Periodic
+        /// face:    0=West 1=East 2=South 3=North 4=Bottom 5=Top
+        /// Rust 封装: LbmSolver::add_boundary_condition()
+        pub fn lbm_solver_add_bc(s: *mut SolverHandle,
+                                  bc_type: c_int, face: c_int,
+                                  ux: f64, uy: f64, uz: f64, rho: f64);
 
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
@@ -103,6 +110,50 @@ pub enum LatticeModel {
 pub enum CollisionModel {
     Bgk,
     Mrt,
+}
+
+/// 边界条件类型
+/// 整数值与 C++ 侧 `lbm::BCType` 枚举成员的顺序一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum BcType {
+    /// 无滑移固壁：将入射分布函数反射为出射方向（动量反向）。
+    /// 适用于静止壁面（南、西、东壁等）。
+    BounceBack     = 0,
+    /// Zou-He 速度进/出口：通过质量+动量守恒关系，
+    /// 由规定速度（ux, uy, uz）确定未知方向的分布函数。
+    ZouHeVelocity  = 1,
+    /// Zou-He 压力进/出口：类似 ZouHeVelocity，
+    /// 但规定的是密度 rho（对应 LBM 压力 p = ρ·cs²）而非速度。
+    ZouHePressure  = 2,
+    /// 周期边界：在流式迁移的模运算中隐式实现，
+    /// 注册此类型为空操作（仅作文档/可视化用途）。
+    Periodic       = 3,
+}
+
+/// 计算域各面编号
+///
+/// 坐标系约定：
+/// - x 轴从西向东（West → East）
+/// - y 轴从南向北（South → North）
+/// - z 轴从底到顶（Bottom → Top，三维仿真）
+///
+/// 整数值与 C++ 侧 `lbm::Face` 枚举成员的顺序一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Face {
+    /// x = 0 边界（左壁）
+    West   = 0,
+    /// x = nx-1 边界（右壁）
+    East   = 1,
+    /// y = 0 边界（底壁）
+    South  = 2,
+    /// y = ny-1 边界（顶壁 / 盖板）
+    North  = 3,
+    /// z = 0 边界（三维仿真前壁）
+    Bottom = 4,
+    /// z = nz-1 边界（三维仿真后壁）
+    Top    = 5,
 }
 
 impl From<LatticeModel> for ffi::LatticeModelC {
@@ -206,6 +257,29 @@ impl LbmSolver {
         // C++ 侧同 step()，但将 step_index 和 dt 原样转发给各插件
         // 详见 lbm_capi.cpp: lbm_solver_step_n()
         unsafe { ffi::lbm_solver_step_n(self.ptr, grid.as_mut_ptr(), step_index, dt) };
+    }
+
+    /// 向求解器注册一个边界条件，在每步 `step()` 的流式迁移后自动施加。
+    ///
+    /// 可多次调用以注册多个边界条件（按注册顺序依次施加）。
+    ///
+    /// # 参数
+    /// * `bc_type` — 边界条件类型（[`BcType`]）
+    /// * `face`    — 施加边界条件的面（[`Face`]）
+    /// * `ux,uy,uz`— 规定速度（用于 [`BcType::ZouHeVelocity`]）
+    /// * `rho`     — 规定密度（用于 [`BcType::ZouHePressure`]）
+    pub fn add_boundary_condition(
+        &mut self,
+        bc_type: BcType,
+        face: Face,
+        ux: f64, uy: f64, uz: f64,
+        rho: f64,
+    ) {
+        // C++ 侧: lbm_solver_add_bc() — core/src/capi/lbm_capi.cpp
+        // 将参数转换为整数枚举值并传给 C++ 的 Solver::add_boundary_condition()
+        unsafe {
+            ffi::lbm_solver_add_bc(self.ptr, bc_type as i32, face as i32, ux, uy, uz, rho);
+        }
     }
 }
 

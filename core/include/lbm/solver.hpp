@@ -1,5 +1,7 @@
 #pragma once
 #include "lattice.hpp"
+#include "boundary.hpp"
+#include <vector>
 
 namespace lbm {
 
@@ -24,16 +26,26 @@ public:
     /// 仅执行碰撞步骤（原地修改 f）
     void collide();
 
-    /// 流式迁移步骤：将 f 传播到 f_tmp，然后交换
+    /// 流式迁移步骤：将 f 传播到 f_tmp，然后交换，并更新宏观量
     void stream();
 
     double omega() const { return omega_; }
     void   set_omega(double w) { omega_ = w; }
 
+    /// 注册一个边界条件，在每步流式迁移后自动施加。
+    /// 可多次调用以注册多个边界条件（按注册顺序依次施加）。
+    void add_boundary_condition(const BoundaryCondition& bc);
+
+    /// 返回当前已注册的边界条件列表（只读）。
+    [[nodiscard]] const std::vector<BoundaryCondition>& boundary_conditions() const {
+        return bcs_;
+    }
+
 private:
     LatticeGrid&   grid_;
     double         omega_;       ///< 松弛频率  ω = 1/τ
     CollisionModel cm_;
+    std::vector<BoundaryCondition> bcs_;  ///< 每步自动施加的边界条件列表
 
     void collide_bgk();
     void collide_mrt();
