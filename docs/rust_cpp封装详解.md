@@ -133,12 +133,12 @@ struct LatticeGrid {
 
 文件：`core/src/lbm/solver.cpp`
 
-每个时间步执行两步：
+每个时间步执行三步（碰撞 + 流式迁移 + 边界条件）：
 
 ```
-step() = collide() + stream()
-         ↓             ↓
-   碰撞（原地）    流式迁移（写入 f_tmp，再交换）
+step() = collide() + stream() + apply_boundary_conditions() + compute_macroscopic()
+         ↓             ↓                  ↓                          ↓
+   碰撞（原地）    流式迁移           边界条件修正幽灵方向       重算边界节点 ρ/u
 ```
 
 **BGK 碰撞公式**（每个格点、每个方向）：
@@ -150,12 +150,14 @@ f_α* = f_α - ω × (f_α - f_α^eq)
 - `ω`：松弛频率，由粘度 `ν` 决定：`ω = 1 / (3ν + 0.5)`
 - `f_α^eq`：Maxwell-Boltzmann 平衡分布（只依赖局部密度 ρ 和速度 **u**）
 
-**流式迁移**：将碰撞后的 `f_α*` 沿 `c_α` 方向传播到相邻格点（周期性边界）：
+**流式迁移**：将碰撞后的 `f_α*` 沿 `c_α` 方向传播到相邻格点（周期性边界）。
+对于边界节点，周期性取模会从对侧引入**幽灵值**，由后续边界条件覆盖修正：
 
 ```cpp
-int di = (i + C[a][0] + nx) % nx;  // 周期性 x
+int di = (i + C[a][0] + nx) % nx;  // 周期性 x（边界节点产生幽灵值）
 int dj = (j + C[a][1] + ny) % ny;  // 周期性 y
 f_tmp[dst * Q + a] = f[src * Q + a];
+// stream() 末尾第一次 compute_macroscopic()——边界节点 ρ/u 含幽灵值
 ```
 
 ### 3.3 PluginRegistry — 单例插件注册中心
@@ -185,10 +187,21 @@ private:
 
 ```
 ① update_motion()   — 碰撞前更新固体位置
-② Solver::step()    — 碰撞 + 流式迁移
-③ apply_boundary()  — 自定义边界条件（流式迁移后）
+② Solver::step()    — 碰撞 + 流式迁移 + 内置 BC + 宏观量重算（详见下方）
+③ apply_boundary()  — 自定义边界条件插件扩展点（流式迁移后）
 ④ adapt_mesh()      — 网格自适应（流式迁移后）
 ⑤ step_flexible()   — 柔性体推进（流式迁移后）
+```
+
+**`Solver::step()` 的内部执行顺序（v0.1.1 修复后）：**
+
+```
+Solver::step():
+  ├─ collide()                         — BGK/MRT 碰撞，使用上一步末尾的 ρ/u
+  ├─ stream()                          — 周期性迁移，末尾第一次 compute_macroscopic()
+  │                                      （边界节点 ρ/u 含幽灵值）
+  ├─ apply_boundary_conditions()       — 以物理正确的 f 值覆盖幽灵方向
+  └─ compute_macroscopic()（第二次）   — 边界节点 ρ/u 得到正确值供下步碰撞使用
 ```
 
 ---
@@ -786,7 +799,9 @@ Rust: solver.step(&mut grid)
   ├─ s->step()
   │   位置：core/src/lbm/solver.cpp
   │   → collide()  [BGK 或 MRT 碰撞，OpenMP 并行]
-  │   → stream()   [周期性流式迁移，交换 f/f_tmp，计算宏观量]
+  │   → stream()   [周期性迁移，交换 f/f_tmp，第一次 compute_macroscopic()]
+  │   → apply_boundary_conditions()  [覆盖幽灵方向：反弹/Zou-He]
+  │   → compute_macroscopic()（第二次，边界节点得到正确 ρ/u）
   │
   ├─ reg.apply_boundary(*g, 0)
   │   → if (boundary_) boundary_->apply(grid, step)
