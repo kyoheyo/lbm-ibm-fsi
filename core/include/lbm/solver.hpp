@@ -1,6 +1,7 @@
 #pragma once
 #include "lattice.hpp"
 #include "boundary.hpp"
+#include "mpi_decomp.hpp"
 #include <vector>
 
 namespace lbm {
@@ -41,11 +42,17 @@ public:
         return bcs_;
     }
 
+    /// 绑定 MPI 域分解描述符，之后每次 step() 的 stream() 末尾自动执行幽灵行交换。
+    /// 传入 nullptr 可解除绑定。
+    /// 仅在 LBM_ENABLE_MPI 编译宏定义时有实际效果；否则为空操作。
+    void attach_mpi(const MpiDecomp* decomp) { mpi_decomp_ = decomp; }
+
 private:
     LatticeGrid&   grid_;
     double         omega_;       ///< 松弛频率  ω = 1/τ
     CollisionModel cm_;
     std::vector<BoundaryCondition> bcs_;  ///< 每步自动施加的边界条件列表
+    const MpiDecomp* mpi_decomp_ = nullptr; ///< 可选 MPI 域分解（nullptr = 单进程模式）
 
     void collide_bgk();
     void collide_mrt();

@@ -1,5 +1,6 @@
 #include "lbm/solver.hpp"
 #include "lbm/boundary.hpp"
+#include "lbm/mpi_decomp.hpp"
 #include <cmath>
 #include <stdexcept>
 
@@ -302,6 +303,14 @@ void Solver::stream()
 
     // 将迁移后的临时缓冲区与主缓冲区交换，并更新宏观量
     std::swap(grid_.f, grid_.f_tmp);
+
+#ifdef LBM_ENABLE_MPI
+    // MPI 幽灵行交换（在 BC 施加之前完成，使边界节点拿到正确的邻居数据）
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        halo_exchange_d2q9(grid_, *mpi_decomp_);
+    }
+#endif
+
     grid_.compute_macroscopic();
 }
 

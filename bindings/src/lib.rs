@@ -78,6 +78,29 @@ mod ffi {
         pub fn lbm_solver_add_bc(s: *mut SolverHandle,
                                   bc_type: c_int, face: c_int,
                                   ux: f64, uy: f64, uz: f64, rho: f64);
+        /// 将 MPI 域分解句柄绑定到求解器（启用自动幽灵行交换）。
+        pub fn lbm_solver_attach_mpi(s: *mut SolverHandle, h: *mut MpiDecompHandle);
+
+        // --- MPI 并行接口 — 实现于 core/src/capi/lbm_capi.cpp ---
+        pub fn lbm_mpi_init() -> c_int;
+        pub fn lbm_mpi_finalize();
+        pub fn lbm_mpi_rank() -> c_int;
+        pub fn lbm_mpi_size() -> c_int;
+        /// 返回含幽灵行的本地 ny；并通过指针输出 y_start 和 local_ny（物理行数）。
+        pub fn lbm_mpi_local_ny(global_ny: c_int,
+                                 out_y_start: *mut c_int,
+                                 out_local_ny: *mut c_int) -> c_int;
+        pub fn lbm_mpi_decomp_new(global_nx: c_int, global_ny: c_int) -> *mut MpiDecompHandle;
+        pub fn lbm_mpi_decomp_free(h: *mut MpiDecompHandle);
+
+        // --- GPU（CUDA）接口 — 实现于 core/src/capi/lbm_capi.cpp ---
+        pub fn lbm_gpu_solver_new(g: *mut LatticeGridHandle, omega: f64) -> *mut GpuSolverHandle;
+        pub fn lbm_gpu_solver_free(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_collide(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_stream(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_macroscopic(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_download(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
+        pub fn lbm_gpu_upload(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
 
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
@@ -89,6 +112,11 @@ mod ffi {
             flexible_fn:   Option<FlexibleFn>,  flexible_data:  *mut std::ffi::c_void,
         );
     }
+
+    /// MPI 域分解描述符的不透明句柄（仅持有指针，不可实例化）
+    pub enum MpiDecompHandle {}
+    /// GPU 求解器的不透明句柄
+    pub enum GpuSolverHandle {}
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +345,128 @@ impl Drop for LbmSolver {
         // C++ 侧: delete s → ~Solver() 析构
         // 对应 lbm_capi.cpp: lbm_solver_free()
         unsafe { ffi::lbm_solver_free(self.ptr) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// MPI 并行工具函数（无论是否启用 MPI 均可安全调用）
+// ---------------------------------------------------------------------------
+
+/// 初始化 MPI。在创建 Grid/Solver 之前调用（幂等）。
+/// 返回 `true` 表示 MPI 已成功初始化（需要编译期启用 LBM_ENABLE_MPI）。
+pub fn mpi_init() -> bool {
+    unsafe { ffi::lbm_mpi_init() != 0 }
+}
+
+/// 终结 MPI（幂等，安全在任何时刻调用）。
+pub fn mpi_finalize() {
+    unsafe { ffi::lbm_mpi_finalize() };
+}
+
+/// 返回当前 MPI 进程编号（未启用或未初始化时返回 0）。
+pub fn mpi_rank() -> i32 {
+    unsafe { ffi::lbm_mpi_rank() }
+}
+
+/// 返回 MPI 进程总数（未启用或未初始化时返回 1）。
+pub fn mpi_size() -> i32 {
+    unsafe { ffi::lbm_mpi_size() }
+}
+
+/// 计算本进程的本地网格 ny（含幽灵行）、全局起始行 y_start 以及物理行数 local_ny。
+/// 返回 `(grid_ny, y_start, local_ny)`。
+pub fn mpi_local_ny(global_ny: i32) -> (i32, i32, i32) {
+    let mut y_start   = 0i32;
+    let mut local_ny  = 0i32;
+    let grid_ny = unsafe {
+        ffi::lbm_mpi_local_ny(global_ny, &mut y_start, &mut local_ny)
+    };
+    (grid_ny, y_start, local_ny)
+}
+
+/// `lbm::MpiDecomp` 的安全封装（持有堆上的 C++ MpiDecomp 对象）
+pub struct LbmMpiDecomp {
+    ptr: *mut ffi::MpiDecompHandle,
+}
+
+unsafe impl Send for LbmMpiDecomp {}
+
+impl LbmMpiDecomp {
+    /// 创建 MPI 域分解（需先调用 `mpi_init()`）。
+    /// 未启用 MPI 时返回 `None`。
+    pub fn new(global_nx: i32, global_ny: i32) -> Option<Self> {
+        let ptr = unsafe { ffi::lbm_mpi_decomp_new(global_nx, global_ny) };
+        if ptr.is_null() { None } else { Some(LbmMpiDecomp { ptr }) }
+    }
+
+    /// 原始可变指针（仅供 LbmSolver::attach_mpi 内部使用）
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut ffi::MpiDecompHandle { self.ptr }
+}
+
+impl Drop for LbmMpiDecomp {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_mpi_decomp_free(self.ptr) };
+    }
+}
+
+impl LbmSolver {
+    /// 绑定 MPI 域分解：之后每次 `step()` 的流式迁移后自动执行幽灵行交换。
+    /// 传入 `None` 可解除绑定（恢复单进程模式）。
+    pub fn attach_mpi(&mut self, decomp: Option<&mut LbmMpiDecomp>) {
+        let h = decomp.map_or(std::ptr::null_mut(), |d| d.as_mut_ptr());
+        unsafe { ffi::lbm_solver_attach_mpi(self.ptr, h) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// GPU（CUDA）求解器封装
+// ---------------------------------------------------------------------------
+
+/// `lbm::GpuSolver` 的安全封装（D2Q9 BGK on CUDA）
+pub struct LbmGpuSolver {
+    ptr: *mut ffi::GpuSolverHandle,
+}
+
+unsafe impl Send for LbmGpuSolver {}
+
+impl LbmGpuSolver {
+    /// 创建 GPU 求解器，将 CPU 网格数据上传到 GPU。
+    /// 未启用 CUDA 或 GPU 初始化失败时返回 `None`。
+    pub fn new(grid: &mut LbmGrid, omega: f64) -> Option<Self> {
+        let ptr = unsafe { ffi::lbm_gpu_solver_new(grid.as_mut_ptr(), omega) };
+        if ptr.is_null() { None } else { Some(LbmGpuSolver { ptr }) }
+    }
+
+    /// 在 GPU 上执行 BGK 碰撞。
+    pub fn collide(&mut self) {
+        unsafe { ffi::lbm_gpu_collide(self.ptr) };
+    }
+
+    /// 在 GPU 上执行流式迁移。
+    pub fn stream(&mut self) {
+        unsafe { ffi::lbm_gpu_stream(self.ptr) };
+    }
+
+    /// 在 GPU 上更新宏观量（ρ、u）。
+    pub fn compute_macroscopic(&mut self) {
+        unsafe { ffi::lbm_gpu_macroscopic(self.ptr) };
+    }
+
+    /// 将 GPU 端分布函数 + 宏观量下载到 CPU 网格
+    /// （用于在 CPU 上执行边界条件，下载后再调用 `upload`）。
+    pub fn download(&self, grid: &mut LbmGrid) {
+        unsafe { ffi::lbm_gpu_download(self.ptr, grid.as_mut_ptr()) };
+    }
+
+    /// 将 CPU 网格 f 上传到 GPU（CPU 端边界条件修正后调用）。
+    pub fn upload(&mut self, grid: &mut LbmGrid) {
+        unsafe { ffi::lbm_gpu_upload(self.ptr, grid.as_mut_ptr()) };
+    }
+}
+
+impl Drop for LbmGpuSolver {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_gpu_solver_free(self.ptr) };
     }
 }
 

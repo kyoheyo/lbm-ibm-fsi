@@ -7,6 +7,7 @@ set(CORE_SOURCES
     src/lbm/lattice.cpp       # 格子模型初始化（D2Q9/D3Q19）与宏观量（ρ、u）计算
     src/lbm/solver.cpp        # BGK/MRT 碰撞 + 流式迁移 + Guo 体力修正
     src/lbm/boundary.cpp      # 反弹边界、Zou-He 速度/压力边界条件
+    src/lbm/mpi_decomp.cpp    # MPI 一维域分解与幽灵行交换（始终编译；MPI 未启用时为空实现）
     # IBM — 浸入边界法
     src/ibm/marker.cpp        # 拉格朗日标记点集创建（圆形截面、柔性丝状体）
     src/ibm/interpolation.cpp # 速度插值（欧拉→拉格朗日）与力展布（拉格朗日→欧拉）
@@ -14,10 +15,15 @@ set(CORE_SOURCES
     src/fsi/structure.cpp     # Euler-Bernoulli 梁有限元（Newmark-β 时间积分）
     src/fsi/coupling.cpp      # 分区显式 FSI 耦合步：插值→直接力→展布→结构推进→速度同步
     # C ABI 桥接层（供 Rust FFI 调用）
-    src/capi/lbm_capi.cpp     # lbm_grid_* / lbm_solver_* C 函数实现
+    src/capi/lbm_capi.cpp     # lbm_grid_* / lbm_solver_* / lbm_mpi_* / lbm_gpu_* C 函数实现
     # 插件系统
     src/plugins/plugin_registry.cpp  # C 函数指针→C++ 虚函数适配器 + 全局单例注册中心
 )
+
+# CUDA 源文件（仅在 ENABLE_CUDA=ON 时加入）
+if(ENABLE_CUDA)
+    list(APPEND CORE_SOURCES src/lbm/gpu_solver.cu)
+endif()
 
 # 静态库目标（产物：liblbm_core.a / lbm_core.lib）
 add_library(lbm_core STATIC ${CORE_SOURCES})
@@ -41,9 +47,12 @@ if(ENABLE_OPENMP)
     target_compile_definitions(lbm_core PUBLIC LBM_ENABLE_OPENMP)
 endif()
 
-# CUDA（宏定义，后端尚未完整实现）
+# CUDA（宏定义 + 链接 CUDA Runtime）
 if(ENABLE_CUDA)
+    target_link_libraries(lbm_core PUBLIC CUDA::cudart)
     target_compile_definitions(lbm_core PUBLIC LBM_ENABLE_CUDA)
+    # CUDA 源文件使用 C++17 标准
+    set_property(SOURCE src/lbm/gpu_solver.cu PROPERTY CUDA_STANDARD 17)
 endif()
 
 # 输出路径（与 build.rs 中的 cargo:rustc-link-search 对应）

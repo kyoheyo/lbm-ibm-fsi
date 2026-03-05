@@ -21,6 +21,7 @@ fn main() {
         .define("BUILD_TESTS", "OFF")                  // 不编译 test_lbm，加速构建
         .define("ENABLE_MPI",    std::env::var("LBM_ENABLE_MPI").unwrap_or_else(|_| "OFF".into()))    // 可用 LBM_ENABLE_MPI=ON 覆盖
         .define("ENABLE_OPENMP", std::env::var("LBM_ENABLE_OPENMP").unwrap_or_else(|_| "OFF".into())) // 可用 LBM_ENABLE_OPENMP=ON 覆盖
+        .define("ENABLE_CUDA",   std::env::var("LBM_ENABLE_CUDA").unwrap_or_else(|_| "OFF".into()))   // 可用 LBM_ENABLE_CUDA=ON 覆盖（需 nvcc）
         .define("CMAKE_BUILD_TYPE", cmake_build_type)  // 单配置生成器（Ninja）使用此值
         .build(); // 依次执行：cmake configure → cmake --build → cmake --install，返回安装前缀
 
@@ -44,4 +45,5 @@ fn main() {
     println!("cargo:rerun-if-changed=../core/include");
     println!("cargo:rerun-if-env-changed=LBM_ENABLE_MPI");
     println!("cargo:rerun-if-env-changed=LBM_ENABLE_OPENMP");
+    println!("cargo:rerun-if-env-changed=LBM_ENABLE_CUDA");
 }

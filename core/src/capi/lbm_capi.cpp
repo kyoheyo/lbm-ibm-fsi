@@ -1,9 +1,18 @@
 // C ABI 封装层 — 允许 Rust（及任何 C 消费者）在不依赖 C++ 名称修饰的情况下调用 C++ 核心库
 #include "lbm/lattice.hpp"
 #include "lbm/solver.hpp"
+#include "lbm/mpi_decomp.hpp"
 #include "plugins/plugin_registry.hpp"
 #include <cstdlib>
 #include <new>
+
+#ifdef LBM_ENABLE_MPI
+#include <mpi.h>
+#endif
+
+#ifdef LBM_ENABLE_CUDA
+#include "lbm/gpu_solver.hpp"
+#endif
 
 // ---------------------------------------------------------------------------
 // C 回调函数类型别名（必须与 plugin_registry.cpp 中的声明一致）
@@ -191,6 +200,219 @@ void lbm_solver_step_n(lbm::Solver* s, lbm::LatticeGrid* g,
     reg.apply_boundary(*g, step_index);
     reg.adapt_mesh(*g, step_index);
     reg.step_flexible(nullptr, dt, step_index);
+}
+
+} // extern "C"
+
+// ===========================================================================
+// MPI 并行接口
+// ===========================================================================
+extern "C" {
+
+/// 初始化 MPI（幂等：可多次调用）。
+/// 在创建 Grid/Solver 之前调用。
+/// 若未启用 LBM_ENABLE_MPI，此函数为空操作，返回 0。
+int lbm_mpi_init()
+{
+#ifdef LBM_ENABLE_MPI
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized) {
+        MPI_Init(nullptr, nullptr);
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/// 结束 MPI。在程序退出前调用（幂等）。
+void lbm_mpi_finalize()
+{
+#ifdef LBM_ENABLE_MPI
+    int finalized = 0;
+    MPI_Finalized(&finalized);
+    if (!finalized) {
+        MPI_Finalize();
+    }
+#endif
+}
+
+/// 返回当前进程编号（未启用 MPI 或未初始化时返回 0）。
+int lbm_mpi_rank()
+{
+#ifdef LBM_ENABLE_MPI
+    int rank = 0, initialized = 0;
+    MPI_Initialized(&initialized);
+    if (initialized) MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    return rank;
+#else
+    return 0;
+#endif
+}
+
+/// 返回进程总数（未启用 MPI 或未初始化时返回 1）。
+int lbm_mpi_size()
+{
+#ifdef LBM_ENABLE_MPI
+    int nprocs = 1, initialized = 0;
+    MPI_Initialized(&initialized);
+    if (initialized) MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+    return nprocs;
+#else
+    return 1;
+#endif
+}
+
+/// 计算本进程应持有的本地行数和全局起始行偏移。
+/// @param global_ny    全局 Y 方向节点数
+/// @param out_y_start  输出：本地域在全局坐标下的起始行（不含幽灵）
+/// @param out_local_ny 输出：本地物理行数（不含幽灵）
+/// @return  含幽灵行的本地 ny：nprocs>1 时 = out_local_ny+2；nprocs=1 时 = global_ny
+int lbm_mpi_local_ny(int global_ny, int* out_y_start, int* out_local_ny)
+{
+#ifdef LBM_ENABLE_MPI
+    int rank = lbm_mpi_rank();
+    int np   = lbm_mpi_size();
+    int base = global_ny / np;
+    int rem  = global_ny % np;
+    int lny  = base + (rank < rem ? 1 : 0);
+    int yst  = rank * base + (rank < rem ? rank : rem);
+    if (out_y_start)   *out_y_start  = yst;
+    if (out_local_ny)  *out_local_ny = lny;
+    return (np > 1) ? lny + 2 : lny;
+#else
+    if (out_y_start)   *out_y_start  = 0;
+    if (out_local_ny)  *out_local_ny = global_ny;
+    return global_ny;
+#endif
+}
+
+/// 指向堆上 lbm::MpiDecomp 的不透明句柄
+struct MpiDecompHandle;
+
+/// 在堆上创建 MpiDecomp；若 MPI 未初始化或未启用，返回 nullptr。
+MpiDecompHandle* lbm_mpi_decomp_new(int global_nx, int global_ny)
+{
+#ifdef LBM_ENABLE_MPI
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized) return nullptr;
+    auto* d = new (std::nothrow) lbm::MpiDecomp(lbm::MpiDecomp::create(global_nx, global_ny));
+    return reinterpret_cast<MpiDecompHandle*>(d);
+#else
+    (void)global_nx; (void)global_ny;
+    return nullptr;
+#endif
+}
+
+/// 释放由 lbm_mpi_decomp_new 创建的 MpiDecomp。
+void lbm_mpi_decomp_free(MpiDecompHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    delete reinterpret_cast<lbm::MpiDecomp*>(h);
+#else
+    (void)h;
+#endif
+}
+
+/// 将 MpiDecomp 绑定到求解器；之后每次 step() 自动执行幽灵行交换。
+void lbm_solver_attach_mpi(lbm::Solver* s, MpiDecompHandle* h)
+{
+    if (!s) return;
+#ifdef LBM_ENABLE_MPI
+    s->attach_mpi(reinterpret_cast<const lbm::MpiDecomp*>(h));
+#else
+    (void)h;
+#endif
+}
+
+} // extern "C"
+
+// ===========================================================================
+// GPU（CUDA）接口
+// ===========================================================================
+extern "C" {
+
+/// 指向堆上 lbm::GpuSolver 的不透明句柄
+struct GpuSolverHandle;
+
+/// 创建 GPU 求解器（上传初始数据到 GPU）。
+/// 若未启用 CUDA 或 GPU 初始化失败，返回 nullptr。
+GpuSolverHandle* lbm_gpu_solver_new(lbm::LatticeGrid* g, double omega)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (!g) return nullptr;
+    try {
+        auto* gs = new lbm::GpuSolver(*g, omega);
+        return reinterpret_cast<GpuSolverHandle*>(gs);
+    } catch (...) {
+        return nullptr;
+    }
+#else
+    (void)g; (void)omega;
+    return nullptr;
+#endif
+}
+
+/// 释放 GPU 求解器（释放设备内存）。
+void lbm_gpu_solver_free(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    delete reinterpret_cast<lbm::GpuSolver*>(h);
+#else
+    (void)h;
+#endif
+}
+
+/// 在 GPU 上执行 BGK 碰撞。
+void lbm_gpu_collide(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->collide();
+#else
+    (void)h;
+#endif
+}
+
+/// 在 GPU 上执行流式迁移。
+void lbm_gpu_stream(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->stream();
+#else
+    (void)h;
+#endif
+}
+
+/// 在 GPU 上更新宏观量（ρ、u）。
+void lbm_gpu_macroscopic(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->compute_macroscopic();
+#else
+    (void)h;
+#endif
+}
+
+/// 将 GPU 端分布函数 + 宏观量下载到 CPU 网格（执行 CPU 端边界条件前调用）。
+void lbm_gpu_download(GpuSolverHandle* h, lbm::LatticeGrid* g)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h && g) reinterpret_cast<lbm::GpuSolver*>(h)->download(*g);
+#else
+    (void)h; (void)g;
+#endif
+}
+
+/// 将 CPU 网格 f 上传到 GPU（CPU 端边界条件修正后调用）。
+void lbm_gpu_upload(GpuSolverHandle* h, lbm::LatticeGrid* g)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h && g) reinterpret_cast<lbm::GpuSolver*>(h)->upload(*g);
+#else
+    (void)h; (void)g;
+#endif
 }
 
 } // extern "C"
