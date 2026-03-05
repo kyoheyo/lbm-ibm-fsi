@@ -103,15 +103,49 @@ pub struct IbmConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
-    /// 每隔多少时间步写出一个 NumPy `.npz` 快照。
+    /// 每隔多少时间步写出一个快照文件。
     /// 这是**高频**原生 Rust 输出路径。
     pub write_interval: u64,
     /// 快照和图像的输出目录
     #[serde(default = "default_output_dir")]
     pub directory: String,
+    /// 输出格式选择：
+    ///
+    /// | 值 | 格式 | 文件扩展名 | 说明 |
+    /// |----|------|------------|------|
+    /// | `"npz"` | NumPy `.npz` 压缩归档（**默认**）| `.npz` | 可被 `lbm_post.NpzReader` 读取 |
+    /// | `"tecplot_asc"` | ASCII Tecplot POINT 格式 | `.dat` | 可用 Tecplot/ParaView 直接打开，人类可读 |
+    /// | `"tecplot_bin"` | 二进制 Tecplot PLT（TDV112）| `.plt` | 可用 Tecplot 打开，体积最小 |
+    ///
+    /// 可在 TOML 中通过 `output.format` 选择：
+    /// ```toml
+    /// [output]
+    /// write_interval = 500
+    /// directory      = "output/lid_cavity"
+    /// format         = "tecplot_asc"   # 或 "npz"（默认）或 "tecplot_bin"
+    /// ```
+    #[serde(default = "default_output_format")]
+    pub format: String,
     /// 每隔多少步调用 Python FFI 绘图器生成等值线图（步数）。
-    /// `None`（或 TOML 中缺失）表示禁用进程内绘图。
+    ///
+    /// ## 启用 FFI 绘图的完整步骤
+    ///
+    /// 1. 在 TOML 中设置 `plot_interval = <N>` 和 `python.pythonpath = "python"`。
+    /// 2. 用 `python-ffi` 特性编译 Rust 求解器：
+    ///    ```bash
+    ///    cargo build --release --features python-ffi
+    ///    ```
+    /// 3. 运行求解器，每隔 N 步 Rust 会在进程内直接调用
+    ///    `lbm_post.bridge.plot_field_raw()`，将速度幅值与涡量云图
+    ///    保存为 `<directory>/<field>_<NNNNNN>.png`，**不创建中间 .npz 文件**。
+    ///
+    /// `None`（或 TOML 中缺失）表示禁用进程内绘图（默认）。
     /// 这是**低频** Python FFI 输出路径。
+    ///
+    /// # 注意
+    ///
+    /// 若未以 `--features python-ffi` 编译，本字段被忽略，
+    /// 不会报错，只是不生成 FFI 云图。
     #[serde(default)]
     pub plot_interval: Option<u64>,
     /// 为 `true` 时每步向 CSV 文件追加一行监控量数据。
@@ -222,6 +256,7 @@ fn default_nz()                 -> u32    { 1 }
 fn default_rho()                -> f64    { 1.0 }
 fn default_delta_kernel()       -> String { "four_point".to_string() }
 fn default_output_dir()         -> String { "output".to_string() }
+fn default_output_format()      -> String { "npz".to_string() }
 fn default_python_interpreter() -> String { "python3".to_string() }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +311,8 @@ mod tests {
         assert_eq!(cfg.fluid.nx, 64);
         assert!((cfg.fluid.rho0 - 1.0_f64).abs() < 1e-12);
         assert_eq!(cfg.simulation.lattice_model, "D2Q9");
+        // [output] 中 format 缺省 → "npz"
+        assert_eq!(cfg.output.format, "npz");
         // [python] 段可选；默认值应生效
         assert_eq!(cfg.python.interpreter, "python3");
         assert!(cfg.python.pre_script.is_none());
@@ -284,6 +321,44 @@ mod tests {
         assert!(!cfg.output.enable_csv_monitor);
         // [plugins] 段缺失 → 所有名称默认为空字符串
         assert!(!cfg.plugins.any_active());
+    }
+
+    #[test]
+    fn test_output_format_tecplot() {
+        // 验证 output.format 能正确解析 tecplot_asc 和 tecplot_bin
+        let toml_str = r#"
+            [simulation]
+            n_steps = 100
+            dt = 1.0
+
+            [fluid]
+            nx = 16
+            ny = 16
+            nu = 0.1
+
+            [output]
+            write_interval = 10
+            format = "tecplot_asc"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.output.format, "tecplot_asc");
+
+        let toml_str2 = r#"
+            [simulation]
+            n_steps = 100
+            dt = 1.0
+
+            [fluid]
+            nx = 16
+            ny = 16
+            nu = 0.1
+
+            [output]
+            write_interval = 10
+            format = "tecplot_bin"
+        "#;
+        let cfg2: Config = toml::from_str(toml_str2).unwrap();
+        assert_eq!(cfg2.output.format, "tecplot_bin");
     }
 
     #[test]

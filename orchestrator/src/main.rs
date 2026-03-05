@@ -72,12 +72,19 @@ fn main() -> Result<()> {
         cfg.simulation.n_steps = n;
     }
 
-    println!("=== LBM-IBM-FSI Solver ===");
-    println!("Config : {}", args.config.display());
-    println!("Grid   : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
-    println!("Steps  : {}", cfg.simulation.n_steps);
-    println!("Model  : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
-    println!("ω      : {:.6}", cfg.omega());
+    println!("=== LBM-IBM-FSI 求解器 ===");
+    println!("配置文件 : {}", args.config.display());
+    println!("网格     : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
+    println!("步数     : {}", cfg.simulation.n_steps);
+    println!("模型     : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
+    println!("松弛频率 : ω = {:.6}", cfg.omega());
+    println!("输出格式 : {} → {}", cfg.output.format, {
+        match cfg.output.format.as_str() {
+            "tecplot_asc" => "fluid_NNNNNN.dat（ASCII Tecplot）",
+            "tecplot_bin" => "fluid_NNNNNN.plt（二进制 Tecplot TDV112）",
+            _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
+        }
+    });
 
     // -----------------------------------------------------------------------
     // 插件启动日志
@@ -233,16 +240,30 @@ fn main() -> Result<()> {
 
         let time = (step + 1) as f64 * cfg.simulation.dt;
 
-        // -- 高频：原生 Rust NPZ 快照 ----------------------------------------
+        // -- 高频：原生 Rust 快照（格式由 output.format 决定）-------------------
         if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
             println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
-            output::write_snapshot_npz(&grid, step + 1, time, &cfg.output.directory)
-                .with_context(|| format!("Failed to write snapshot at step {}", step + 1))?;
+            match cfg.output.format.as_str() {
+                "tecplot_asc" => {
+                    // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
+                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &cfg.output.directory)
+                        .with_context(|| format!("写出 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
+                }
+                "tecplot_bin" => {
+                    // 二进制 Tecplot .plt 格式（TDV112）：体积最小，Tecplot 软件可直接打开
+                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &cfg.output.directory)
+                        .with_context(|| format!("写出 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
+                }
+                _ => {
+                    // 默认："npz"——NumPy .npz 压缩归档，Python 后处理首选格式
+                    output::write_snapshot_npz(&grid, step + 1, time, &cfg.output.directory)
+                        .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
+                }
+            }
         }
 
         // -- 逐步：轻量级 CSV 监控日志 -----------------------------------------
-        if cfg.output.enable_csv_monitor {
-            let n = (grid.nx() * grid.ny()) as usize;
+        if cfg.output.enable_csv_monitor {            let n = (grid.nx() * grid.ny()) as usize;
             let ke: f64 = (0..n)
                 .map(|i| {
                     let u = grid.ux(i as i32);

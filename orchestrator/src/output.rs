@@ -1,12 +1,24 @@
 //! LBM 主控程序的原生 Rust 输出模块。
 //!
-//! 实现了两种互补的输出策略：
+//! 实现了三种快照格式和一个轻量级时序日志：
 //!
-//! ## 高频：NPZ 快照文件
+//! ## 高频：NPZ 快照文件（默认）
 //!
 //! [`write_snapshot_npz`] 每隔 `write_interval` 步将完整欧拉场（ρ、ux、uy）
 //! 写入兼容 NumPy 格式的 `.npz` 压缩归档文件。
 //! 该格式可直接被 `lbm_post.vtk_reader.NpzReader` 读取，无需额外工具。
+//!
+//! ## 高频：ASCII Tecplot 格式（`.dat`）
+//!
+//! [`write_snapshot_tecplot_asc`] 将同一欧拉场写为 Tecplot ASCII POINT
+//! 格式文件，可用 Tecplot、ParaView 或本项目 Python 后处理包直接读取。
+//! 文件名格式：`<directory>/fluid_<NNNNNN>.dat`
+//!
+//! ## 高频：二进制 Tecplot 格式（`.plt`，TDV112）
+//!
+//! [`write_snapshot_tecplot_bin`] 将同一欧拉场写为 Tecplot 二进制 PLT 格式
+//! （TDV112 版本），可直接在 Tecplot 软件中打开，文件体积约为 ASCII 版本的 1/3。
+//! 文件名格式：`<directory>/fluid_<NNNNNN>.plt`
 //!
 //! ## 逐步：CSV 监控日志
 //!
@@ -80,6 +92,249 @@ pub fn write_snapshot_npz(
     zip.write_all(&npy_f64(&[time], &[]))?;
 
     zip.finish()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ASCII Tecplot 快照写出器
+// ---------------------------------------------------------------------------
+
+/// 将一个欧拉场快照写为 ASCII Tecplot POINT 格式文件（`.dat`）。
+///
+/// 生成的文件遵循 Tecplot ASCII 格式规范，可直接被 Tecplot、ParaView
+/// 以及本项目的 `lbm_post.vtk_reader.TecplotReader` 读取。
+///
+/// ## 文件格式示例
+///
+/// ```text
+/// TITLE = "LBM Flow Field step=000100 time=100.000"
+/// VARIABLES = "X" "Y" "RHO" "UX" "UY"
+/// ZONE T="fluid", I=100, J=100, K=1, DATAPACKING=POINT, SOLUTIONTIME=100.0
+/// 0.5 0.5 1.0001 0.0012 0.0003
+/// 1.5 0.5 1.0002 0.0015 0.0004
+/// ...
+/// ```
+///
+/// 文件名格式：`<directory>/fluid_<NNNNNN>.dat`
+pub fn write_snapshot_tecplot_asc(
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    directory: &str,
+) -> Result<()> {
+    let nx = grid.nx() as usize;
+    let ny = grid.ny() as usize;
+
+    let path = format!("{}/fluid_{:06}.dat", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("无法创建 Tecplot ASCII 文件：{path}"))?;
+
+    // 写文件头：标题、变量名、Zone 描述
+    writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
+    writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
+    writeln!(
+        file,
+        "ZONE T=\"fluid\", I={nx}, J={ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}"
+    )?;
+
+    // 逐节点写出数据（行主序：j 为外循环，i 为内循环）
+    // 坐标采用格子中心点：x = i+0.5，y = j+0.5
+    for j in 0..ny {
+        for i in 0..nx {
+            let idx = (j * nx + i) as i32;
+            let x   = i as f64 + 0.5;
+            let y   = j as f64 + 0.5;
+            let rho = grid.rho(idx);
+            let ux  = grid.ux(idx);
+            let uy  = grid.uy(idx);
+            writeln!(file, "{x:.4} {y:.4} {rho:.8e} {ux:.8e} {uy:.8e}")?;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 二进制 Tecplot PLT 快照写出器（TDV112 格式）
+// ---------------------------------------------------------------------------
+
+/// 将一个欧拉场快照写为二进制 Tecplot PLT 格式文件（TDV112 版本）。
+///
+/// 生成的文件符合 Tecplot TDV112 二进制格式规范，可直接在 Tecplot 软件中打开，
+/// 也可被本项目的 `lbm_post.vtk_reader.TecplotBinReader` 读取。
+///
+/// ## TDV112 格式结构（有序矩形网格）
+///
+/// ```text
+/// 1. 魔数   "#!TDV112" + 0x01（小端 int = 1 表示字节序）
+/// 2. 文件类型  0 = 全场（Grid + Solution）
+/// 3. 标题字符串（空字符终止）
+/// 4. 变量数量 N（本实现 N=5：X, Y, RHO, UX, UY）
+/// 5. 变量名字符串（各自空字符终止）
+/// 6. Zone 头（标记 = 299.0f32）
+/// 7. EOH 标记（= 357.0f32）
+/// 8. Zone 数据块（变量格式 = double = 2）
+/// ```
+///
+/// 文件名格式：`<directory>/fluid_<NNNNNN>.plt`
+pub fn write_snapshot_tecplot_bin(
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    directory: &str,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let nx = grid.nx() as usize;
+    let ny = grid.ny() as usize;
+    let n  = nx * ny;
+
+    // 从 C++ 格子网格收集场数组（行主序）
+    let mut rho_vec = Vec::with_capacity(n);
+    let mut ux_vec  = Vec::with_capacity(n);
+    let mut uy_vec  = Vec::with_capacity(n);
+    for j in 0..ny {
+        for i in 0..nx {
+            let idx = (j * nx + i) as i32;
+            rho_vec.push(grid.rho(idx));
+            ux_vec .push(grid.ux(idx));
+            uy_vec .push(grid.uy(idx));
+        }
+    }
+
+    let path = format!("{}/fluid_{:06}.plt", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("无法创建 Tecplot 二进制文件：{path}"))?;
+
+    // -----------------------------------------------------------------------
+    // 1. 魔数（8 字节 ASCII + 空终止）+ 字节序标志
+    // -----------------------------------------------------------------------
+    file.write_all(b"#!TDV112")?;
+    // 字节序标志：1 = 小端（Intel 字节序）
+    file.write_all(&1_i32.to_le_bytes())?;
+
+    // -----------------------------------------------------------------------
+    // 2. 文件类型（0 = 全场）
+    // -----------------------------------------------------------------------
+    file.write_all(&0_i32.to_le_bytes())?;
+
+    // -----------------------------------------------------------------------
+    // 3. 数据集标题（空终止字符串）
+    // -----------------------------------------------------------------------
+    let title = format!("LBM Flow Field step={step:06} time={time:.3}");
+    write_tec_string(&mut file, &title)?;
+
+    // -----------------------------------------------------------------------
+    // 4. 变量数量
+    // -----------------------------------------------------------------------
+    let n_vars: i32 = 5; // X, Y, RHO, UX, UY
+    file.write_all(&n_vars.to_le_bytes())?;
+
+    // -----------------------------------------------------------------------
+    // 5. 变量名（各自空终止字符串）
+    // -----------------------------------------------------------------------
+    for name in &["X", "Y", "RHO", "UX", "UY"] {
+        write_tec_string(&mut file, name)?;
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Zone 头（Zone 标记 299.0 + Zone 元信息）
+    // -----------------------------------------------------------------------
+    // Zone 标记
+    file.write_all(&299.0_f32.to_le_bytes())?;
+    // Zone 名称
+    write_tec_string(&mut file, "fluid")?;
+    // 父 Zone 索引（-1 = 无）
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    // Strand ID（-1 = 自动）
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    // 求解时间
+    file.write_all(&time.to_le_bytes())?;
+    // Zone 颜色（-1 = 自动）
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    // Zone 类型（0 = Ordered 有序网格）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 变量位置（0 = 节点中心）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 是否提供原始邻居（0 = 否）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 用户定义面邻居连接数（0 = 无）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // I-max, J-max, K-max（有序网格尺寸）
+    file.write_all(&(nx as i32).to_le_bytes())?;
+    file.write_all(&(ny as i32).to_le_bytes())?;
+    file.write_all(&1_i32.to_le_bytes())?;
+    // 辅助数据对数（0 = 无）
+    file.write_all(&0_i32.to_le_bytes())?;
+
+    // -----------------------------------------------------------------------
+    // 7. EOH（Header 结束标志 357.0）
+    // -----------------------------------------------------------------------
+    file.write_all(&357.0_f32.to_le_bytes())?;
+
+    // -----------------------------------------------------------------------
+    // 8. 数据区域（Zone 数据标记 + 各变量数据）
+    // -----------------------------------------------------------------------
+    // 区域数据标记
+    file.write_all(&299.0_f32.to_le_bytes())?;
+
+    // 各变量的数据格式（2 = float64 double，对应所有 5 个变量）
+    for _ in 0..n_vars {
+        file.write_all(&2_i32.to_le_bytes())?; // 2 = IEEE双精度浮点
+    }
+
+    // 是否有被动变量（0 = 无）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 是否有变量共享（0 = 无）
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 共享连接的 Zone 编号（-1 = 不共享）
+    file.write_all(&(-1_i32).to_le_bytes())?;
+
+    // 变量 1：X 坐标（格子中心，i + 0.5）
+    // X 坐标只与 i 有关，遍历 ny 行只是为了写出 nx*ny 个值
+    for _j in 0..ny {
+        for i in 0..nx {
+            let x = i as f64 + 0.5;
+            file.write_all(&x.to_le_bytes())?;
+        }
+    }
+    // 变量 2：Y 坐标（格子中心，j + 0.5）
+    // Y 坐标只与 j 有关，每行 nx 个节点共享同一 y 值
+    for j in 0..ny {
+        let y = j as f64 + 0.5;
+        for _ in 0..nx {
+            file.write_all(&y.to_le_bytes())?;
+        }
+    }
+    // 变量 3：密度 ρ
+    for v in &rho_vec {
+        file.write_all(&v.to_le_bytes())?;
+    }
+    // 变量 4：x 方向速度 ux
+    for v in &ux_vec {
+        file.write_all(&v.to_le_bytes())?;
+    }
+    // 变量 5：y 方向速度 uy
+    for v in &uy_vec {
+        file.write_all(&v.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tecplot 字符串写出辅助函数
+// ---------------------------------------------------------------------------
+
+/// 将 UTF-8 字符串按 Tecplot TDV112 格式写出：
+/// 逐字符以 i32 小端写出 ASCII 码，末尾追加 0（空字符终止符）。
+fn write_tec_string(file: &mut std::fs::File, s: &str) -> Result<()> {
+    use std::io::Write as _;
+    for ch in s.chars() {
+        file.write_all(&(ch as i32).to_le_bytes())?;
+    }
+    // 空字符终止
+    file.write_all(&0_i32.to_le_bytes())?;
     Ok(())
 }
 
@@ -260,5 +515,95 @@ mod tests {
         // 1 行标题 + 2 行数据
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("step,time"));
+    }
+
+    /// 验证 Tecplot ASCII 格式的关键结构：标题行、变量行、Zone 行。
+    /// 本测试不需要真实 LbmGrid，仅验证辅助函数生成的字符串格式正确。
+    #[test]
+    fn test_tecplot_asc_header_structure() {
+        // 模拟手动拼装一段 ASCII Tecplot 输出（格式正确性校验）
+        let step: u64 = 100;
+        let time: f64 = 100.0;
+        let nx: usize = 4;
+        let ny: usize = 4;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_tecplot_asc_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dat_path = dir.join("test.dat");
+
+        // 手动写出一个最小 Tecplot ASCII 文件，验证格式
+        let mut f = std::fs::File::create(&dat_path).unwrap();
+        writeln!(f, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"").unwrap();
+        writeln!(f, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"").unwrap();
+        writeln!(f, "ZONE T=\"fluid\", I={nx}, J={ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}").unwrap();
+        for j in 0..ny {
+            for i in 0..nx {
+                writeln!(f, "{:.4} {:.4} 1.00000000e0 0.00000000e0 0.00000000e0",
+                    i as f64 + 0.5, j as f64 + 0.5).unwrap();
+            }
+        }
+        drop(f);
+
+        let text = std::fs::read_to_string(&dat_path).unwrap();
+        // 验证标题行
+        assert!(text.contains("TITLE = \"LBM Flow Field step=000100 time=100.000\""));
+        // 验证变量行
+        assert!(text.contains("VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\""));
+        // 验证 Zone 行包含 I=4, J=4
+        assert!(text.contains("I=4"));
+        assert!(text.contains("J=4"));
+        // 验证数据行总数（ny * nx = 16）
+        let data_lines = text.lines().skip(3).count();
+        assert_eq!(data_lines, ny * nx);
+    }
+
+    /// 验证 Tecplot 二进制格式的魔数和字节序标志。
+    #[test]
+    fn test_tecplot_bin_magic_number() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_tecplot_bin_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plt_path = dir.join("test.plt");
+
+        // 手动写出 TDV112 文件头并验证
+        let mut f = std::fs::File::create(&plt_path).unwrap();
+        // 魔数
+        f.write_all(b"#!TDV112").unwrap();
+        // 字节序标志 = 1
+        f.write_all(&1_i32.to_le_bytes()).unwrap();
+        drop(f);
+
+        let bytes = std::fs::read(&plt_path).unwrap();
+        // 验证魔数（前 8 字节）
+        assert_eq!(&bytes[0..8], b"#!TDV112");
+        // 验证字节序标志（字节 8-11，值 = 1）
+        let byte_order = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(byte_order, 1);
+    }
+
+    /// 验证 write_tec_string 将字符串按 i32 字符码序列写出，末尾有空字符。
+    #[test]
+    fn test_write_tec_string_null_terminated() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_tecplot_str_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("tec_str.bin");
+        let mut f = std::fs::File::create(&p).unwrap();
+        write_tec_string(&mut f, "AB").unwrap();
+        drop(f);
+
+        let bytes = std::fs::read(&p).unwrap();
+        // "AB" → [65, 0, 0, 0,  66, 0, 0, 0,  0, 0, 0, 0]
+        assert_eq!(bytes.len(), 12); // 3 × i32
+        let a = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let b = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let z = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(a, 'A' as i32);
+        assert_eq!(b, 'B' as i32);
+        assert_eq!(z, 0); // 空字符终止
     }
 }

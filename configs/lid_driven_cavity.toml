@@ -1,33 +1,37 @@
-# Lid-driven cavity flow with a flexible filament in the centre
-# Classic benchmark: Re = U*L/ν = 1.0 * 100 / 0.01 = 100
+# 顶盖驱动方腔流基准算例（含中心柔性丝状体）
+# 雷诺数：Re = U·L / ν = 0.1 × 100 / 0.01 = 100
 
 [simulation]
 n_steps        = 10000
-dt             = 1.0          # lattice time units
+dt             = 1.0          # 格子时间单位
 lattice_model  = "D2Q9"
-collision_model = "MRT"       # MRT is more stable at lower viscosity
+collision_model = "MRT"       # MRT 在低粘度下更稳定
 
 [fluid]
 nx = 100
 ny = 100
 nz = 1
-nu = 0.01                     # kinematic viscosity (lattice units)
+nu = 0.01                     # 运动粘度（格子单位）
 rho0 = 1.0
 
+  # 北壁（顶盖）：Zou-He 速度边界条件，驱动盖板以 ux=0.1 运动
   [[fluid.boundary_conditions]]
   bc_type = "zou_he_velocity"
   face    = "north"
-  ux      = 0.1               # lid velocity
+  ux      = 0.1               # 盖板速度
   uy      = 0.0
 
+  # 南壁（底部固壁）：标准反弹边界条件（无滑移）
   [[fluid.boundary_conditions]]
   bc_type = "bounce_back"
   face    = "south"
 
+  # 西壁（左侧固壁）：标准反弹边界条件
   [[fluid.boundary_conditions]]
   bc_type = "bounce_back"
   face    = "west"
 
+  # 东壁（右侧固壁）：标准反弹边界条件
   [[fluid.boundary_conditions]]
   bc_type = "bounce_back"
   face    = "east"
@@ -42,24 +46,39 @@ n_elements     = 10
 
 [ibm]
 geometry   = "filament"
-x0         = 50.0            # centre of domain in lattice units
+x0         = 50.0            # 丝状体起点 x（格子单位）
 y0         = 30.0
-size       = 30.0            # filament length (lattice units)
+size       = 30.0            # 丝状体长度（格子单位）
 n_markers  = 30
 delta_kernel = "four_point"
 
 [output]
 write_interval = 500
 directory      = "output/lid_cavity"
+# 输出格式选择（三选一，默认 "npz"）：
+#   "npz"         → fluid_NNNNNN.npz  NumPy 压缩归档，供 Python 后处理（默认）
+#   "tecplot_asc" → fluid_NNNNNN.dat  ASCII Tecplot POINT 格式，人类可读
+#   "tecplot_bin" → fluid_NNNNNN.plt  二进制 Tecplot TDV112，文件最小
+format         = "npz"
+
+# --- 可选：Python FFI 进程内实时绘图 ---
+# 每隔 plot_interval 步，Rust 在进程内直接调用 Python 生成云图（无中间 .npz 文件）。
+# 需要以 --features python-ffi 编译：
+#   cargo build --release --features python-ffi
+# 然后在此取消注释：
+# plot_interval  = 2000   # 每 2000 步绘制一次速度云图和涡量云图
+
+# --- 可选：逐步轻量级时间序列监控 ---
+# enable_csv_monitor = true  # 每步写出 step, time, ke 到 monitor.csv
 
 [python]
-# After the simulation finishes, automatically visualise the flow field.
-# The solver passes the output directory as the first positional argument.
-# Set pythonpath to the python/ sub-directory so lbm_post is importable
-# without a pip install (adjust the path if running from a different location).
+# 仿真结束后自动可视化流场。
+# 求解器将输出目录作为第一个位置参数传递给脚本。
+# 设置 pythonpath 可使 lbm_post 在不 pip install 的情况下也能导入。
 #
-# interpreter: use "python" on Windows where the launcher is named "python.exe",
-#              and "python3" on Linux/macOS where "python" may not exist.
+# interpreter 说明：
+#   Windows 上 Python 可执行文件名为 "python"（推荐）
+#   Linux/macOS 上通常为 "python3"
 interpreter = "python"
 post_script = "python/examples/plot_solver_output.py"
 pythonpath  = "python"

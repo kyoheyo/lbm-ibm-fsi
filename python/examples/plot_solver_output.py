@@ -2,51 +2,58 @@
 """
 examples/plot_solver_output.py
 ==============================
-Post-processing script for visualising the output of the Rust LBM solver.
+LBM 求解器输出后处理脚本，支持 NPZ / ASCII Tecplot / 二进制 Tecplot 三种格式。
 
-After running the solver::
+运行求解器后::
 
     ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml
 
-a directory of ``fluid_NNNNNN.npz`` snapshots is produced.  This script reads
-those files and saves publication-ready flow-field plots.
+输出目录中会产生快照文件（格式取决于 TOML 中的 ``output.format``）：
 
-Usage
------
-Run standalone (plots go next to the snapshots)::
+* ``fluid_NNNNNN.npz`` — NumPy 压缩归档（默认，``format = "npz"``）
+* ``fluid_NNNNNN.dat`` — ASCII Tecplot POINT 格式（``format = "tecplot_asc"``）
+* ``fluid_NNNNNN.plt`` — 二进制 Tecplot TDV112（``format = "tecplot_bin"``）
+
+本脚本读取上述快照并保存出版级流场图。
+
+用法
+----
+独立运行（图像保存到快照同目录）::
 
     python3 python/examples/plot_solver_output.py
 
-Point at a specific output directory::
+指定输入目录::
 
     python3 python/examples/plot_solver_output.py --input output/lid_cavity
 
-Choose a custom plot destination::
+自定义输出目录::
 
     python3 python/examples/plot_solver_output.py \\
         --input output/lid_cavity --output my_plots/
 
-The solver can also invoke this script automatically by adding the following
-section to the TOML config::
+指定输入格式（默认自动检测）::
+
+    python3 python/examples/plot_solver_output.py --fmt tecplot_asc
+
+在 TOML 配置中自动调用（仿真结束后）::
 
     [python]
     post_script = "python/examples/plot_solver_output.py"
-    pythonpath  = "python"   # optional: makes lbm_post importable without pip
+    pythonpath  = "python"
 
-When called as a post-script the solver passes the output directory as the
-first positional argument, so ``--input`` need not be specified.
+调用时求解器将输出目录作为第一个位置参数传入，因此无需手动指定 ``--input``。
 
-Outputs
--------
-Written to ``<output_dir>/``:
+输出文件
+--------
+保存到 ``<output_dir>/``：
 
-* ``velocity_magnitude.png``
-* ``streamlines.png``
-* ``vorticity.png``
-* ``ux_profile.png``      — ux profile at cavity centre (x = nx//2)
-* ``uy_profile.png``      — uy profile at cavity centre (y = ny//2)
-* ``monitor_velocity.png`` — |u| time series at the centre monitor point
-                             (only written when more than one snapshot is available)
+* ``velocity_magnitude.png``   — 速度幅值云图
+* ``streamlines.png``          — 流线图
+* ``vorticity.png``            — 涡量云图
+* ``ux_profile.png``           — 方腔中心截面 ux 剖面（x = nx//2）
+* ``uy_profile.png``           — 方腔中心截面 uy 剖面（y = ny//2）
+* ``monitor_velocity.png``     — 中心监测点 |u| 时间序列
+                                 （仅在快照数 > 1 时生成）
 """
 
 from __future__ import annotations
@@ -56,26 +63,24 @@ import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Path bootstrap: ensure lbm_pre / lbm_post are importable regardless of the
-# working directory or how this script is invoked.
+# sys.path 引导：确保无论工作目录如何，lbm_pre / lbm_post 均可导入。
 # __file__ → .../python/examples/plot_solver_output.py
 # .parent  → .../python/examples/
-# .parent  → .../python/          ← the package root
+# .parent  → .../python/          ← 包的根目录
 # ---------------------------------------------------------------------------
 _PYTHON_DIR = Path(__file__).resolve().parent.parent
 if str(_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(_PYTHON_DIR))
 
 # ---------------------------------------------------------------------------
-# CLI
+# 命令行参数解析
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Visualise LBM solver output (fluid_NNNNNN.npz snapshots). "
-            "Produces velocity-magnitude, streamline, vorticity and profile "
-            "plots in the specified output directory."
+            "可视化 LBM 求解器输出（支持 .npz / .dat / .plt 快照格式）。"
+            "生成速度幅值、流线、涡量及剖面图，保存到指定输出目录。"
         )
     )
     p.add_argument(
@@ -83,8 +88,8 @@ def _parse_args() -> argparse.Namespace:
         nargs="?",
         metavar="INPUT_DIR",
         help=(
-            "Directory containing fluid_*.npz snapshots "
-            "(passed automatically when used as post_script)."
+            "包含快照文件的目录"
+            "（作为 post_script 调用时由求解器自动传入）。"
         ),
     )
     p.add_argument(
@@ -92,8 +97,8 @@ def _parse_args() -> argparse.Namespace:
         metavar="INPUT_DIR",
         default=None,
         help=(
-            "Directory containing fluid_*.npz snapshots. "
-            "Defaults to 'output/lid_cavity' relative to the repo root."
+            "包含快照文件的目录。"
+            "默认：仓库根目录下的 'output/lid_cavity'。"
         ),
     )
     p.add_argument(
@@ -101,8 +106,18 @@ def _parse_args() -> argparse.Namespace:
         metavar="OUTPUT_DIR",
         default=None,
         help=(
-            "Directory for plot files. "
-            "Defaults to the same directory as INPUT_DIR."
+            "图像文件的保存目录。"
+            "默认：与 INPUT_DIR 相同。"
+        ),
+    )
+    p.add_argument(
+        "--fmt",
+        metavar="FORMAT",
+        default=None,
+        choices=["npz", "tecplot_asc", "tecplot_bin"],
+        help=(
+            "输入文件格式：npz（默认）、tecplot_asc（.dat）或 tecplot_bin（.plt）。"
+            "若不指定则自动检测（先找 .npz，再找 .dat，最后找 .plt）。"
         ),
     )
     p.add_argument(
@@ -111,8 +126,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help=(
-            "Plot a specific time step instead of the last snapshot. "
-            "Must match one of the fluid_NNNNNN.npz filenames."
+            "指定绘制某个时间步（而不是最后一帧）。"
+            "对应文件名 fluid_NNNNNN.{npz|dat|plt}。"
         ),
     )
     p.add_argument(
@@ -120,19 +135,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         metavar="I",
-        help="Grid x-index for the vertical velocity profile (default: nx//2).",
+        help="竖向速度剖面的 x 格点索引（默认：nx//2）。",
     )
     p.add_argument(
         "--centre-y",
         type=int,
         default=None,
         metavar="J",
-        help="Grid y-index for the horizontal velocity profile (default: ny//2).",
+        help="横向速度剖面的 y 格点索引（默认：ny//2）。",
     )
     args = p.parse_args()
 
-    # Positional arg overrides --input (compatibility with Rust post_script calling
-    # convention: the solver passes the output directory as the first positional arg).
+    # 位置参数优先于 --input（与 Rust post_script 调用约定兼容）
     if args.positional_input is not None:
         args.input = args.positional_input
 
@@ -140,13 +154,13 @@ def _parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# 主函数
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     args = _parse_args()
 
-    from lbm_post.vtk_reader import NpzReader
+    from lbm_post.vtk_reader import NpzReader, TecplotAscReader, TecplotBinReader
     from lbm_post.plot import (
         plot_velocity_magnitude,
         plot_streamlines,
@@ -157,19 +171,19 @@ def main() -> None:
     from lbm_post.analysis import compute_bulk_quantities, monitor_point
 
     # ------------------------------------------------------------------
-    # Resolve input / output directories
+    # 解析输入 / 输出目录
     # ------------------------------------------------------------------
     if args.input is not None:
         input_dir = Path(args.input)
     else:
-        # Default: <repo_root>/output/lid_cavity
+        # 默认：<仓库根目录>/output/lid_cavity
         repo_root = _PYTHON_DIR.parent
         input_dir = repo_root / "output" / "lid_cavity"
 
     if not input_dir.exists():
         print(
-            f"[plot_solver_output] ERROR: input directory not found: {input_dir}\n"
-            "  Run the solver first:\n"
+            f"[plot_solver_output] 错误：输入目录不存在：{input_dir}\n"
+            "  请先运行求解器：\n"
             "    ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml",
             file=sys.stderr,
         )
@@ -179,65 +193,97 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Load snapshots
+    # 自动选择读取器
     # ------------------------------------------------------------------
-    reader = NpzReader(input_dir)
+    fmt = args.fmt
+    if fmt is None:
+        # 自动检测：优先 .npz，其次 .dat，最后 .plt
+        if list(input_dir.glob("fluid_*.npz")):
+            fmt = "npz"
+        elif list(input_dir.glob("fluid_*.dat")):
+            fmt = "tecplot_asc"
+        elif list(input_dir.glob("fluid_*.plt")):
+            fmt = "tecplot_bin"
+        else:
+            print(
+                f"[plot_solver_output] 错误：目录 {input_dir} 中没有快照文件\n"
+                "  支持格式：fluid_*.npz（NPZ）/ fluid_*.dat（ASCII Tecplot）/ "
+                "fluid_*.plt（二进制 Tecplot）\n"
+                "  请先运行求解器：\n"
+                "    ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if fmt == "npz":
+        reader = NpzReader(input_dir)
+        fmt_label = "NPZ"
+    elif fmt == "tecplot_asc":
+        reader = TecplotAscReader(input_dir)
+        fmt_label = "ASCII Tecplot (.dat)"
+    else:
+        reader = TecplotBinReader(input_dir)
+        fmt_label = "二进制 Tecplot (.plt)"
+
     if len(reader) == 0:
         print(
-            f"[plot_solver_output] ERROR: no fluid_*.npz files found in {input_dir}\n"
-            "  Run the solver first:\n"
+            f"[plot_solver_output] 错误：目录 {input_dir} 中没有 {fmt_label} 快照文件\n"
+            "  请先运行求解器：\n"
             "    ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    print(f"[plot_solver_output] Found {len(reader)} snapshot(s) in {input_dir}")
+    print(f"[plot_solver_output] 在 {input_dir} 中找到 {len(reader)} 个快照（格式：{fmt_label}）")
 
     if args.step is not None:
         snap = reader.read(args.step)
-        print(f"  Using step {snap.step}")
+        print(f"  使用第 {snap.step} 步快照")
     else:
         snap = reader.last()
-        print(f"  Using last snapshot  step={snap.step}  time={snap.time:.2f}")
+        print(f"  使用最后一帧  step={snap.step}  time={snap.time:.2f}")
 
     cx = args.centre_x if args.centre_x is not None else snap.nx // 2
     cy = args.centre_y if args.centre_y is not None else snap.ny // 2
 
     # ------------------------------------------------------------------
-    # 1. Velocity magnitude
+    # 1. 速度幅值云图
     # ------------------------------------------------------------------
     fig, _ = plot_velocity_magnitude(snap)
     save_figure(fig, output_dir / "velocity_magnitude.png")
-    print(f"  [1/6] velocity_magnitude.png")
+    print("  [1/6] velocity_magnitude.png")
 
     # ------------------------------------------------------------------
-    # 2. Streamlines
+    # 2. 流线图
     # ------------------------------------------------------------------
     fig, _ = plot_streamlines(snap)
     save_figure(fig, output_dir / "streamlines.png")
-    print(f"  [2/6] streamlines.png")
+    print("  [2/6] streamlines.png")
 
     # ------------------------------------------------------------------
-    # 3. Vorticity
+    # 3. 涡量云图
     # ------------------------------------------------------------------
     fig, _ = plot_vorticity(snap)
     save_figure(fig, output_dir / "vorticity.png")
-    print(f"  [3/6] vorticity.png")
+    print("  [3/6] vorticity.png")
 
     # ------------------------------------------------------------------
-    # 4. Velocity profiles
+    # 4. ux 速度剖面
     # ------------------------------------------------------------------
     fig, _ = plot_velocity_profile(snap, x_slices=[cx], component="ux")
     save_figure(fig, output_dir / "ux_profile.png")
     print(f"  [4/6] ux_profile.png  (x={cx})")
 
+    # ------------------------------------------------------------------
+    # 5. uy 速度剖面
+    # ------------------------------------------------------------------
     fig, _ = plot_velocity_profile(snap, y_slices=[cy], component="uy")
     save_figure(fig, output_dir / "uy_profile.png")
     print(f"  [5/6] uy_profile.png  (y={cy})")
 
     # ------------------------------------------------------------------
-    # 6. Velocity time series at the centre monitor point
-    # (uses all loaded snapshots; skipped when only one snapshot exists)
+    # 6. 中心监测点速度时间序列
+    #    （使用全部已加载快照；仅在快照数 > 1 时生成）
     # ------------------------------------------------------------------
     if len(reader) > 1:
         from lbm_post.plot import plot_convergence
@@ -249,20 +295,20 @@ def main() -> None:
             log_scale=False,
         )
         save_figure(fig, output_dir / "monitor_velocity.png")
-        print(f"  [6/6] monitor_velocity.png  ({len(all_snaps)} time steps)")
+        print(f"  [6/6] monitor_velocity.png  （{len(all_snaps)} 个时间步）")
     else:
-        print("  [6/6] monitor_velocity.png  skipped (only 1 snapshot)")
+        print("  [6/6] monitor_velocity.png  跳过（只有 1 个快照）")
 
     # ------------------------------------------------------------------
-    # Bulk statistics
+    # 体积统计量
     # ------------------------------------------------------------------
     bq = compute_bulk_quantities(snap)
-    print(f"\nBulk statistics at step {bq.step}:")
-    print(f"  KE        = {bq.ke:.6f}")
-    print(f"  Enstrophy = {bq.enstrophy:.6f}")
-    print(f"  ρ mean    = {bq.rho_mean:.6f}  std = {bq.rho_std:.2e}")
-    print(f"  max |∇·u| = {bq.div_max:.2e}")
-    print(f"\nPlots saved → {output_dir}")
+    print(f"\n第 {bq.step} 步体积统计量：")
+    print(f"  动能      KE        = {bq.ke:.6f}")
+    print(f"  涡量能    Enstrophy = {bq.enstrophy:.6f}")
+    print(f"  密度均值  ρ mean    = {bq.rho_mean:.6f}  std = {bq.rho_std:.2e}")
+    print(f"  最大散度  max|∇·u|  = {bq.div_max:.2e}")
+    print(f"\n图像已保存 → {output_dir}")
 
 
 if __name__ == "__main__":
