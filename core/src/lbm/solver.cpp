@@ -47,7 +47,14 @@ Solver::Solver(LatticeGrid& grid, double omega, CollisionModel cm)
 }
 
 // ---------------------------------------------------------------------------
-// 单时间步：碰撞 + 流式迁移 + 注册的边界条件
+// 单时间步：碰撞 + 流式迁移 + 边界条件 + 宏观量更新
+//
+// 执行顺序说明：
+//   1. collide()  — 使用上一步的 ρ/u 计算平衡态并执行 BGK/MRT 松弛
+//   2. stream()   — 传播分布函数，并初步计算宏观量（边界节点此时使用幽灵值）
+//   3. apply_BC() — 用物理边界条件覆盖幽灵方向的分布函数
+//   4. compute_macroscopic() — 用 BC 修正后的 f 重新计算边界节点的正确 ρ/u
+//      （若未执行此步，下次碰撞将使用 BC 修正前的错误 ρ/u）
 // ---------------------------------------------------------------------------
 void Solver::step()
 {
@@ -56,6 +63,8 @@ void Solver::step()
     // 施加通过 add_boundary_condition() 注册的边界条件
     if (!bcs_.empty()) {
         apply_boundary_conditions(grid_, bcs_);
+        // BC 修正了边界节点的 f 值，需重新计算宏观量以供下次碰撞使用
+        grid_.compute_macroscopic();
     }
 }
 
