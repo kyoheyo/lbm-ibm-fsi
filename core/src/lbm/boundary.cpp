@@ -18,11 +18,21 @@ namespace lbm {
 //   0:(0,0) 1:(+1,0) 2:(0,+1) 3:(-1,0) 4:(0,-1)
 //   5:(+1,+1) 6:(-1,+1) 7:(-1,-1) 8:(+1,-1)
 //
-// 各面的幽灵（未知）方向与反弹关系（f[未知] = f[OPP]，OPP 方向为相应的已知）：
-//   南壁 (j=0)    ：f[2]←f[4], f[5]←f[7], f[6]←f[8]
-//   北壁 (j=ny-1) ：f[4]←f[2], f[7]←f[5], f[8]←f[6]
-//   西壁 (i=0)    ：f[1]←f[3], f[5]←f[7], f[8]←f[6]
-//   东壁 (i=nx-1) ：f[3]←f[1], f[6]←f[8], f[7]←f[5]
+// 标准反弹边界条件（halfway bounce-back）物理推导：
+//   碰后、迁移前，壁面节点 x_b 处朝向壁面方向 a 的分布函数为 f*_a(x_b, t)。
+//   粒子碰壁后原路返回，因此迁移后到达 x_b 的朝流体方向（opp[a]）分布函数应为：
+//     f[opp[a]](x_b, t+dt) = f*[a](x_b, t)
+//   其中 f*（碰后迁移前的值）在 stream() 完成后存于 g.f_tmp
+//   （stream() 末尾执行了 std::swap(g.f, g.f_tmp)）。
+//
+// 使用 g.f_tmp（碰后迁移前值）而非 g.f（迁移后值）作为反弹源，
+// 才符合物理上的时序逻辑，避免引入来自相邻内部节点的错误值。
+//
+// 各面反弹赋值（f[未知方向] = f_tmp[其反方向]，均取壁面节点本身）：
+//   南壁 (j=0)    ：f[2]←f_tmp[4], f[5]←f_tmp[7], f[6]←f_tmp[8]
+//   北壁 (j=ny-1) ：f[4]←f_tmp[2], f[7]←f_tmp[5], f[8]←f_tmp[6]
+//   西壁 (i=0)    ：f[1]←f_tmp[3], f[5]←f_tmp[7], f[8]←f_tmp[6]
+//   东壁 (i=nx-1) ：f[3]←f_tmp[1], f[6]←f_tmp[8], f[7]←f_tmp[5]
 // ---------------------------------------------------------------------------
 static void apply_bounce_back(LatticeGrid& g, Face face)
 {
@@ -37,14 +47,17 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
     switch (face) {
         case Face::South:
             // 南壁 (j=0)：幽灵方向 N(2), NE(5), NW(6) 由周期延拓自 j=ny-1 而来
+            // 使用 f_tmp（碰后迁移前）中壁面节点的反方向分量赋值
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                double* f = &g.f[g.idx(i, 0) * d2q9::Q];
-                f[2] = f[4];   // N  ← 反弹自 S
-                f[5] = f[7];   // NE ← 反弹自 SW
-                f[6] = f[8];   // NW ← 反弹自 SE
+                const int n = g.idx(i, 0);
+                double*       f  = &g.f    [n * d2q9::Q];
+                const double* fp = &g.f_tmp[n * d2q9::Q];  // 碰后迁移前的值
+                f[2] = fp[4];   // N  ← 碰后迁移前的 S
+                f[5] = fp[7];   // NE ← 碰后迁移前的 SW
+                f[6] = fp[8];   // NW ← 碰后迁移前的 SE
             }
             break;
 
@@ -54,10 +67,12 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                double* f = &g.f[g.idx(i, ny - 1) * d2q9::Q];
-                f[4] = f[2];   // S  ← 反弹自 N
-                f[7] = f[5];   // SW ← 反弹自 NE
-                f[8] = f[6];   // SE ← 反弹自 NW
+                const int n = g.idx(i, ny - 1);
+                double*       f  = &g.f    [n * d2q9::Q];
+                const double* fp = &g.f_tmp[n * d2q9::Q];  // 碰后迁移前的值
+                f[4] = fp[2];   // S  ← 碰后迁移前的 N
+                f[7] = fp[5];   // SW ← 碰后迁移前的 NE
+                f[8] = fp[6];   // SE ← 碰后迁移前的 NW
             }
             break;
 
@@ -67,10 +82,12 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int j = 0; j < ny; ++j) {
-                double* f = &g.f[g.idx(0, j) * d2q9::Q];
-                f[1] = f[3];   // E  ← 反弹自 W
-                f[5] = f[7];   // NE ← 反弹自 SW
-                f[8] = f[6];   // SE ← 反弹自 NW
+                const int n = g.idx(0, j);
+                double*       f  = &g.f    [n * d2q9::Q];
+                const double* fp = &g.f_tmp[n * d2q9::Q];  // 碰后迁移前的值
+                f[1] = fp[3];   // E  ← 碰后迁移前的 W
+                f[5] = fp[7];   // NE ← 碰后迁移前的 SW
+                f[8] = fp[6];   // SE ← 碰后迁移前的 NW
             }
             break;
 
@@ -80,10 +97,12 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int j = 0; j < ny; ++j) {
-                double* f = &g.f[g.idx(nx - 1, j) * d2q9::Q];
-                f[3] = f[1];   // W  ← 反弹自 E
-                f[6] = f[8];   // NW ← 反弹自 SE
-                f[7] = f[5];   // SW ← 反弹自 NE
+                const int n = g.idx(nx - 1, j);
+                double*       f  = &g.f    [n * d2q9::Q];
+                const double* fp = &g.f_tmp[n * d2q9::Q];  // 碰后迁移前的值
+                f[3] = fp[1];   // W  ← 碰后迁移前的 E
+                f[6] = fp[8];   // NW ← 碰后迁移前的 SE
+                f[7] = fp[5];   // SW ← 碰后迁移前的 NE
             }
             break;
 

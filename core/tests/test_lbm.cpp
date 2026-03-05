@@ -124,10 +124,18 @@ static int test_bc_drives_flow()
     return ok ? 0 : 1;
 }
 
-// 测试 4：反弹 BC 不应修改已知方向的分布函数
-// 逐节点检查：施加南壁反弹后，f[1](E)、f[3](W)、f[4](S)、f[7](SW)、f[8](SE)
-// 的值与施加前相同（这些方向由内部节点推送而来，是已知量）。
-static int test_bounce_back_preserves_known()
+// 测试 4：反弹 BC 使用碰后迁移前（f_tmp）的值设置未知方向
+//
+// 正确的 halfway bounce-back 应满足：
+//   f[opp[a]](x_wall, t+dt) = f*[a](x_wall, t)
+// 其中 f* 是碰撞后、流式迁移前的分布函数，stream() 后存于 g.f_tmp。
+//
+// 施加反弹后（仍在同一步内），验证：
+//   f[2](i,0) == f_tmp[4](i,0)   （N ← 碰前 S）
+//   f[5](i,0) == f_tmp[7](i,0)   （NE ← 碰前 SW）
+//   f[6](i,0) == f_tmp[8](i,0)   （NW ← 碰前 SE）
+// 精度公差：IEEE 754 双精度精确赋值，应严格相等（tol = 1e-14）
+static int test_bounce_back_uses_precollision_values()
 {
     const int nx = 8, ny = 8;
     lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
@@ -144,24 +152,23 @@ static int test_bounce_back_preserves_known()
     // 运行几步产生非均匀分布
     for (int t = 0; t < 5; ++t) solver.step();
 
-    // 手动检查南壁节点（j=0）的已知方向：在施加反弹 BC 之后，
-    // 流式迁移后的 f[4], f[7], f[8] 不应被反弹修改
-    // （南壁已知方向：f[4](S), f[7](SW), f[8](SE) 来自 j=1 内部）
-    // 方法：记录反弹 BC 后的值，与手工计算值对比
-    // 此处验证：反弹仅设置 f[2],f[5],f[6]，且 f[2]=f[4], f[5]=f[7], f[6]=f[8]
-    // 精度公差：f[a] 是 IEEE 754 双精度浮点数的精确赋值（无舍入），应严格相等
+    // 步骤结束后：
+    //   g.f     = 施加 BC + compute_macroscopic() 后的分布函数
+    //   g.f_tmp = 本次 stream() 之前的碰后分布函数（即反弹 BC 的正确来源）
+    // 验证南壁反弹赋值使用了 f_tmp（碰后迁移前）而非 f（迁移后）的值
     constexpr double BOUNCE_BACK_TOLERANCE = 1e-14;
     bool ok = true;
     for (int i = 1; i < nx - 1; ++i) {
         const int n = g.idx(i, 0);
-        const double* f = &g.f[n * lbm::d2q9::Q];
-        // 南壁正确反弹：f[2]==f[4], f[5]==f[7], f[6]==f[8]
-        if (std::abs(f[2] - f[4]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
-        if (std::abs(f[5] - f[7]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
-        if (std::abs(f[6] - f[8]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
+        const double* f  = &g.f    [n * lbm::d2q9::Q];
+        const double* fp = &g.f_tmp[n * lbm::d2q9::Q];  // post-collision, pre-streaming values
+        // 正确反弹：f[2] == f_tmp[4], f[5] == f_tmp[7], f[6] == f_tmp[8]
+        if (std::abs(f[2] - fp[4]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
+        if (std::abs(f[5] - fp[7]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
+        if (std::abs(f[6] - fp[8]) > BOUNCE_BACK_TOLERANCE) { ok = false; break; }
     }
 
-    std::printf("[LBM] bounce-back sets correct directions (south wall): %s\n",
+    std::printf("[LBM] bounce-back uses pre-streaming (post-collision) values (south wall): %s\n",
                 ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -172,6 +179,6 @@ int test_lbm_main()
     failures += test_mass_conservation();
     failures += test_feq_normalisation();
     failures += test_bc_drives_flow();
-    failures += test_bounce_back_preserves_known();
+    failures += test_bounce_back_uses_precollision_values();
     return failures;
 }
