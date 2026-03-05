@@ -57,6 +57,12 @@ public:
     GpuSolver(const GpuSolver&)            = delete;
     GpuSolver& operator=(const GpuSolver&) = delete;
 
+    /// Single fused step: BGK collision + streaming + macroscopic update,
+    /// with one cudaDeviceSynchronize at the end (faster than calling
+    /// collide() + stream() + compute_macroscopic() individually).
+    /// After returning, d_f / d_f_tmp / d_rho / d_u are all up-to-date.
+    void step();
+
     /// 在 GPU 上执行 BGK 碰撞（原地修改 d_f）
     void collide();
 

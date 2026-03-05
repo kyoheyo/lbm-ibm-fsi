@@ -2,6 +2,7 @@
 #include "lbm/lattice.hpp"
 #include "lbm/solver.hpp"
 #include "lbm/boundary.hpp"
+#include "lbm/mpi_decomp.hpp"
 #include <cmath>
 #include <cstdio>
 #include <numeric>
@@ -379,6 +380,79 @@ static int test_guo_extrapolation_west_velocity()
 }
 
 
+// 测试 9：MpiDecomp 单进程模式字段正确性
+//
+// 在非 MPI 构建（或 nprocs=1）下，MpiDecomp::create() 应返回：
+//   rank=0, nprocs=1, y_start=0, y_end=gny-1, local_ny=gny
+//   has_south_wall() == true, has_north_wall() == true
+//   grid_ny() == global_ny（无幽灵行）
+//
+// 这验证了域分解描述符在单进程/无 MPI 构建下的正确初始化，
+// 同时作为多进程情形下各字段计算的基准回归测试。
+static int test_mpi_decomp_single_rank()
+{
+    const int gnx = 32, gny = 16;
+    const auto d = lbm::MpiDecomp::create(gnx, gny);
+
+    bool ok = true;
+    ok = ok && (d.rank      == 0);
+    ok = ok && (d.nprocs    == 1);
+    ok = ok && (d.global_nx == gnx);
+    ok = ok && (d.global_ny == gny);
+    ok = ok && (d.y_start   == 0);
+    ok = ok && (d.y_end     == gny - 1);
+    ok = ok && (d.local_ny  == gny);
+    ok = ok && (d.grid_ny() == gny);       // nprocs==1: no ghost rows
+    ok = ok && d.has_south_wall();
+    ok = ok && d.has_north_wall();
+
+    std::printf("[MPI] MpiDecomp single-rank fields: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
+// 测试 10：attach_mpi() 单进程模式对仿真结果无影响（质量守恒不受干扰）
+//
+// 物理期望：
+//   在非 MPI 构建（nprocs=1）下，attach_mpi() 应为空操作——
+//   halo exchange 代码路径受 nprocs>1 守卫，因此仿真结果应与
+//   不调用 attach_mpi() 完全一致。
+//
+// 验证方法：两组完全相同的初始条件下各运行 100 步，
+//   分别不绑定 / 绑定 MpiDecomp；最终宏观量逐节点比较。
+static int test_mpi_attach_no_effect()
+{
+    const int nx = 16, ny = 16;
+    const double omega = 1.0;
+
+    // 基准：不绑定任何 MpiDecomp
+    lbm::LatticeGrid g_ref(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_ref.size(); ++i) g_ref.rho[i] = 1.0 + 0.01 * (i % 7);
+    lbm::Solver solver_ref(g_ref, omega);
+    for (int t = 0; t < 100; ++t) solver_ref.step();
+
+    // 对照：绑定 nprocs==1 的 MpiDecomp（应为 no-op）
+    lbm::LatticeGrid g_mpi(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_mpi.size(); ++i) g_mpi.rho[i] = 1.0 + 0.01 * (i % 7);
+    lbm::Solver solver_mpi(g_mpi, omega);
+    const auto decomp = lbm::MpiDecomp::create(nx, ny);  // nprocs==1
+    solver_mpi.attach_mpi(&decomp);
+    for (int t = 0; t < 100; ++t) solver_mpi.step();
+
+    // 两组结果应逐节点完全相同（IEEE-754 精确相等）
+    constexpr double TOL = 1e-14;
+    bool ok = true;
+    for (int i = 0; i < g_ref.size() && ok; ++i) {
+        if (std::abs(g_ref.rho[i] - g_mpi.rho[i]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 0] - g_mpi.u[i * 2 + 0]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 1] - g_mpi.u[i * 2 + 1]) > TOL) { ok = false; break; }
+    }
+    std::printf("[MPI] attach_mpi single-rank no-op (results identical): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -390,5 +464,7 @@ int test_lbm_main()
     failures += test_zou_he_pressure_east();
     failures += test_fully_developed_east();
     failures += test_guo_extrapolation_west_velocity();
+    failures += test_mpi_decomp_single_rank();
+    failures += test_mpi_attach_no_effect();
     return failures;
 }

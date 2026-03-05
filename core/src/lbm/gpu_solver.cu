@@ -171,22 +171,27 @@ void GpuSolver::collide()
     constexpr int BLOCK = 256;
     const int grid = (n_ + BLOCK - 1) / BLOCK;
     collide_bgk_kernel<<<grid, BLOCK>>>(d_f, d_rho, d_u, omega_, n_);
+    // Check for kernel launch errors; execution errors are caught at the next sync
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // No cudaDeviceSynchronize here: kernels in the default stream execute in
+    // order, so stream_kernel (or the caller's download/sync) will naturally
+    // wait for this kernel to finish first.
 }
 
 void GpuSolver::stream()
 {
-    // 保存碰后值到 d_f_tmp（供 CPU 端半步长反弹 BC 使用）
-    const std::size_t f_bytes = static_cast<std::size_t>(n_) * 9 * sizeof(double);
-    CUDA_CHECK(cudaMemcpy(d_f_tmp, d_f, f_bytes, cudaMemcpyDeviceToDevice));
-
+    // Push-streaming: every cell in d_f_tmp is overwritten by exactly one
+    // source cell, so no prior backup copy of d_f into d_f_tmp is needed.
+    // After the kernel: d_f_tmp holds the streamed distribution.
+    // After the pointer swap below: d_f = streamed result,
+    //   d_f_tmp = pre-streaming (post-collision) values — kept for
+    //   CPU-side half-way bounce-back BC (download() copies it to g.f_tmp).
     constexpr int BLOCK = 256;
     const int grid = (n_ + BLOCK - 1) / BLOCK;
     stream_kernel<<<grid, BLOCK>>>(d_f, d_f_tmp, nx_, ny_);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    // 交换指针：d_f_tmp 现在是流式迁移后的结果，d_f 是碰后值
+    // Pointer swap (no GPU work): d_f ↔ d_f_tmp
     double* tmp = d_f;
     d_f     = d_f_tmp;
     d_f_tmp = tmp;
@@ -218,6 +223,47 @@ void GpuSolver::upload(const LatticeGrid& g)
 {
     const std::size_t f_bytes = static_cast<std::size_t>(n_) * 9 * sizeof(double);
     CUDA_CHECK(cudaMemcpy(d_f, g.f.data(), f_bytes, cudaMemcpyHostToDevice));
+}
+
+// ---------------------------------------------------------------------------
+// GpuSolver::step() — single-synchronize fused step
+//
+// Launches three kernels (collide → stream → macroscopic) back-to-back in
+// the default CUDA stream (which serialises them automatically) and issues
+// ONE cudaDeviceSynchronize at the end.  This avoids the two extra host-GPU
+// round-trips that the individual collide() / stream() methods would incur.
+//
+// After this call:
+//   d_f     — post-stream distribution function (ready for download / BC)
+//   d_f_tmp — post-collision, pre-stream distribution (for half-way BB BC)
+//   d_rho, d_u — updated macroscopic fields
+// ---------------------------------------------------------------------------
+void GpuSolver::step()
+{
+    constexpr int BLOCK = 256;
+    const int g = (n_ + BLOCK - 1) / BLOCK;
+
+    // 1. BGK collision: relax d_f toward equilibrium in-place
+    collide_bgk_kernel<<<g, BLOCK>>>(d_f, d_rho, d_u, omega_, n_);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2. Push streaming: propagate d_f into d_f_tmp; the stream kernel
+    //    overwrites every element of d_f_tmp, so no prior backup copy needed.
+    stream_kernel<<<g, BLOCK>>>(d_f, d_f_tmp, nx_, ny_);
+    CUDA_CHECK(cudaGetLastError());
+    // Pointer swap (host-side only, zero GPU cost):
+    //   d_f     = streamed result (old d_f_tmp)
+    //   d_f_tmp = pre-stream / post-collision values (old d_f)
+    double* tmp = d_f;
+    d_f     = d_f_tmp;
+    d_f_tmp = tmp;
+
+    // 3. Compute macroscopic fields (ρ, u) from the updated d_f
+    macroscopic_kernel<<<g, BLOCK>>>(d_f, d_rho, d_u, n_);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Single synchronise — catches execution errors from all three kernels
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 } // namespace lbm
