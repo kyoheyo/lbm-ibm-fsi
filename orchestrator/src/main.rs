@@ -186,10 +186,19 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     for bc_cfg in &cfg.fluid.boundary_conditions {
         let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
-            "zou_he_velocity"  => BcType::ZouHeVelocity,
-            "zou_he_pressure"  => BcType::ZouHePressure,
-            "periodic"         => BcType::Periodic,
-            "bounce_back"      => BcType::BounceBack,
+            // 反弹类
+            "bounce_back"          => BcType::BounceBack,
+            "bounce_back_full_way" => BcType::BounceBackFullWay,
+            // Zou-He 非平衡反弹类
+            "zou_he_velocity"      => BcType::ZouHeVelocity,
+            "zou_he_pressure"      => BcType::ZouHePressure,
+            // 出口类
+            "fully_developed"      => BcType::FullyDeveloped,
+            "free_outlet"          => BcType::FreeOutlet,
+            // 非平衡外推类
+            "guo_extrapolation"    => BcType::GuoExtrapolation,
+            // 周期类（流式迁移中隐式处理）
+            "periodic"             => BcType::Periodic,
             other => {
                 eprintln!(
                     "  [warn] unknown bc_type {:?}; defaulting to BounceBack",

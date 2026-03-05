@@ -70,8 +70,9 @@ mod ffi {
                                   g: *mut LatticeGridHandle,
                                   step_index: c_int,
                                   dt: f64);
-        /// 向求解器注册一个边界条件，每步 step() 后自动施加。
-        /// bc_type: 0=BounceBack 1=ZouHe_Velocity 2=ZouHe_Pressure 3=Periodic
+        /// 向求解器注册一个边界条件，在每步 `step()` 的流式迁移后自动施加。
+        /// bc_type: 0=BounceBack 1=BounceBackFullWay 2=ZouHe_Velocity 3=ZouHe_Pressure
+        ///          4=FullyDeveloped 5=FreeOutlet 6=Guo_Extrapolation 7=Periodic
         /// face:    0=West 1=East 2=South 3=North 4=Bottom 5=Top
         /// Rust 封装: LbmSolver::add_boundary_condition()
         pub fn lbm_solver_add_bc(s: *mut SolverHandle,
@@ -113,22 +114,50 @@ pub enum CollisionModel {
 }
 
 /// 边界条件类型
-/// 整数值与 C++ 侧 `lbm::BCType` 枚举成员的顺序一致。
+///
+/// 整数值与 C++ 侧 `lbm::BCType` 枚举成员的顺序**严格一致**。
+/// 若在 C++ 侧修改枚举顺序，此处必须同步更新，否则会导致运行时错误。
+///
+/// C++ BCType 定义位于 `core/include/lbm/boundary.hpp`：
+/// ```cpp
+/// enum class BCType {
+///     BounceBack        = 0,
+///     BounceBackFullWay = 1,
+///     ZouHe_Velocity    = 2,
+///     ZouHe_Pressure    = 3,
+///     FullyDeveloped    = 4,
+///     FreeOutlet        = 5,
+///     Guo_Extrapolation = 6,
+///     Periodic          = 7,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum BcType {
-    /// 无滑移固壁：将入射分布函数反射为出射方向（动量反向）。
-    /// 适用于静止壁面（南、西、东壁等）。
-    BounceBack     = 0,
-    /// Zou-He 速度进/出口：通过质量+动量守恒关系，
+    /// 半步长（halfway）反弹：壁面位于节点间半格处，2 阶精度。
+    /// 适用于静止无滑移固壁。
+    BounceBack          = 0,
+    /// 全步长（on-node）反弹：壁面位于节点处，1 阶精度。
+    /// 实现简单，精度较低，适合快速验证。
+    BounceBackFullWay   = 1,
+    /// Zou-He 速度进/出口：通过质量+动量守恒+非平衡反弹条件，
     /// 由规定速度（ux, uy, uz）确定未知方向的分布函数。
-    ZouHeVelocity  = 1,
+    ZouHeVelocity       = 2,
     /// Zou-He 压力进/出口：类似 ZouHeVelocity，
     /// 但规定的是密度 rho（对应 LBM 压力 p = ρ·cs²）而非速度。
-    ZouHePressure  = 2,
+    ZouHePressure       = 3,
+    /// 充分发展出口：将出口节点的分布函数替换为上游相邻层的值（零法向梯度）。
+    /// 适合通道出口处流动已充分发展的场景。
+    FullyDeveloped      = 4,
+    /// 自由出口：与 `FullyDeveloped` 等价（别名）。
+    FreeOutlet          = 5,
+    /// 郭照立非平衡外推格式（Guo et al., Chinese Physics 2002）：
+    /// `f_b = f_eq(ρ_b, u_b) + f_neq(interior)`，适用于各种入/出口。
+    /// `rho > 0` 时为压力模式（外推速度）；`rho = 0` 时为速度模式（外推密度）。
+    GuoExtrapolation    = 6,
     /// 周期边界：在流式迁移的模运算中隐式实现，
     /// 注册此类型为空操作（仅作文档/可视化用途）。
-    Periodic       = 3,
+    Periodic            = 7,
 }
 
 /// 计算域各面编号

@@ -101,10 +101,14 @@ lbm::Solver* lbm_solver_new(lbm::LatticeGrid* g, double omega, int cm_id)
 /// 向求解器注册一个边界条件，每步 step() 后自动施加。
 ///
 /// @param s        求解器指针（由 lbm_solver_new 创建）
-/// @param bc_type  边界类型：0=BounceBack, 1=ZouHe_Velocity, 2=ZouHe_Pressure, 3=Periodic
+/// @param bc_type  边界类型（与 C++ lbm::BCType 枚举值对应）：
+///                   0=BounceBack        1=BounceBackFullWay
+///                   2=ZouHe_Velocity    3=ZouHe_Pressure
+///                   4=FullyDeveloped    5=FreeOutlet
+///                   6=Guo_Extrapolation 7=Periodic
 /// @param face     面编号：0=West, 1=East, 2=South, 3=North, 4=Bottom, 5=Top
-/// @param ux,uy,uz 规定速度分量（仅 ZouHe_Velocity 使用）
-/// @param rho      规定密度（仅 ZouHe_Pressure 使用）
+/// @param ux,uy,uz 规定速度分量（ZouHe_Velocity / Guo_Extrapolation 速度模式使用）
+/// @param rho      规定密度（ZouHe_Pressure 使用；Guo_Extrapolation 中 rho>0 为压力模式，rho=0 为速度模式）
 /// Rust 封装: LbmSolver::add_boundary_condition() — bindings/src/lib.rs
 void lbm_solver_add_bc(lbm::Solver* s,
                         int bc_type, int face,
@@ -112,7 +116,7 @@ void lbm_solver_add_bc(lbm::Solver* s,
                         double rho)
 {
     if (!s) return;
-    if (bc_type < 0 || bc_type > 3) return;
+    if (bc_type < 0 || bc_type > 7) return;   // 与 BCType 枚举成员数同步
     if (face    < 0 || face    > 5) return;
 
     lbm::BoundaryCondition bc;
