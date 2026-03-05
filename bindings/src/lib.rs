@@ -102,6 +102,12 @@ mod ffi {
         pub fn lbm_gpu_download(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
         pub fn lbm_gpu_upload(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
 
+        // --- 并行状态查询 — 实现于 core/src/capi/lbm_capi.cpp ---
+        pub fn lbm_openmp_enabled()     -> c_int;
+        pub fn lbm_openmp_max_threads() -> c_int;
+        pub fn lbm_cuda_enabled()       -> c_int;
+        pub fn lbm_mpi_enabled()        -> c_int;
+
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
         // Rust 安全封装: register_plugins()（见本文件底部）
@@ -382,6 +388,43 @@ pub fn mpi_local_ny(global_ny: i32) -> (i32, i32, i32) {
         ffi::lbm_mpi_local_ny(global_ny, &mut y_start, &mut local_ny)
     };
     (grid_ny, y_start, local_ny)
+}
+
+// ---------------------------------------------------------------------------
+/// 打印当前编译时和运行时并行配置摘要。
+///
+/// 输出示例（OpenMP 已启用，8 线程）：
+/// ```text
+/// 并行配置：
+///   OpenMP : 已启用  线程数 = 8（受 OMP_NUM_THREADS 控制）
+///   MPI    : 未启用
+///   GPU    : 未启用
+/// ```
+// ---------------------------------------------------------------------------
+pub fn print_parallel_status() {
+    let omp_on  = unsafe { ffi::lbm_openmp_enabled() } != 0;
+    let cuda_on = unsafe { ffi::lbm_cuda_enabled()   } != 0;
+    let mpi_on  = unsafe { ffi::lbm_mpi_enabled()    } != 0;
+
+    println!("并行配置：");
+    if omp_on {
+        let threads = unsafe { ffi::lbm_openmp_max_threads() };
+        println!("  OpenMP : 已启用  线程数 = {}（受 OMP_NUM_THREADS 控制）", threads);
+    } else {
+        println!("  OpenMP : 未启用");
+    }
+    if mpi_on {
+        let rank  = mpi_rank();
+        let procs = mpi_size();
+        println!("  MPI    : 已启用  进程数 = {}  当前 rank = {}", procs, rank);
+    } else {
+        println!("  MPI    : 未启用");
+    }
+    if cuda_on {
+        println!("  GPU    : 已启用（CUDA）");
+    } else {
+        println!("  GPU    : 未启用");
+    }
 }
 
 /// `lbm::MpiDecomp` 的安全封装（持有堆上的 C++ MpiDecomp 对象）

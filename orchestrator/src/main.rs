@@ -85,6 +85,7 @@ fn main() -> Result<()> {
             _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
         }
     });
+    lbm_bindings::print_parallel_status();
 
     // -----------------------------------------------------------------------
     // 插件启动日志

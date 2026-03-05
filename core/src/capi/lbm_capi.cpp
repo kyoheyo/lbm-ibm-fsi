@@ -14,6 +14,10 @@
 #include "lbm/gpu_solver.hpp"
 #endif
 
+#ifdef LBM_ENABLE_OPENMP
+#include <omp.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // C 回调函数类型别名（必须与 plugin_registry.cpp 中的声明一致）
 // Rust 对应类型: ffi::BoundaryFn / MeshFn / MotionFn / FlexibleFn — bindings/src/lib.rs
@@ -412,6 +416,51 @@ void lbm_gpu_upload(GpuSolverHandle* h, lbm::LatticeGrid* g)
     if (h && g) reinterpret_cast<lbm::GpuSolver*>(h)->upload(*g);
 #else
     (void)h; (void)g;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 并行状态查询接口 — 运行时打印并行配置时使用
+// ---------------------------------------------------------------------------
+
+/// 返回 1 表示编译时启用了 OpenMP，否则返回 0。
+int lbm_openmp_enabled()
+{
+#ifdef LBM_ENABLE_OPENMP
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/// 返回 OpenMP 最大线程数（omp_get_max_threads()）。
+/// 若未启用 OpenMP，返回 1（单线程）。
+int lbm_openmp_max_threads()
+{
+#ifdef LBM_ENABLE_OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+/// 返回 1 表示编译时启用了 CUDA GPU 后端，否则返回 0。
+int lbm_cuda_enabled()
+{
+#ifdef LBM_ENABLE_CUDA
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/// 返回 1 表示编译时启用了 MPI，否则返回 0（不触发 MPI 初始化）。
+int lbm_mpi_enabled()
+{
+#ifdef LBM_ENABLE_MPI
+    return 1;
+#else
+    return 0;
 #endif
 }
 
