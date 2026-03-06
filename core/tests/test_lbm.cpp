@@ -708,6 +708,128 @@ static int test_corner_bounce_back_fix()
 }
 
 
+// 测试：非固壁角点不施加反弹修正
+//
+// 当角节点的两个相邻面均为非固壁 BC（FullyDeveloped），
+// apply_corner_bounce_back() 应**跳过**该角节点，不覆盖其 f 值为 f_tmp[opp(a)]。
+//
+// 测试设计（直接调用 apply_boundary_conditions，而非通过 step()）：
+//   1. 用已知的平衡分布初始化整个网格的 f 和 f_tmp
+//   2. 将 SW 角节点的 f_tmp 覆写为哨兵值（100 + a），
+//      使 f_tmp[opp(a)](SW) ≈ 100 远大于任何物理 f 值（< 0.5）
+//   3. 注册 BCs：South + West = FullyDeveloped（非固壁）；North + East = BounceBack（固壁）
+//   4. 直接调用 apply_boundary_conditions（跳过碰撞/流式步骤）
+//   5. 验证：
+//      (a) SW 幽灵方向的 f 值 ≈ FD 源节点 (1,0) 的 f 值（未被哨兵覆盖），
+//          即 |f[ghost](SW) - f[ghost](1,0)| < 1e-14，
+//          同时 f[ghost](SW) 绝对值远小于哨兵值 100（未被 bounce-back 覆盖）。
+//      (b) NE 幽灵方向满足 f[a] == f_tmp[opp(a)]（固壁角，bounce-back 正常施加）。
+static int test_corner_bounce_back_skip_nonwall()
+{
+    const int nx = 4, ny = 4;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 1. 用平衡分布（rho=1, ux=uy=0）初始化 f 和 f_tmp
+    //    平衡分布值均 < 0.5，与哨兵值 ~100 差异显著
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int n = g.idx(i, j);
+            const double u[2] = {0.0, 0.0};
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                const double c[2] = {
+                    static_cast<double>(lbm::d2q9::C[a][0]),
+                    static_cast<double>(lbm::d2q9::C[a][1])
+                };
+                const double fval = lbm::f_eq(lbm::d2q9::W[a], 1.0, c, u, 2);
+                g.f    [n * lbm::d2q9::Q + a] = fval;
+                g.f_tmp[n * lbm::d2q9::Q + a] = fval;
+            }
+        }
+    }
+
+    // 2. 将 SW 角节点的 f_tmp 覆写为哨兵值（100+a），
+    //    使 f_tmp[opp(ghost_a)](SW) ≈ 100 >> 任何物理 f 值
+    {
+        const int sw_n = g.idx(0, 0);
+        for (int a = 0; a < lbm::d2q9::Q; ++a)
+            g.f_tmp[sw_n * lbm::d2q9::Q + a] = 100.0 + a;
+    }
+
+    // 3. 注册 BCs
+    std::vector<lbm::BoundaryCondition> bcs;
+    for (auto face : {lbm::Face::South, lbm::Face::West}) {
+        lbm::BoundaryCondition bc;
+        bc.type = lbm::BCType::FullyDeveloped;
+        bc.face = face;
+        bcs.push_back(bc);
+    }
+    for (auto face : {lbm::Face::North, lbm::Face::East}) {
+        lbm::BoundaryCondition bc;
+        bc.type = lbm::BCType::BounceBack;
+        bc.face = face;
+        bcs.push_back(bc);
+    }
+
+    // 4. 直接调用 apply_boundary_conditions（不经过碰撞/流式迁移）
+    lbm::apply_boundary_conditions(g, bcs);
+
+    const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+    bool ok = true;
+
+    // --- (a) SW 角（South FD + West FD）：幽灵方向应等于 FD 源节点 (1,0) 的 f 值 ---
+    //   FD West 最后执行，将 f[a](1,0) 拷贝到 f[a](0,0)。
+    //   若角点修正被正确跳过，幽灵方向不会被哨兵覆盖。
+    {
+        const int sw_n   = g.idx(0, 0);
+        const int fd_src = g.idx(1, 0);   // West FD 的源节点（最后覆盖 South FD 的结果）
+        const double* f_sw  = &g.f    [sw_n   * lbm::d2q9::Q];
+        const double* f_src = &g.f    [fd_src * lbm::d2q9::Q];
+        const int sw_ghosts[5] = {1, 2, 5, 6, 8};
+
+        for (int a : sw_ghosts) {
+            // 若 bounce-back 被错误施加：f_sw[a] = f_tmp[OPP[a]](SW) = 100 + OPP[a]
+            if (f_sw[a] > 10.0) {
+                std::printf("[LBM] corner skip: SW ghost dir %d = %.2f "
+                            "(sentinel value, bounce-back was wrongly applied)\n",
+                            a, f_sw[a]);
+                ok = false;
+            }
+            // 若 FD 正常：f_sw[a] == f_src[a]（平衡值，< 0.5）
+            const double diff = std::abs(f_sw[a] - f_src[a]);
+            if (diff > 1e-14) {
+                std::printf("[LBM] corner skip: SW ghost dir %d = %.6e, "
+                            "FD source = %.6e, diff = %.2e\n",
+                            a, f_sw[a], f_src[a], diff);
+                ok = false;
+            }
+        }
+    }
+
+    // --- (b) NE 角（North BB + East BB）：幽灵方向应满足 f[a] == f_tmp[opp(a)] ---
+    //   NE 的 f_tmp 仍为初始平衡值（未被哨兵覆盖），bounce-back 应正常施加。
+    {
+        const int ne_n = g.idx(nx - 1, ny - 1);
+        const double* f_ne  = &g.f    [ne_n * lbm::d2q9::Q];
+        const double* ft_ne = &g.f_tmp[ne_n * lbm::d2q9::Q];
+        const int ne_ghosts[5] = {3, 4, 6, 7, 8};
+
+        for (int a : ne_ghosts) {
+            const double diff = std::abs(f_ne[a] - ft_ne[OPP[a]]);
+            if (diff > 1e-14) {
+                std::printf("[LBM] corner skip: NE ghost dir %d not bounce-backed: "
+                            "f=%.6e, f_tmp[opp]=%.6e, diff=%.2e\n",
+                            a, f_ne[a], ft_ne[OPP[a]], diff);
+                ok = false;
+            }
+        }
+    }
+
+    std::printf("[LBM] corner BB skip (non-wall corner not overwritten): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -720,6 +842,7 @@ int test_lbm_main()
     failures += test_fully_developed_east();
     failures += test_guo_extrapolation_west_velocity();
     failures += test_corner_bounce_back_fix();
+    failures += test_corner_bounce_back_skip_nonwall();
     failures += test_mpi_decomp_single_rank();
     failures += test_mpi_attach_no_effect();
     failures += test_mpi_halo_exchange_correctness();

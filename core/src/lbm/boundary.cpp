@@ -771,7 +771,7 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 //     NE (nx-1, ny-1) : f[3](W), f[4](S), f[6](NW), f[7](SW), f[8](SE)
 //
 // 修正方案：
-//   在所有面 BC 完成后，对每个角节点的全部 5 个幽灵方向施加**半步长反弹**，
+//   在所有面 BC 完成后，对满足条件的角节点的全部 5 个幽灵方向施加**半步长反弹**，
 //   使用 g.f_tmp（碰撞后、迁移前的值，不受任何面 BC 修改）覆盖由面 BC
 //   设置的近似值。公式为：f[a] = f_tmp[opp(a)]（见对立方向表）。
 //
@@ -780,9 +780,20 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 //
 // 物理意义：
 //   角点为两固壁的交汇奇点，在无滑移 Navier-Stokes 方程中速度为零。
-//   半步长反弹在角点处等价于强制施加 u = 0 边界条件，物理上始终正确。
+//   半步长反弹在角点处等价于强制施加 u = 0 边界条件。
+//
+// 选择性修正（wall_face_bits 参数）：
+//   仅对两相邻面中**至少有一面是固壁 BC**（BounceBack 或 BounceBackFullWay）的
+//   角节点施加修正。两相邻面均为非固壁 BC（如 FD/FO 出口）时跳过，避免对
+//   流体出口角点强制施加物理上不正确的 u = 0。
+//
+//   wall_face_bits 位掩码（由调用方 apply_boundary_conditions 计算并传入）：
+//     bit 0（0x1）: South 面为固壁 BC
+//     bit 1（0x2）: North 面为固壁 BC
+//     bit 2（0x4）: West  面为固壁 BC
+//     bit 3（0x8）: East  面为固壁 BC
 // ---------------------------------------------------------------------------
-static void apply_corner_bounce_back(LatticeGrid& g)
+static void apply_corner_bounce_back(LatticeGrid& g, unsigned wall_face_bits)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
@@ -793,8 +804,14 @@ static void apply_corner_bounce_back(LatticeGrid& g)
     // 0↔0, 1↔3, 2↔4, 3↔1, 4↔2, 5↔7, 6↔8, 7↔5, 8↔6
     static const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
 
+    const bool south = (wall_face_bits & 0x1u) != 0u;
+    const bool north = (wall_face_bits & 0x2u) != 0u;
+    const bool west  = (wall_face_bits & 0x4u) != 0u;
+    const bool east  = (wall_face_bits & 0x8u) != 0u;
+
     // --- SW 角 (0, 0)：幽灵方向 1,2,5,6,8 ---
-    {
+    // 相邻面：South 和 West
+    if (south || west) {
         const int n = g.idx(0, 0);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
@@ -802,7 +819,8 @@ static void apply_corner_bounce_back(LatticeGrid& g)
     }
 
     // --- SE 角 (nx-1, 0)：幽灵方向 2,3,5,6,7 ---
-    {
+    // 相邻面：South 和 East
+    if (south || east) {
         const int n = g.idx(nx - 1, 0);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
@@ -810,7 +828,8 @@ static void apply_corner_bounce_back(LatticeGrid& g)
     }
 
     // --- NW 角 (0, ny-1)：幽灵方向 1,4,5,7,8 ---
-    {
+    // 相邻面：North 和 West
+    if (north || west) {
         const int n = g.idx(0, ny - 1);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
@@ -818,7 +837,8 @@ static void apply_corner_bounce_back(LatticeGrid& g)
     }
 
     // --- NE 角 (nx-1, ny-1)：幽灵方向 3,4,6,7,8 ---
-    {
+    // 相邻面：North 和 East
+    if (north || east) {
         const int n = g.idx(nx - 1, ny - 1);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
@@ -860,11 +880,25 @@ void apply_boundary_conditions(LatticeGrid& grid,
         }
     }
 
-    // 所有面 BC 完成后，对 4 个角节点施加半步长反弹修正：
-    // 覆盖面 BC 中因使用幽灵值而引入的近似误差（ZouHe/Guo 角点误差修正）。
-    // 对纯 BounceBack 配置此步骤幂等（无副作用）。
+    // 所有面 BC 完成后，对满足条件的角节点施加半步长反弹修正。
+    // 条件：角节点的两个相邻面中，至少有一面是固壁 BC（BounceBack/BounceBackFullWay）。
+    // 若两相邻面均为非固壁 BC（如 FD/FO 出口），则跳过该角节点，
+    // 避免在流体出口角点强制施加物理上不正确的 u = 0。
     if (!bcs.empty()) {
-        apply_corner_bounce_back(grid);
+        // 计算固壁面掩码：bit0=South, bit1=North, bit2=West, bit3=East
+        unsigned wall_face_bits = 0u;
+        for (const auto& bc : bcs) {
+            if (bc.type == BCType::BounceBack || bc.type == BCType::BounceBackFullWay) {
+                switch (bc.face) {
+                    case Face::South: wall_face_bits |= 0x1u; break;
+                    case Face::North: wall_face_bits |= 0x2u; break;
+                    case Face::West:  wall_face_bits |= 0x4u; break;
+                    case Face::East:  wall_face_bits |= 0x8u; break;
+                    default: break;
+                }
+            }
+        }
+        apply_corner_bounce_back(grid, wall_face_bits);
     }
 }
 

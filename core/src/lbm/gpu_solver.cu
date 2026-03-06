@@ -491,21 +491,26 @@ __global__ void bc_guo_extrap_east(double* f, const double* rho, const double* u
 // 7. 边角点半步长反弹修正（一次性处理全部 4 个角节点）
 //
 // 与 CPU 端 apply_corner_bounce_back() 逻辑完全对应（见 boundary.cpp §7）：
-//   在所有面 BC 核函数执行完毕后，对 4 个角节点的幽灵方向施加 f[a]=f_pre[opp(a)]。
+//   在所有面 BC 核函数执行完毕后，对满足条件的角节点的幽灵方向施加 f[a]=f_pre[opp(a)]。
+//
+// corner_mask 位掩码（由调用方计算，仅对置位的角节点施加修正）：
+//   bit 0（tid=0）: SW(0,0)       幽灵方向：1,2,5,6,8
+//   bit 1（tid=1）: SE(nx-1,0)    幽灵方向：2,3,5,6,7
+//   bit 2（tid=2）: NW(0,ny-1)    幽灵方向：1,4,5,7,8
+//   bit 3（tid=3）: NE(nx-1,ny-1) 幽灵方向：3,4,6,7,8
 //
 // 线程映射：1 个 block，4 个线程，每线程处理 1 个角节点。
-//   tid=0 → SW(0,0)       幽灵方向：1,2,5,6,8
-//   tid=1 → SE(nx-1,0)    幽灵方向：2,3,5,6,7
-//   tid=2 → NW(0,ny-1)    幽灵方向：1,4,5,7,8
-//   tid=3 → NE(nx-1,ny-1) 幽灵方向：3,4,6,7,8
 // ---------------------------------------------------------------------------
 __global__ void bc_corner_bounce_back_all(double* f, const double* f_pre,
-                                           int nx, int ny)
+                                           int nx, int ny, unsigned corner_mask)
 {
     // 对立方向表：opp[a]
     const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
 
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 该线程对应的角节点不需要修正时直接返回
+    if (!((corner_mask >> tid) & 1u)) return;
 
     int n;
     // 各角节点的幽灵方向（须由 BC 覆盖的 5 个方向）
@@ -723,10 +728,35 @@ void GpuSolver::apply_boundary_conditions_on_stream(cudaStream_t s)
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // 所有面 BC 核函数完成后，用角点半步长反弹修正 4 个角节点（对应 CPU 端逻辑）。
+    // 所有面 BC 核函数完成后，对满足条件的角节点施加半步长反弹修正（对应 CPU 端逻辑）。
+    // 仅对两相邻面中至少有一面是固壁 BC 的角节点施加修正。
     if (!bcs_.empty()) {
-        bc_corner_bounce_back_all<<<1, 4, 0, s>>>(d_f, d_f_tmp, nx_, ny_);
-        CUDA_CHECK(cudaGetLastError());
+        // 计算固壁面掩码：bit0=South, bit1=North, bit2=West, bit3=East
+        unsigned wall_face_bits = 0u;
+        for (const auto& bc : bcs_) {
+            if (bc.type == BCType::BounceBack || bc.type == BCType::BounceBackFullWay) {
+                switch (bc.face) {
+                    case Face::South: wall_face_bits |= 0x1u; break;
+                    case Face::North: wall_face_bits |= 0x2u; break;
+                    case Face::West:  wall_face_bits |= 0x4u; break;
+                    case Face::East:  wall_face_bits |= 0x8u; break;
+                    default: break;
+                }
+            }
+        }
+        // corner_mask：bit0=SW, bit1=SE, bit2=NW, bit3=NE
+        const bool south = (wall_face_bits & 0x1u) != 0u;
+        const bool north = (wall_face_bits & 0x2u) != 0u;
+        const bool west  = (wall_face_bits & 0x4u) != 0u;
+        const bool east  = (wall_face_bits & 0x8u) != 0u;
+        const unsigned corner_mask = ((south || west) ? 0x1u : 0u)
+                                   | ((south || east) ? 0x2u : 0u)
+                                   | ((north || west) ? 0x4u : 0u)
+                                   | ((north || east) ? 0x8u : 0u);
+        if (corner_mask != 0u) {
+            bc_corner_bounce_back_all<<<1, 4, 0, s>>>(d_f, d_f_tmp, nx_, ny_, corner_mask);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 }
 
