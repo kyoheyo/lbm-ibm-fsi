@@ -98,10 +98,9 @@ plot_interval  = 2000   # 每 2000 步（4 次 .dat 快照之后）绘制一次�
 # ─── Python 集成说明 ──────────────────────────────────────────────────────────
 # 支持两种互补模式，可同时开启：
 #
-#   1. 子进程后处理（post_script）：
-#      仿真结束后，Rust 启动独立 Python 子进程运行 post_script。
-#      脚本以输出目录（directory）作为第一个位置参数，读取 .dat/.npz 文件后绘图。
-#      适合：完整后处理流水线（批量绘图、数据分析、报告生成）。
+#   1. 子进程后处理（post_script / pre_script）：
+#      Rust 主控程序在仿真循环前/后启动独立 Python 子进程。
+#      适合：完整预/后处理流水线（网格生成、批量绘图、数据分析、报告生成）。
 #
 #   2. FFI 进程内实时绘图（[output] 中的 plot_interval）：
 #      pyo3 在进程内调用 Python 函数，直接传递内存中的流场数组，无临时文件。
@@ -112,6 +111,10 @@ plot_interval  = 2000   # 每 2000 步（4 次 .dat 快照之后）绘制一次�
 #   Linux/macOS：通常为 "python3"
 interpreter = "python"
 
+# 仿真开始前自动执行的预处理脚本（可选）。
+# 脚本接收配置文件路径作为第一个位置参数，可用于网格生成、参数校验等。
+# pre_script  = "python/examples/pre_process.py"
+
 # 仿真结束后自动执行的后处理脚本。
 # 脚本接收 <directory> 为第一个位置参数，遍历 .dat 文件批量绘图。
 post_script = "python/examples/plot_solver_output.py"
@@ -119,3 +122,24 @@ post_script = "python/examples/plot_solver_output.py"
 # 将此路径追加到 sys.path，使 lbm_pre / lbm_post 无需 pip install 即可导入。
 # 通常指向仓库根目录下的 python/ 子目录。
 pythonpath  = "python"
+
+[plugins]
+# 自定义插件（空字符串 = 不启用）。名称仅作提示用途，实际插件逻辑在 Rust 代码中注册。
+# boundary = ""   # 自定义边界条件插件（对流出口、NRBC 等）
+# mesh     = ""   # 网格处理 / 自适应细化插件
+# motion   = ""   # 运动网格 / 运动固体插件（6 自由度刚体、ALE 等）
+# flexible = ""   # 替代柔性体求解器插件（Kirchhoff 板、协转梁等）
+
+[parallel]
+# OpenMP 线程数（0 = 使用全部 CPU 核心数；正整数 N = 强制使用 N 个线程）。
+# omp_num_threads = 0
+
+[mpi]
+# MPI 域分解模式：
+#   "block"       → XY 块分解（nx_blocks × ny_blocks，1D 切片为其特例）
+#   "independent" → 每进程独立仿真，无通信（适合参数扫描）
+#   "multigrid"   → 嵌套式多重网格（框架预留）
+# mode      = "block"
+# nx_blocks = 1    # X 方向进程块数（默认 1）
+# ny_blocks = 0    # Y 方向进程块数（0 = 自动，等于 nprocs；需与 mpirun -n N 匹配）
+# nz_blocks = 1    # Z 方向进程块数（3D 扩展预留，2D 仿真设 1）

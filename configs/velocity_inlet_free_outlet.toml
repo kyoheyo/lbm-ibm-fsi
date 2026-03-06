@@ -93,9 +93,56 @@ plot_interval  = 5000   # 每 5000 步（5 次 .dat 快照之后）绘制一次�
 # Python 解释器（Windows 通常为 "python"，Linux/macOS 通常为 "python3"）。
 interpreter = "python"
 
+# 仿真开始前自动执行的预处理脚本（可选）。
+# 脚本接收配置文件路径作为第一个位置参数。
+# pre_script  = "python/examples/pre_process.py"
+
 # 仿真结束后自动执行的后处理脚本。
 # 脚本以 <directory> 为第一个位置参数，读取 .dat 文件并绘制速度云图、流线及自由出口细节。
 post_script = "python/examples/plot_solver_output.py"
 
 # 无需 pip install 即可导入 lbm_post 的 sys.path 追加目录。
 pythonpath  = "python"
+
+# ---------------------------------------------------------------------------
+# [structure] 弹性结构参数（仅含柔性丝状体的 IBM-FSI 算例才需要，此处注释供参考）
+# ---------------------------------------------------------------------------
+# [structure]
+# young_modulus = 1.0e3    # 杨氏模量
+# second_moment = 1.0e-6   # 截面惯性矩
+# density       = 1.5      # 结构密度
+# area          = 0.01     # 截面面积
+# length        = 0.3      # 丝状体自然长度（格子单位）
+# n_elements    = 10       # 有限元单元数
+
+# ---------------------------------------------------------------------------
+# [ibm] 浸没边界法参数（仅含 IBM 固体/柔性体的算例才需要，此处注释供参考）
+# ---------------------------------------------------------------------------
+# [ibm]
+# geometry     = "filament"    # "filament"（丝状体）或 "circle"（刚性圆柱）
+# x0           = 50.0          # 起点/圆心 x（格子单位）
+# y0           = 30.0          # 起点/圆心 y（格子单位）
+# size         = 30.0          # 长度（丝状体）或半径（圆形），格子单位
+# n_markers    = 30            # 拉格朗日标记点数量
+# delta_kernel = "four_point"  # Delta 核函数："two_point" 或 "four_point"
+
+[plugins]
+# 自定义插件（空字符串 = 不启用）。名称仅作提示用途，实际插件逻辑在 Rust 代码中注册。
+# boundary = ""   # 自定义边界条件插件（对流出口、NRBC 等）
+# mesh     = ""   # 网格处理 / 自适应细化插件
+# motion   = ""   # 运动网格 / 运动固体插件（6 自由度刚体、ALE 等）
+# flexible = ""   # 替代柔性体求解器插件（Kirchhoff 板、协转梁等）
+
+[parallel]
+# OpenMP 线程数（0 = 使用全部 CPU 核心数；正整数 N = 强制使用 N 个线程）。
+# omp_num_threads = 0
+
+[mpi]
+# MPI 域分解模式：
+#   "block"       → XY 块分解（nx_blocks × ny_blocks，1D 切片为其特例）
+#   "independent" → 每进程独立仿真，无通信（适合参数扫描）
+#   "multigrid"   → 嵌套式多重网格（框架预留）
+# mode      = "block"
+# nx_blocks = 1    # X 方向进程块数（默认 1）
+# ny_blocks = 0    # Y 方向进程块数（0 = 自动，等于 nprocs；需与 mpirun -n N 匹配）
+# nz_blocks = 1    # Z 方向进程块数（3D 扩展预留，2D 仿真设 1）
