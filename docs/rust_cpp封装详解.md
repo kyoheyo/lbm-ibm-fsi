@@ -255,6 +255,8 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 
 ### 4.3 C ABI 函数签名对照表
 
+**CPU 求解器（`lbm_solver_*`）**
+
 | C ABI 函数 | C++ 内部操作 | 返回 |
 |-----------|-------------|------|
 | `lbm_grid_new(nx, ny, nz, model_id)` | `new LatticeGrid(…)` | `LatticeGrid*`（nullptr 表示失败） |
@@ -268,6 +270,26 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 | `lbm_solver_step(s, g)` | 调用插件 + `s->step()` | void |
 | `lbm_solver_step_n(s, g, step, dt)` | 带时间信息版本 | void |
 | `lbm_set_plugins(…8 个参数…)` | 更新 PluginRegistry 单例 | void |
+
+**GPU 求解器（`lbm_gpu_*`，需 `ENABLE_CUDA=ON` 编译）**
+
+| C ABI 函数 | C++ 内部操作 | 返回 |
+|-----------|-------------|------|
+| `lbm_gpu_new(g, omega)` | `new GpuSolver(*g, omega)` | `GpuSolver*` |
+| `lbm_gpu_free(s)` | `delete s` | void |
+| `lbm_gpu_add_bc(s, type, face, ux, uy, rho)` | `s->add_boundary_condition(bc)` | void |
+| `lbm_gpu_step(s)` | `s->step()` 同步单步 | void |
+| `lbm_gpu_download(s, g)` | `s->download(*g)`（f+rho+u 全量 D→H） | void |
+| `lbm_gpu_download_rho_u(s, g)` | `s->download_rho_u(*g)`（仅 rho+u，~6.3 MB） | void |
+| `lbm_gpu_upload(s, g)` | `s->upload(*g)`（f H→D） | void |
+| `lbm_gpu_step_async(s)` | `s->step_async()`（在 `compute_stream_` 上异步） | void |
+| `lbm_gpu_wait_compute(s)` | `s->wait_compute()`（等待 compute 流完成）| void |
+| `lbm_gpu_enqueue_async_download_rho_u(s, buf)` | `s->enqueue_async_download_rho_u(buf)`（在 io 流上排队 D→H） | void |
+| `lbm_gpu_sync_async_download(s)` | `s->sync_async_download()`（等待 io 流完成）| void |
+| `lbm_gpu_pinned_rho(s, buf)` | `s->h_rho(buf)`（返回固定内存 rho 缓冲区指针）| `const double*` |
+| `lbm_gpu_pinned_u(s, buf)` | `s->h_u(buf)`（返回固定内存 u 缓冲区指针）| `const double*` |
+| `lbm_gpu_n(s)` | `s->n_`（总节点数）| int |
+
 
 ---
 
