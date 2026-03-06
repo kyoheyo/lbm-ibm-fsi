@@ -17,6 +17,7 @@
    - 3.6 C++ 实现：`MpiDecomp2D::create()`
    - 3.7 幽灵层交换：`halo_exchange_d2q9_2d()`
    - 3.8 三维预留：`MpiDecomp3D`
+   - 3.9 块分解模式下的输出策略
 4. [模式二：多进程独立（`"independent"`）](#4-模式二多进程独立independent)
    - 4.1 使用场景
    - 4.2 输出目录隔离
@@ -293,6 +294,78 @@ static MpiDecomp3D create(int gnx, int gny, int gnz, int px, int py, int pz);
 ```
 
 **当前状态**：创建/空间范围查询 API 就绪；幽灵层交换（6 方向）和对应的三维 LBM 求解器待未来实现。
+
+### 3.9 块分解模式下的输出策略
+
+#### 分区快照输出（默认）
+
+每个 rank 将本地物理分区数据写入各自的子目录，互不干扰：
+
+```
+output/
+├── rank_0/
+│   ├── fluid_000500.npz    ← 含 x_start/y_start/global_nx/global_ny 元数据
+│   └── monitor.csv
+├── rank_1/
+│   ├── fluid_000500.npz
+│   └── monitor.csv
+├── rank_2/
+│   └── fluid_000500.npz
+└── rank_3/
+    └── fluid_000500.npz
+```
+
+NPZ 分区文件中额外存储了位置元数据，供后处理工具拼合全局场：
+
+| 附加键名 | 类型 | 含义 |
+|---------|------|------|
+| `x_start` | int64 | 本分区在全局坐标系中的 X 起始位置 |
+| `y_start` | int64 | 本分区在全局坐标系中的 Y 起始位置 |
+| `global_nx` | int64 | 全局域 X 总节点数 |
+| `global_ny` | int64 | 全局域 Y 总节点数 |
+
+#### 计算中全局合并输出（`combine_blocks = true`）
+
+在 TOML 中设置 `combine_blocks = true` 后，rank-0 在每次写快照时自动通过
+`MPI_Gatherv` 收集全部分区数据，拼合为全局场后写出到 `<directory>/fluid_<NNNNNN>.<ext>`：
+
+```toml
+[output]
+write_interval = 500
+directory      = "output/my_run"
+format         = "npz"           # 或 "tecplot_asc" / "tecplot_bin"
+combine_blocks = true            # 默认 false；仅 block 模式有效
+```
+
+开启后输出目录结构变为：
+
+```
+output/my_run/
+├── fluid_000500.npz    ← rank-0 写出的全局合并快照（含全域完整流场）
+├── fluid_001000.npz
+├── rank_0/
+│   ├── fluid_000500.npz
+│   └── fluid_001000.npz
+├── rank_1/
+│   ├── fluid_000500.npz
+│   └── fluid_001000.npz
+└── ...
+```
+
+若同时启用 `plot_interval`（需 `python-ffi` 特性），绘图使用全局合并场，
+生成完整流域的速度幅值云图、涡量云图和流线图。
+
+#### 计算完成后离线合并（`combine_block_snapshots`）
+
+若计算时未开启 `combine_blocks = true`（或需要在事后转换格式），可使用
+`python/examples/combine_blocks.py` 脚本或 Python API 进行离线合并（详见
+docs/运行时实现详解.md §13.4）：
+
+```bash
+# 将 NPZ 分区文件合并为全局 .dat
+python3 python/examples/combine_blocks.py \
+    --dir output/my_run --fmt dat --out output/my_run/global
+```
 
 ---
 

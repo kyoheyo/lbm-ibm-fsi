@@ -642,7 +642,7 @@ fn run() -> Result<()> {
                         (rho, ux, uy, pnx, pny, output_dir.clone())
                     };
 
-                for field_name in &["velocity_magnitude", "vorticity"] {
+                for field_name in &["velocity_magnitude", "vorticity", "streamlines"] {
                     if let Err(e) = python_bridge::plot_field(
                         &plot_rho, &plot_ux, &plot_uy, plot_nx, plot_ny,
                         step + 1, time,

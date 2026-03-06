@@ -242,6 +242,48 @@ Plots produced:
 | `uy_profile.png` | uy horizontal profile at cavity centre (y = ny/2) |
 | `monitor_velocity.png` | \|u\| time series at the centre monitor point |
 
+### MPI block decomposition output
+
+When running with MPI block decomposition (`mpi.mode = "block"`), each rank writes its
+partition snapshots to `output/<dir>/rank_N/fluid_NNNNNN.npz` with embedded position
+metadata (`x_start`, `y_start`, `global_nx`, `global_ny`).
+
+**Option 1 — In-simulation global output** (`combine_blocks = true` in TOML):
+
+```toml
+[output]
+combine_blocks = true   # rank-0 gathers all partitions and writes global snapshots
+```
+
+This writes complete global snapshots (`<dir>/fluid_*.npz/.dat/.plt`) during the
+simulation. If `plot_interval` is also set (with `--features python-ffi`), the FFI
+plots (velocity magnitude, vorticity, **streamlines**) also use the global combined
+field.
+
+**Option 2 — Post-simulation combining** (offline, after the run):
+
+```bash
+# Combine partition NPZ files into a single global NPZ
+python3 python/examples/combine_blocks.py --dir output/my_run
+
+# Or write combined output as ASCII Tecplot .dat
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt dat
+
+# Or binary Tecplot .plt
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt plt
+```
+
+Or directly from Python:
+
+```python
+from lbm_post.vtk_reader import combine_block_snapshots
+written = combine_block_snapshots("output/my_run", fmt="npz")
+```
+
+> **Note:** Post-simulation combining reads NPZ partition files (which contain position
+> metadata). If the solver wrote `.dat`/`.plt` partition files, use `combine_blocks = true`
+> during the run instead.
+
 ## References
 
 - Aidun, C.K. & Clausen, J.R. (2010). *Lattice-Boltzmann method for complex flows*. Annual Review of Fluid Mechanics.

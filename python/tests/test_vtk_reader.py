@@ -454,10 +454,31 @@ class TestCombineBlockSnapshots:
         with pytest.raises(FileNotFoundError):
             combine_block_snapshots("/nonexistent/path_xyz", fmt="npz")
 
-    def test_dat_format_raises_informative(self, tmp_path):
-        """dat 格式分区文件无元数据，应抛出明确错误。"""
-        with pytest.raises(ValueError, match="元数据"):
-            combine_block_snapshots(tmp_path, fmt="dat")
+    def test_dat_format_output(self, tmp_path):
+        """dat 输出格式：合并文件应为 ASCII Tecplot .dat 格式。"""
+        expected_rho, expected_ux, _ = self._make_2rank_output(tmp_path)
+        written = combine_block_snapshots(tmp_path, fmt="dat")
+        assert len(written) == 1
+        assert written[0].suffix == ".dat"
+        # 验证文件以 TITLE 行开头
+        text = written[0].read_text(encoding="ascii")
+        assert text.startswith("TITLE")
+        assert "VARIABLES" in text
+
+    def test_plt_format_output(self, tmp_path):
+        """plt 输出格式：合并文件应为二进制 Tecplot TDV112 格式。"""
+        self._make_2rank_output(tmp_path)
+        written = combine_block_snapshots(tmp_path, fmt="plt")
+        assert len(written) == 1
+        assert written[0].suffix == ".plt"
+        # 验证魔数
+        data = written[0].read_bytes()
+        assert data[:8] == b"#!TDV112"
+
+    def test_invalid_fmt_raises(self, tmp_path):
+        """不支持的输出格式应抛出 ValueError。"""
+        with pytest.raises(ValueError, match="不支持的输出格式"):
+            combine_block_snapshots(tmp_path, fmt="vtu")
 
     def test_4rank_2d_decomposition(self, tmp_path):
         """2×2 二维块分解：4 rank 拼合全局场。"""
