@@ -53,32 +53,62 @@ n_markers  = 30
 delta_kernel = "four_point"
 
 [output]
+# 每隔 write_interval 步写出一个完整的流场快照文件。
+# 快照包含：密度场 ρ、速度场 (ux, uy)，以及（如有 IBM）拉格朗日标记点坐标。
 write_interval = 500
+
+# 快照输出目录（相对于可执行文件工作目录或绝对路径均可）。
 directory      = "output/lid_cavity"
-# 输出格式选择（三选一，默认 "npz"）：
-#   "npz"         → fluid_NNNNNN.npz  NumPy 压缩归档，供 Python 后处理（默认）
-#   "tecplot_asc" → fluid_NNNNNN.dat  ASCII Tecplot POINT 格式，人类可读
-#   "tecplot_bin" → fluid_NNNNNN.plt  二进制 Tecplot TDV112，文件最小
-format         = "npz"
 
-# --- 可选：Python FFI 进程内实时绘图 ---
-# 每隔 plot_interval 步，Rust 在进程内直接调用 Python 生成云图（无中间 .npz 文件）。
-# 需要以 --features python-ffi 编译：
-#   cargo build --release --features python-ffi
-# 然后在此取消注释：
-# plot_interval  = 2000   # 每 2000 步绘制一次速度云图和涡量云图
+# 输出格式选择（三选一）：
+#   "tecplot_asc" → fluid_NNNNNN.dat  ASCII Tecplot POINT 格式，可用 Tecplot/ParaView 直接打开，
+#                                      人类可读，便于调试和数据交换。（★ 本配置已启用）
+#   "npz"         → fluid_NNNNNN.npz  NumPy 压缩归档，供 Python lbm_post 后处理。
+#   "tecplot_bin" → fluid_NNNNNN.plt  二进制 Tecplot TDV112，文件体积最小。
+format         = "tecplot_asc"
 
-# --- 可选：逐步轻量级时间序列监控 ---
-# enable_csv_monitor = true  # 每步写出 step, time, ke 到 monitor.csv
+# Python FFI 进程内实时绘图（每隔 plot_interval 步生成一张云图）。
+#
+# 工作原理：
+#   Rust 在进程内通过 pyo3 直接调用 lbm_post.bridge.plot_field_raw()，
+#   将速度幅值云图和涡量云图保存到 <directory>/vel_NNNNNN.png / vor_NNNNNN.png。
+#   整个过程在进程内完成，不创建中间 .dat/.npz 文件，延迟极低。
+#
+# 使用前提：
+#   1. 以 --features python-ffi 特性编译求解器：
+#        cargo build --release --features python-ffi
+#   2. [python] 段中设置正确的 pythonpath（见下方）。
+#   3. 确保 matplotlib / numpy 已安装：pip install matplotlib numpy
+#
+# 若未以 python-ffi 特性编译，本字段被静默忽略，不影响 .dat 快照输出。
+plot_interval  = 2000   # 每 2000 步（4 次 .dat 快照之后）绘制一次云图
+
+# 每步向 CSV 文件追加监控量（step, time, ke），开销极低。
+# 开启后在 directory/monitor.csv 中记录动能演化历史，可用于收敛判断。
+# enable_csv_monitor = true
 
 [python]
-# 仿真结束后自动可视化流场。
-# 求解器将输出目录作为第一个位置参数传递给脚本。
-# 设置 pythonpath 可使 lbm_post 在不 pip install 的情况下也能导入。
+# ─── Python 集成说明 ──────────────────────────────────────────────────────────
+# 支持两种互补模式，可同时开启：
 #
-# interpreter 说明：
-#   Windows 上 Python 可执行文件名为 "python"（推荐）
-#   Linux/macOS 上通常为 "python3"
+#   1. 子进程后处理（post_script）：
+#      仿真结束后，Rust 启动独立 Python 子进程运行 post_script。
+#      脚本以输出目录（directory）作为第一个位置参数，读取 .dat/.npz 文件后绘图。
+#      适合：完整后处理流水线（批量绘图、数据分析、报告生成）。
+#
+#   2. FFI 进程内实时绘图（[output] 中的 plot_interval）：
+#      pyo3 在进程内调用 Python 函数，直接传递内存中的流场数组，无临时文件。
+#      适合：仿真过程中的实时可视化监控。
+
+# Python 解释器路径或名称：
+#   Windows：通常为 "python"
+#   Linux/macOS：通常为 "python3"
 interpreter = "python"
+
+# 仿真结束后自动执行的后处理脚本。
+# 脚本接收 <directory> 为第一个位置参数，遍历 .dat 文件批量绘图。
 post_script = "python/examples/plot_solver_output.py"
+
+# 将此路径追加到 sys.path，使 lbm_pre / lbm_post 无需 pip install 即可导入。
+# 通常指向仓库根目录下的 python/ 子目录。
 pythonpath  = "python"
