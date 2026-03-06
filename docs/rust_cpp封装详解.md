@@ -290,6 +290,32 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 | `lbm_mpi_decomp2d_grid_ny(h)` | `LbmMpiDecomp2D::grid_ny()` | `h->grid_ny()` | 本地含幽灵行 ny |
 | `lbm_mpi_decomp2d_x_start(h)` | `LbmMpiDecomp2D::x_start()` | `h->x_start` | 全局 X 起始坐标 |
 | `lbm_mpi_decomp2d_y_start(h)` | `LbmMpiDecomp2D::y_start()` | `h->y_start` | 全局 Y 起始坐标 |
+| `lbm_mpi_decomp3d_new(gnx, gny, gnz, px, py, pz)` | `LbmMpiDecomp3D::new(…)` | `new MpiDecomp3D(…)` | 创建三维 XYZ 块分解（幽灵交换预留） |
+| `lbm_mpi_decomp3d_free(h)` | `Drop for LbmMpiDecomp3D` | `delete h` | 释放三维块分解 |
+| `lbm_mpi_decomp3d_grid_nx(h)` | `LbmMpiDecomp3D::grid_nx()` | `h->grid_nx()` | 本地含幽灵层 nx |
+| `lbm_mpi_decomp3d_grid_ny(h)` | `LbmMpiDecomp3D::grid_ny()` | `h->grid_ny()` | 本地含幽灵层 ny |
+| `lbm_mpi_decomp3d_grid_nz(h)` | `LbmMpiDecomp3D::grid_nz()` | `h->grid_nz()` | 本地含幽灵层 nz |
+| `lbm_mpi_decomp3d_x_start(h)` | `LbmMpiDecomp3D::x_start()` | `h->x_start` | 全局 X 起始坐标 |
+| `lbm_mpi_decomp3d_y_start(h)` | `LbmMpiDecomp3D::y_start()` | `h->y_start` | 全局 Y 起始坐标 |
+| `lbm_mpi_decomp3d_z_start(h)` | `LbmMpiDecomp3D::z_start()` | `h->z_start` | 全局 Z 起始坐标 |
+
+**多重网格 AMR 树（`lbm_mg_*`）**
+
+| C ABI 函数 | Rust 封装 | C++ 内部操作 | 说明 |
+|-----------|---------|-------------|------|
+| `lbm_mg_tree_new(x0,x1,y0,y1,z0,z1,is_3d)` | `LbmMgTree::new(…)` | `new MgTree(root_extent, dim)` | 创建多重网格树（根节点为全局最粗网格） |
+| `lbm_mg_tree_free(h)` | `Drop for LbmMgTree` | `delete h` | 释放整棵树（含所有节点） |
+| `lbm_mg_tree_add_level(tree, parent, x0,x1,y0,y1,z0,z1, r)` | `LbmMgTree::add_level(…)` | `tree->add_level(parent, extent, r)` | 在父节点内添加细化子区域（refine_ratio r ∈ [1,1024]） |
+| `lbm_mg_tree_root(h)` | `LbmMgTree::root()` | `tree->root()` | 获取根节点（最粗网格）句柄 |
+| `lbm_mg_tree_max_level(h)` | `LbmMgTree::max_level()` | `tree->max_level()` | 树的最大层级深度 |
+| `lbm_mg_tree_node_count(h)` | `LbmMgTree::node_count()` | `tree->node_count()` | 树中节点总数 |
+| `lbm_mg_node_set_grid(node, grid)` | `LbmMgNode::set_grid(g)` | `node->grid = g` | 绑定 LatticeGrid 到节点 |
+| `lbm_mg_node_x_start/end/y_start/end/z_start/end(h)` | — | `node->extent.*` | 节点空间范围（全局粗坐标） |
+| `lbm_mg_node_level(h)` | `LbmMgNode::level()` | `node->level` | 节点层级（0=最粗） |
+| `lbm_mg_node_refine_ratio(h)` | `LbmMgNode::refine_ratio()` | `node->refine_ratio` | 相对父节点的线性加密比 |
+| `lbm_mg_node_child_count(h)` | `LbmMgNode::child_count()` | `node->children.size()` | 子节点数 |
+| **`lbm_mg_prolong_rho_u(coarse, fine)`** | `lbm_mg_prolong_rho_u(c, f)` | `mg_prolong_rho_u(*c, *f)` | **延拓**：粗→细，双线性插值 ρ/u；返回 0（成功）/ -1（错误） |
+| **`lbm_mg_restrict_rho_u(fine, coarse)`** | `lbm_mg_restrict_rho_u(f, c)` | `mg_restrict_rho_u(*f, *c)` | **限制**：细→粗，r×r 体积平均 ρ/u；返回 0（成功）/ -1（错误） |
 
 **OpenMP 接口（需 `ENABLE_OPENMP=ON` 编译）**
 
@@ -518,6 +544,89 @@ impl LbmSolver {
     /// 绑定二维 XY 块分解（之后 step() 自动执行四向幽灵层交换）
     pub fn attach_mpi2d(&mut self, decomp: Option<&mut LbmMpiDecomp2D>);
 }
+```
+
+#### LbmMpiDecomp3D — 三维 XYZ 块分解（预留接口）
+
+```rust
+/// 持有堆上的 C++ MpiDecomp3D 对象（三维 XYZ 块分解，幽灵交换预留）
+pub struct LbmMpiDecomp3D { ptr: *mut ffi::MpiDecomp3DHandle }
+
+impl LbmMpiDecomp3D {
+    /// 创建 px×py×pz 三维块分解（需先调用 mpi_init()）
+    /// px * py * pz 必须等于 MPI 进程总数；否则返回 None
+    pub fn new(gnx: i32, gny: i32, gnz: i32, px: i32, py: i32, pz: i32) -> Option<Self>;
+    pub fn grid_nx(&self) -> i32;   // 本地含幽灵层 nx
+    pub fn grid_ny(&self) -> i32;   // 本地含幽灵层 ny
+    pub fn grid_nz(&self) -> i32;   // 本地含幽灵层 nz
+    pub fn x_start(&self) -> i32;  // 全局 X 起始坐标
+    pub fn y_start(&self) -> i32;  // 全局 Y 起始坐标
+    pub fn z_start(&self) -> i32;  // 全局 Z 起始坐标
+}
+```
+
+### 6.6 多重网格 AMR 树（MgTree / MgNode）
+
+#### LbmMgTree — 多重网格嵌套关系树
+
+```rust
+/// 持有堆上的 C++ MgTree 对象。
+/// 树管理所有 MgNode 的所有权；MgNode 句柄由树内存管理，不由 Rust 释放。
+pub struct LbmMgTree { ptr: *mut ffi::MgTreeHandle }
+
+impl LbmMgTree {
+    /// 创建多重网格树，根节点空间范围为 (x0..x1, y0..y1, z0..z1)（全局格子坐标）。
+    /// is_3d=true 时启用三维加密比（r³）；否则为二维（r²）。
+    pub fn new(x0: i32, x1: i32, y0: i32, y1: i32, z0: i32, z1: i32, is_3d: bool) -> Self;
+
+    /// 在父节点内添加细化子区域，返回子节点的不透明句柄。
+    /// refine_ratio 取值范围 [1, 1024]；超出范围 C++ 侧抛出异常，Rust 返回 None。
+    pub fn add_level(
+        &mut self,
+        parent: *mut ffi::MgNodeHandle,
+        x0: i32, x1: i32, y0: i32, y1: i32, z0: i32, z1: i32,
+        refine_ratio: i32,
+    ) -> Option<*mut ffi::MgNodeHandle>;
+
+    pub fn root(&mut self) -> *mut ffi::MgNodeHandle;  // 获取根节点句柄
+    pub fn max_level(&self) -> i32;                    // 最大层级
+    pub fn node_count(&self) -> i32;                   // 节点总数
+}
+```
+
+**注意**：`MgNode` 句柄（`*mut ffi::MgNodeHandle`）由 `LbmMgTree` 管理，**不应手动释放**。
+
+#### AMR 延拓/限制算子（C API 直接使用）
+
+```rust
+// 延拓：粗 → 细，双线性插值 ρ/u（线性场精确）
+// 返回 0（成功）/ -1（grid 为 nullptr 或参数无效）
+extern "C" fn lbm_mg_prolong_rho_u(
+    coarse: *const MgNodeHandle,
+    fine:   *mut   MgNodeHandle,
+) -> c_int;
+
+// 限制：细 → 粗，r×r 体积平均 ρ/u（保证质量守恒投影）
+// 返回 0（成功）/ -1（grid 为 nullptr 或参数无效）
+extern "C" fn lbm_mg_restrict_rho_u(
+    fine:   *const MgNodeHandle,
+    coarse: *mut   MgNodeHandle,
+) -> c_int;
+```
+
+**典型用法（双层 2D AMR 时间步）**：
+
+```rust
+// 1. 粗网格步进 1 步
+solver_coarse.step();
+// 2. 延拓：将粗网格 ρ/u 插值到细网格边界区域
+unsafe { lbm_mg_prolong_rho_u(root_node, fine_node); }
+// 3. 细网格步进 r 步（每粗步对应 r 个细步）
+for _ in 0..refine_ratio {
+    solver_fine.step();
+}
+// 4. 限制：将细网格 ρ/u 平均回粗网格
+unsafe { lbm_mg_restrict_rho_u(fine_node, root_node); }
 ```
 
 #### set_omp_num_threads — OpenMP 线程数设置

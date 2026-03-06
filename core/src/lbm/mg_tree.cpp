@@ -142,9 +142,9 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
     const int fn_y = fg.ny;
 
     for (int jf = 0; jf < fn_y; ++jf) {
-        for (int if_ = 0; if_ < fn_x; ++if_) {
+        for (int ix = 0; ix < fn_x; ++ix) {
             // 细节点在粗坐标系中的浮点位置（节点位于整数坐标处）
-            const double px = fine.extent.x_start + static_cast<double>(if_) / r;
+            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
             const double py = fine.extent.y_start + static_cast<double>(jf)  / r;
 
             // 双线性插值的左下粗节点（全局粗坐标系）
@@ -182,7 +182,7 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
             const double w01 = (1.0 - alpha)  * beta;
             const double w11 = alpha           * beta;
 
-            const int fi = fg.idx(if_, jf);
+            const int fi = fg.idx(ix, jf);
 
             // 插值 ρ
             fg.rho[fi] = w00 * cg.rho[c00]

@@ -1190,12 +1190,12 @@ static int test_mg_prolong_rho_u()
         // 对 if=0..3：px = 1.0, 1.5, 2.0, 2.5 → 无夹持（2.5 < 3）
         const int r2 = 2;
         for (int jf = 0; jf < 4; ++jf) {
-            for (int if_ = 0; if_ < 4; ++if_) {
-                const double px = 1 + static_cast<double>(if_) / r2;
+            for (int ix = 0; ix < 4; ++ix) {
+                const double px = 1 + static_cast<double>(ix) / r2;
                 const double py = 1 + static_cast<double>(jf)  / r2;
                 // 双线性对线性函数精确（节点坐标无需夹持）
                 const double expected = 1.0 + 0.1 * px + 0.05 * py;
-                const double actual   = fine.rho[fine.idx(if_, jf)];
+                const double actual   = fine.rho[fine.idx(ix, jf)];
                 ok &= (std::fabs(actual - expected) < 1e-10);
             }
         }
