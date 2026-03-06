@@ -498,6 +498,7 @@ GpuSolver::GpuSolver(const LatticeGrid& g, double omega)
     const std::size_t rho_bytes = static_cast<std::size_t>(n_)     * sizeof(double);
     const std::size_t u_bytes   = static_cast<std::size_t>(n_) * 2 * sizeof(double);
 
+    // 设备内存
     CUDA_CHECK(cudaMalloc(&d_f,     f_bytes));
     CUDA_CHECK(cudaMalloc(&d_f_tmp, f_bytes));
     CUDA_CHECK(cudaMalloc(&d_rho,   rho_bytes));
@@ -509,14 +510,38 @@ GpuSolver::GpuSolver(const LatticeGrid& g, double omega)
     CUDA_CHECK(cudaMemcpy(d_u,   g.u.data(),   u_bytes,   cudaMemcpyHostToDevice));
     // f_tmp 初始化为与 f 相同（用于 BounceBack BC 读取碰后值）
     CUDA_CHECK(cudaMemcpy(d_f_tmp, g.f.data(), f_bytes, cudaMemcpyHostToDevice));
+
+    // CUDA 流与事件（用于异步输出下载管线）
+    CUDA_CHECK(cudaStreamCreate(&compute_stream_));
+    CUDA_CHECK(cudaStreamCreate(&io_stream_));
+    // cudaEventDisableTiming：不记录时间，降低同步开销
+    CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_, cudaEventDisableTiming));
+
+    // 固定（pinned）主机缓冲区（双缓冲，rho/u 各两份）
+    CUDA_CHECK(cudaMallocHost(&h_rho_[0], rho_bytes));
+    CUDA_CHECK(cudaMallocHost(&h_rho_[1], rho_bytes));
+    CUDA_CHECK(cudaMallocHost(&h_u_[0],   u_bytes));
+    CUDA_CHECK(cudaMallocHost(&h_u_[1],   u_bytes));
 }
 
 GpuSolver::~GpuSolver()
 {
+    // 设备内存
     if (d_f)     cudaFree(d_f);
     if (d_f_tmp) cudaFree(d_f_tmp);
     if (d_rho)   cudaFree(d_rho);
     if (d_u)     cudaFree(d_u);
+
+    // CUDA 流与事件
+    if (compute_stream_ != nullptr) cudaStreamDestroy(compute_stream_);
+    if (io_stream_      != nullptr) cudaStreamDestroy(io_stream_);
+    if (compute_done_   != nullptr) cudaEventDestroy(compute_done_);
+
+    // 固定主机缓冲区
+    if (h_rho_[0] != nullptr) cudaFreeHost(h_rho_[0]);
+    if (h_rho_[1] != nullptr) cudaFreeHost(h_rho_[1]);
+    if (h_u_[0]   != nullptr) cudaFreeHost(h_u_[0]);
+    if (h_u_[1]   != nullptr) cudaFreeHost(h_u_[1]);
 }
 
 void GpuSolver::collide()
@@ -566,6 +591,11 @@ void GpuSolver::add_boundary_condition(const BoundaryCondition& bc)
 
 void GpuSolver::apply_boundary_conditions_gpu()
 {
+    apply_boundary_conditions_on_stream(nullptr);  // default (legacy) stream
+}
+
+void GpuSolver::apply_boundary_conditions_on_stream(cudaStream_t s)
+{
     // 边界核函数的线程块大小。边界面节点数通常为 nx 或 ny（O(√n)），
     // BLOCK_BC=128 对 nx/ny ≤ 128 的情况也能正常工作（不足 1 个 block）。
     constexpr int BLOCK_BC = 128;
@@ -577,93 +607,59 @@ void GpuSolver::apply_boundary_conditions_gpu()
 
         switch (bc.type) {
         case BCType::BounceBack:
-            // 半步长反弹：从 d_f_tmp（碰后迁移前）读取，写入 d_f
             switch (bc.face) {
-            case Face::South:
-                bc_bounce_back_south<<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_);            break;
-            case Face::North:
-                bc_bounce_back_north<<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
-            case Face::West:
-                bc_bounce_back_west <<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
-            case Face::East:
-                bc_bounce_back_east <<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            case Face::South: bc_bounce_back_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_f_tmp, nx_);            break;
+            case Face::North: bc_bounce_back_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            case Face::West:  bc_bounce_back_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            case Face::East:  bc_bounce_back_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_f_tmp, nx_, ny_);       break;
             default: break;
             }
             break;
-
         case BCType::BounceBackFullWay:
-            // 全步长反弹：仅使用 d_f（就地交换对称方向）
             switch (bc.face) {
-            case Face::South:
-                bc_bounce_back_fw_south<<<grid_bc, BLOCK_BC>>>(d_f, nx_);         break;
-            case Face::North:
-                bc_bounce_back_fw_north<<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
-            case Face::West:
-                bc_bounce_back_fw_west <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
-            case Face::East:
-                bc_bounce_back_fw_east <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
+            case Face::South: bc_bounce_back_fw_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_);         break;
+            case Face::North: bc_bounce_back_fw_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);    break;
+            case Face::West:  bc_bounce_back_fw_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);    break;
+            case Face::East:  bc_bounce_back_fw_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);    break;
             default: break;
             }
             break;
-
         case BCType::ZouHe_Velocity:
             switch (bc.face) {
-            case Face::North:
-                bc_zou_he_vel_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
-            case Face::South:
-                bc_zou_he_vel_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy);      break;
-            case Face::West:
-                bc_zou_he_vel_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
-            case Face::East:
-                bc_zou_he_vel_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            case Face::North: bc_zou_he_vel_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            case Face::South: bc_zou_he_vel_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy);      break;
+            case Face::West:  bc_zou_he_vel_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            case Face::East:  bc_zou_he_vel_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
             default: break;
             }
             break;
-
         case BCType::ZouHe_Pressure:
             switch (bc.face) {
-            case Face::North:
-                bc_zou_he_pres_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.ux); break;
-            case Face::South:
-                bc_zou_he_pres_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.rho, bc.ux);      break;
-            case Face::West:
-                bc_zou_he_pres_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
-            case Face::East:
-                bc_zou_he_pres_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
+            case Face::North: bc_zou_he_pres_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.ux); break;
+            case Face::South: bc_zou_he_pres_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, bc.rho, bc.ux);      break;
+            case Face::West:  bc_zou_he_pres_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
+            case Face::East:  bc_zou_he_pres_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
             default: break;
             }
             break;
-
         case BCType::FullyDeveloped:
             switch (bc.face) {
-            case Face::South:
-                bc_fully_developed_south<<<grid_bc, BLOCK_BC>>>(d_f, nx_);        break;
-            case Face::North:
-                bc_fully_developed_north<<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
-            case Face::West:
-                bc_fully_developed_west <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
-            case Face::East:
-                bc_fully_developed_east <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
+            case Face::South: bc_fully_developed_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_);        break;
+            case Face::North: bc_fully_developed_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);   break;
+            case Face::West:  bc_fully_developed_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);   break;
+            case Face::East:  bc_fully_developed_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, nx_, ny_);   break;
             default: break;
             }
             break;
-
         case BCType::Guo_Extrapolation:
-            // Guo 外推需要相邻节点的 rho/u，所以必须在 macroscopic_kernel 之前调用
-            // （此时 d_rho/d_u 来自上一步，用于读取内部节点值，精度足够）
             switch (bc.face) {
-            case Face::South:
-                bc_guo_extrap_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy, bc.rho);          break;
-            case Face::North:
-                bc_guo_extrap_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
-            case Face::West:
-                bc_guo_extrap_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
-            case Face::East:
-                bc_guo_extrap_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            case Face::South: bc_guo_extrap_south<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy, bc.rho);          break;
+            case Face::North: bc_guo_extrap_north<<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            case Face::West:  bc_guo_extrap_west <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            case Face::East:  bc_guo_extrap_east <<<grid_bc, BLOCK_BC, 0, s>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
             default: break;
             }
             break;
-
         default:
             break;
         }
@@ -672,6 +668,7 @@ void GpuSolver::apply_boundary_conditions_gpu()
 }
 
 
+void GpuSolver::download(LatticeGrid& g) const
 {
     const std::size_t f_bytes   = static_cast<std::size_t>(n_) * 9 * sizeof(double);
     const std::size_t rho_bytes = static_cast<std::size_t>(n_)     * sizeof(double);
@@ -684,6 +681,16 @@ void GpuSolver::apply_boundary_conditions_gpu()
     CUDA_CHECK(cudaMemcpy(g.u.data(),   d_u,   u_bytes,   cudaMemcpyDeviceToHost));
 }
 
+void GpuSolver::download_rho_u(LatticeGrid& g) const
+{
+    // 仅下载宏观量（ρ、u），用于输出快照。
+    // 数据量：n×8 + n×16 = 24n 字节；512² 时约 6.3 MB（比 download() 少 7×）。
+    const std::size_t rho_bytes = static_cast<std::size_t>(n_)     * sizeof(double);
+    const std::size_t u_bytes   = static_cast<std::size_t>(n_) * 2 * sizeof(double);
+    CUDA_CHECK(cudaMemcpy(g.rho.data(), d_rho, rho_bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g.u.data(),   d_u,   u_bytes,   cudaMemcpyDeviceToHost));
+}
+
 void GpuSolver::upload(const LatticeGrid& g)
 {
     const std::size_t f_bytes = static_cast<std::size_t>(n_) * 9 * sizeof(double);
@@ -691,23 +698,16 @@ void GpuSolver::upload(const LatticeGrid& g)
 }
 
 // ---------------------------------------------------------------------------
-// GpuSolver::step() — single-synchronize fused step
+// GpuSolver::step() — 同步单步（默认流 + cudaDeviceSynchronize）
 //
-// Launches three compute kernels (collide → stream → macroscopic) and,
-// if any boundary conditions have been registered via add_boundary_condition(),
-// the corresponding GPU BC kernels are launched between stream and macroscopic.
-// All kernels run in the default CUDA stream (serialised automatically).
-// ONE cudaDeviceSynchronize is issued at the end — catching execution errors
-// from all kernels while minimising host-GPU round-trips.
+// 标准同步 API，适合大多数场景：
+//   - 小网格调试
+//   - 无输出（纯计算）的大批量仿真
+//   - output_interval 极大（输出间隔 >> 磁盘写盘时间），I/O 开销可忽略
 //
-// Key property: when BCs are registered with add_boundary_condition(), NO
-// per-step GPU↔CPU data transfer is needed.  download() should only be
-// called when the caller needs to read back results (e.g. for output).
-//
-// After this call:
-//   d_f     — post-BC, post-stream distribution function
-//   d_f_tmp — post-collision, pre-stream distribution (for half-way BB BC)
-//   d_rho, d_u — updated macroscopic fields (reflect BC corrections)
+// 当 output_interval 较小时，每次 download_rho_u/download + 写盘会让 GPU 空闲
+// 数十毫秒。若这成为瓶颈，改用 step_async() + enqueue_async_download_rho_u()
+// 实现 GPU 计算与磁盘 I/O 的重叠（见 §16.4.7）。
 // ---------------------------------------------------------------------------
 void GpuSolver::step()
 {
@@ -718,32 +718,93 @@ void GpuSolver::step()
     collide_bgk_kernel<<<g, BLOCK>>>(d_f, d_rho, d_u, omega_, n_);
     CUDA_CHECK(cudaGetLastError());
 
-    // 2. Push streaming: propagate d_f into d_f_tmp; the stream kernel
-    //    overwrites every element of d_f_tmp, so no prior backup copy needed.
+    // 2. Push streaming
     stream_kernel<<<g, BLOCK>>>(d_f, d_f_tmp, nx_, ny_);
     CUDA_CHECK(cudaGetLastError());
-    // Pointer swap (host-side only, zero GPU cost):
-    //   d_f     = streamed result (old d_f_tmp)
-    //   d_f_tmp = pre-stream / post-collision values (old d_f)
-    double* tmp = d_f;
-    d_f     = d_f_tmp;
-    d_f_tmp = tmp;
+    double* tmp = d_f; d_f = d_f_tmp; d_f_tmp = tmp;
 
-    // 3. Apply registered boundary conditions directly on GPU —
-    //    no CPU↔GPU transfer required.  BCs that need the previous step's
-    //    rho/u (Guo_Extrapolation) read from d_rho/d_u which are still
-    //    valid from the prior macroscopic kernel call.
+    // 3. GPU-native boundary conditions
     if (!bcs_.empty()) {
         apply_boundary_conditions_gpu();
     }
 
-    // 4. Compute macroscopic fields (ρ, u) from the BC-corrected d_f
+    // 4. Macroscopic fields
     macroscopic_kernel<<<g, BLOCK>>>(d_f, d_rho, d_u, n_);
     CUDA_CHECK(cudaGetLastError());
 
-    // Single synchronise — catches execution errors from all kernels
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+// ---------------------------------------------------------------------------
+// GpuSolver::step_async() — 异步单步（compute_stream，无阻塞同步）
+//
+// 在 compute_stream_ 上提交全部核函数，末尾记录 compute_done_ 事件。
+// 立即返回，不阻塞 CPU。
+//
+// 典型用法（双缓冲输出管线，参见 §16.4.7 文档）：
+//   step_async()                          // 启动计算，立即返回
+//   enqueue_async_download_rho_u(buf_idx) // 异步拷贝前一步结果到 pinned 内存
+//   write_file(...)                        // CPU 写盘（与 GPU 计算并行）
+//   wait_compute()                         // 等待当前步计算完成
+// ---------------------------------------------------------------------------
+void GpuSolver::step_async()
+{
+    constexpr int BLOCK = 256;
+    const int g = (n_ + BLOCK - 1) / BLOCK;
+
+    // 全部核函数提交到 compute_stream_
+    collide_bgk_kernel<<<g, BLOCK, 0, compute_stream_>>>(d_f, d_rho, d_u, omega_, n_);
+    CUDA_CHECK(cudaGetLastError());
+
+    stream_kernel<<<g, BLOCK, 0, compute_stream_>>>(d_f, d_f_tmp, nx_, ny_);
+    CUDA_CHECK(cudaGetLastError());
+    double* tmp = d_f; d_f = d_f_tmp; d_f_tmp = tmp;
+
+    if (!bcs_.empty()) {
+        apply_boundary_conditions_on_stream(compute_stream_);
+    }
+
+    macroscopic_kernel<<<g, BLOCK, 0, compute_stream_>>>(d_f, d_rho, d_u, n_);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 记录计算完成事件（io_stream_ 的异步拷贝将等待此事件）
+    CUDA_CHECK(cudaEventRecord(compute_done_, compute_stream_));
+}
+
+void GpuSolver::wait_compute()
+{
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+}
+
+// ---------------------------------------------------------------------------
+// GpuSolver::enqueue_async_download_rho_u() — 异步拷贝 ρ/u 到固定主机缓冲区
+//
+// io_stream_ 等待 compute_done_ 事件（确保 GPU 计算完成后才开始拷贝），
+// 然后发起两个 cudaMemcpyAsync（device→pinned host），立即返回。
+//
+// buf_idx: 双缓冲索引（0 或 1）。调用方在连续两次输出步之间交替使用，
+//          以避免 CPU 正在读取上一次缓冲区时被覆盖。
+// ---------------------------------------------------------------------------
+void GpuSolver::enqueue_async_download_rho_u(int buf_idx)
+{
+    const std::size_t rho_bytes = static_cast<std::size_t>(n_)     * sizeof(double);
+    const std::size_t u_bytes   = static_cast<std::size_t>(n_) * 2 * sizeof(double);
+
+    // io_stream_ 等待 compute_done_ 事件（GPU 计算完成后再拷贝）
+    CUDA_CHECK(cudaStreamWaitEvent(io_stream_, compute_done_, 0));
+
+    const int b = buf_idx & 1;  // 限制为 0 或 1；调用方应保证 buf_idx ∈ {0, 1}
+    CUDA_CHECK(cudaMemcpyAsync(h_rho_[b], d_rho, rho_bytes, cudaMemcpyDeviceToHost, io_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(h_u_[b],   d_u,   u_bytes,   cudaMemcpyDeviceToHost, io_stream_));
+}
+
+void GpuSolver::sync_async_download()
+{
+    CUDA_CHECK(cudaStreamSynchronize(io_stream_));
+}
+
+const double* GpuSolver::h_rho(int buf_idx) const { return h_rho_[buf_idx & 1]; }
+const double* GpuSolver::h_u(int buf_idx)   const { return h_u_  [buf_idx & 1]; }
 
 } // namespace lbm
 

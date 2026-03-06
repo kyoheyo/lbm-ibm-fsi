@@ -99,8 +99,19 @@ mod ffi {
         pub fn lbm_gpu_collide(h: *mut GpuSolverHandle);
         pub fn lbm_gpu_stream(h: *mut GpuSolverHandle);
         pub fn lbm_gpu_macroscopic(h: *mut GpuSolverHandle);
+        // 同步下载（全量 f+f_tmp+rho+u，44 MB @512²）
         pub fn lbm_gpu_download(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
+        // 同步下载（仅 rho+u，6.3 MB @512²，用于输出快照）
+        pub fn lbm_gpu_download_rho_u(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
         pub fn lbm_gpu_upload(h: *mut GpuSolverHandle, g: *mut LatticeGridHandle);
+        // 异步输出管线
+        pub fn lbm_gpu_step_async(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_wait_compute(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_enqueue_async_download_rho_u(h: *mut GpuSolverHandle, buf_idx: c_int);
+        pub fn lbm_gpu_sync_async_download(h: *mut GpuSolverHandle);
+        pub fn lbm_gpu_pinned_rho(h: *const GpuSolverHandle, buf_idx: c_int) -> *const f64;
+        pub fn lbm_gpu_pinned_u  (h: *const GpuSolverHandle, buf_idx: c_int) -> *const f64;
+        pub fn lbm_gpu_n         (h: *const GpuSolverHandle) -> c_int;
 
         // --- 并行状态查询 — 实现于 core/src/capi/lbm_capi.cpp ---
         pub fn lbm_openmp_enabled()     -> c_int;
@@ -466,6 +477,43 @@ impl LbmSolver {
 // ---------------------------------------------------------------------------
 
 /// `lbm::GpuSolver` 的安全封装（D2Q9 BGK on CUDA）
+///
+/// 支持两种主循环模式：
+///
+/// **同步模式**（适合小网格 / 无频繁 I/O）：
+/// ```ignore
+/// let mut gpu = LbmGpuSolver::new(&mut grid, omega).unwrap();
+/// gpu.add_boundary_condition(...);
+/// for _ in 0..nsteps {
+///     gpu.step();  // 阻塞，GPU 计算完成后返回
+/// }
+/// gpu.download(&mut grid);
+/// ```
+///
+/// **异步双缓冲模式**（推荐，GPU 计算与磁盘 I/O 并行）：
+/// ```ignore
+/// let mut gpu = LbmGpuSolver::new(&mut grid, omega).unwrap();
+/// gpu.add_boundary_condition(...);
+/// let mut pending = false;
+/// let mut buf: i32 = 0;
+/// for step in 0..nsteps {
+///     if pending {
+///         gpu.sync_async_download();                          // 等待拷贝完成
+///         let n = gpu.n() as usize;
+///         let rho = unsafe { std::slice::from_raw_parts(gpu.pinned_rho(buf), n) };
+///         let u   = unsafe { std::slice::from_raw_parts(gpu.pinned_u(buf), n * 2) };
+///         write_snapshot(rho, u, n, step - 1);               // 写盘（GPU 并行计算中）
+///         buf ^= 1;
+///     }
+///     gpu.step_async();                                       // 非阻塞，立即返回
+///     if step % write_interval == 0 {
+///         gpu.enqueue_async_download_rho_u(buf);             // 异步拷贝，非阻塞
+///         pending = true;
+///     } else { pending = false; }
+/// }
+/// gpu.wait_compute();
+/// if pending { gpu.sync_async_download(); write_snapshot(...); }
+/// ```
 pub struct LbmGpuSolver {
     ptr: *mut ffi::GpuSolverHandle,
 }
@@ -495,15 +543,80 @@ impl LbmGpuSolver {
         unsafe { ffi::lbm_gpu_macroscopic(self.ptr) };
     }
 
-    /// 将 GPU 端分布函数 + 宏观量下载到 CPU 网格
-    /// （用于在 CPU 上执行边界条件，下载后再调用 `upload`）。
+    // ------------------------------------------------------------------
+    // 同步数据传输
+    // ------------------------------------------------------------------
+
+    /// 将 GPU 端完整状态（f、f_tmp、ρ、u）下载到 CPU 网格
+    /// （用于 CPU 端边界条件，或需要完整状态检查点的场景）。
     pub fn download(&self, grid: &mut LbmGrid) {
         unsafe { ffi::lbm_gpu_download(self.ptr, grid.as_mut_ptr()) };
+    }
+
+    /// 仅将 ρ、u 下载到 CPU 网格（6.3 MB @512²，用于输出快照）。
+    /// 比 download() 少传输 7× 数据量。
+    pub fn download_rho_u(&self, grid: &mut LbmGrid) {
+        unsafe { ffi::lbm_gpu_download_rho_u(self.ptr, grid.as_mut_ptr()) };
     }
 
     /// 将 CPU 网格 f 上传到 GPU（CPU 端边界条件修正后调用）。
     pub fn upload(&mut self, grid: &mut LbmGrid) {
         unsafe { ffi::lbm_gpu_upload(self.ptr, grid.as_mut_ptr()) };
+    }
+
+    // ------------------------------------------------------------------
+    // 异步输出管线（推荐用于有频繁 I/O 的大规模仿真）
+    // ------------------------------------------------------------------
+
+    /// 异步单步执行（在 compute_stream 上提交全部核函数，立即返回）。
+    /// 与 step() 的区别：不阻塞 CPU，允许 CPU 同时执行磁盘写入等操作。
+    pub fn step_async(&mut self) {
+        unsafe { ffi::lbm_gpu_step_async(self.ptr) };
+    }
+
+    /// 等待 compute_stream 完成（cudaStreamSynchronize）。
+    /// 在 step_async() 后、读取 GPU 结果之前调用。
+    pub fn wait_compute(&mut self) {
+        unsafe { ffi::lbm_gpu_wait_compute(self.ptr) };
+    }
+
+    /// 将 d_rho/d_u 异步拷贝到固定主机双缓冲区 buf_idx（0 或 1）的 io_stream 上。
+    /// io_stream 自动等待 compute_done 事件，不阻塞 CPU。
+    /// `buf_idx` 必须为 0 或 1；调用方应在连续两次输出步之间交替使用。
+    pub fn enqueue_async_download_rho_u(&mut self, buf_idx: i32) {
+        unsafe { ffi::lbm_gpu_enqueue_async_download_rho_u(self.ptr, buf_idx) };
+    }
+
+    /// 等待 io_stream（异步拷贝）完成（cudaStreamSynchronize）。
+    /// 完成后可以安全读取 pinned_rho() / pinned_u() 中的数据。
+    pub fn sync_async_download(&mut self) {
+        unsafe { ffi::lbm_gpu_sync_async_download(self.ptr) };
+    }
+
+    /// 返回固定主机缓冲区中 ρ 数组的原始指针。
+    ///
+    /// # Safety
+    /// - 必须在 [`sync_async_download()`] 返回后才能读取此指针指向的数据。
+    /// - 指针的有效生命周期与 `LbmGpuSolver` 实例绑定；销毁 solver 后指针失效。
+    /// - 若再次调用 `enqueue_async_download_rho_u(buf_idx)` 且缓冲区写入完成后，
+    ///   该指针的内容会被新数据覆盖。双缓冲设计（0/1 交替）可避免读写竞争。
+    /// - `buf_idx` 必须为 0 或 1，否则行为未定义。
+    pub fn pinned_rho(&self, buf_idx: i32) -> *const f64 {
+        unsafe { ffi::lbm_gpu_pinned_rho(self.ptr as *const _, buf_idx) }
+    }
+
+    /// 返回固定主机缓冲区中 u 数组的原始指针（布局：`[ux0, uy0, ux1, uy1, …]`，长度 = `n() * 2`）。
+    ///
+    /// # Safety
+    /// 与 [`pinned_rho()`] 相同——必须在 [`sync_async_download()`] 返回后读取，
+    /// 且指针有效性与 solver 生命周期绑定。
+    pub fn pinned_u(&self, buf_idx: i32) -> *const f64 {
+        unsafe { ffi::lbm_gpu_pinned_u(self.ptr as *const _, buf_idx) }
+    }
+
+    /// 返回总节点数 n（= nx × ny）。
+    pub fn n(&self) -> i32 {
+        unsafe { ffi::lbm_gpu_n(self.ptr as *const _) }
     }
 }
 

@@ -409,6 +409,16 @@ void lbm_gpu_download(GpuSolverHandle* h, lbm::LatticeGrid* g)
 #endif
 }
 
+/// 仅下载宏观量（ρ、u）到 CPU 网格（用于输出快照，比 download() 少 7× 数据量）。
+void lbm_gpu_download_rho_u(GpuSolverHandle* h, lbm::LatticeGrid* g)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h && g) reinterpret_cast<lbm::GpuSolver*>(h)->download_rho_u(*g);
+#else
+    (void)h; (void)g;
+#endif
+}
+
 /// 将 CPU 网格 f 上传到 GPU（CPU 端边界条件修正后调用）。
 void lbm_gpu_upload(GpuSolverHandle* h, lbm::LatticeGrid* g)
 {
@@ -417,6 +427,85 @@ void lbm_gpu_upload(GpuSolverHandle* h, lbm::LatticeGrid* g)
 #else
     (void)h; (void)g;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// 异步输出管线接口
+// ---------------------------------------------------------------------------
+
+/// 异步单步执行：在 compute_stream 上提交全部核函数（BGK + 流式 + GPU-BC + 宏观量），
+/// 记录 compute_done 事件，立即返回（不阻塞 CPU）。
+void lbm_gpu_step_async(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->step_async();
+#else
+    (void)h;
+#endif
+}
+
+/// 等待 compute_stream 完成（cudaStreamSynchronize）。
+void lbm_gpu_wait_compute(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->wait_compute();
+#else
+    (void)h;
+#endif
+}
+
+/// 将 d_rho/d_u 异步拷贝到固定主机双缓冲区 buf_idx（0 或 1）的 io_stream 上。
+/// io_stream 自动等待 compute_done 事件（确保计算完成后才开始拷贝）。
+void lbm_gpu_enqueue_async_download_rho_u(GpuSolverHandle* h, int buf_idx)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->enqueue_async_download_rho_u(buf_idx);
+#else
+    (void)h; (void)buf_idx;
+#endif
+}
+
+/// 等待 io_stream（异步拷贝）完成（cudaStreamSynchronize）。
+void lbm_gpu_sync_async_download(GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) reinterpret_cast<lbm::GpuSolver*>(h)->sync_async_download();
+#else
+    (void)h;
+#endif
+}
+
+/// 返回固定主机缓冲区中 ρ 数组的指针（仅在 lbm_gpu_sync_async_download 后调用）。
+const double* lbm_gpu_pinned_rho(const GpuSolverHandle* h, int buf_idx)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) return reinterpret_cast<const lbm::GpuSolver*>(h)->h_rho(buf_idx);
+#else
+    (void)h; (void)buf_idx;
+#endif
+    return nullptr;
+}
+
+/// 返回固定主机缓冲区中 u 数组的指针（仅在 lbm_gpu_sync_async_download 后调用）。
+const double* lbm_gpu_pinned_u(const GpuSolverHandle* h, int buf_idx)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) return reinterpret_cast<const lbm::GpuSolver*>(h)->h_u(buf_idx);
+#else
+    (void)h; (void)buf_idx;
+#endif
+    return nullptr;
+}
+
+/// 返回总节点数 n（= nx × ny）。
+int lbm_gpu_n(const GpuSolverHandle* h)
+{
+#ifdef LBM_ENABLE_CUDA
+    if (h) return reinterpret_cast<const lbm::GpuSolver*>(h)->n();
+#else
+    (void)h;
+#endif
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
