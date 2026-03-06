@@ -154,6 +154,339 @@ void macroscopic_kernel(const double* __restrict__ f,
     }
 }
 
+// ===========================================================================
+// GPU 边界条件核函数
+// ===========================================================================
+//
+// 约定：流式迁移（push 方案）+ 指针交换后：
+//   f      = d_f     — 流式迁移后的分布函数（待施加 BC）
+//   f_pre  = d_f_tmp — 碰撞后、迁移前的分布函数（供半步长反弹 BC 使用）
+//   rho / u           — 碰撞前已有的宏观量（在 apply 后由 macroscopic_kernel 刷新）
+//
+// 各面在 D2Q9 中的幽灵（未知）方向：
+//   南壁 j=0    : f[2](N), f[5](NE), f[6](NW)
+//   北壁 j=ny-1 : f[4](S), f[7](SW), f[8](SE)
+//   西壁 i=0    : f[1](E), f[5](NE), f[8](SE)
+//   东壁 i=nx-1 : f[3](W), f[6](NW), f[7](SW)
+//
+// 线程粒度：每个线程处理一个边界面节点（S/N 面：i∈[0,nx)；E/W 面：j∈[0,ny)）
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. 半步长反弹（BounceBack）— 使用碰后迁移前的分布函数 f_pre
+// ---------------------------------------------------------------------------
+__global__ void bc_bounce_back_south(double* f, const double* f_pre, int nx)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = i;  // j=0: idx(i,0) = i
+    f[n*9+2] = f_pre[n*9+4];
+    f[n*9+5] = f_pre[n*9+7];
+    f[n*9+6] = f_pre[n*9+8];
+}
+
+__global__ void bc_bounce_back_north(double* f, const double* f_pre, int nx, int ny)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = (ny-1)*nx + i;  // j=ny-1
+    f[n*9+4] = f_pre[n*9+2];
+    f[n*9+7] = f_pre[n*9+5];
+    f[n*9+8] = f_pre[n*9+6];
+}
+
+__global__ void bc_bounce_back_west(double* f, const double* f_pre, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx;  // i=0: idx(0,j) = j*nx
+    f[n*9+1] = f_pre[n*9+3];
+    f[n*9+5] = f_pre[n*9+7];
+    f[n*9+8] = f_pre[n*9+6];
+}
+
+__global__ void bc_bounce_back_east(double* f, const double* f_pre, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx + (nx-1);  // i=nx-1
+    f[n*9+3] = f_pre[n*9+1];
+    f[n*9+6] = f_pre[n*9+8];
+    f[n*9+7] = f_pre[n*9+5];
+}
+
+// ---------------------------------------------------------------------------
+// 2. 全步长反弹（BounceBackFullWay）— 使用迁移后的分布函数 f（就地）
+// ---------------------------------------------------------------------------
+__global__ void bc_bounce_back_fw_south(double* f, int nx)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = i;
+    const double s4=f[n*9+4], s7=f[n*9+7], s8=f[n*9+8];
+    f[n*9+2]=s4; f[n*9+5]=s7; f[n*9+6]=s8;
+}
+
+__global__ void bc_bounce_back_fw_north(double* f, int nx, int ny)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = (ny-1)*nx + i;
+    const double s2=f[n*9+2], s5=f[n*9+5], s6=f[n*9+6];
+    f[n*9+4]=s2; f[n*9+7]=s5; f[n*9+8]=s6;
+}
+
+__global__ void bc_bounce_back_fw_west(double* f, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx;
+    const double s3=f[n*9+3], s7=f[n*9+7], s6=f[n*9+6];
+    f[n*9+1]=s3; f[n*9+5]=s7; f[n*9+8]=s6;
+}
+
+__global__ void bc_bounce_back_fw_east(double* f, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx + (nx-1);
+    const double s1=f[n*9+1], s8=f[n*9+8], s5=f[n*9+5];
+    f[n*9+3]=s1; f[n*9+6]=s8; f[n*9+7]=s5;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Zou-He 速度边界条件（非平衡反弹格式）
+// ---------------------------------------------------------------------------
+__global__ void bc_zou_he_vel_north(double* f, double* rho, double* u,
+                                     int nx, int ny, double bc_ux, double bc_uy)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = (ny-1)*nx + i;
+    double* fp = &f[n*9];
+    const double rw = (fp[0]+fp[1]+fp[3] + 2.0*(fp[2]+fp[5]+fp[6])) / (1.0+bc_uy);
+    fp[4] = fp[2] - (2.0/3.0)*rw*bc_uy;
+    fp[7] = fp[5] + 0.5*(fp[1]-fp[3]) - (1.0/6.0)*rw*bc_uy - 0.5*rw*bc_ux;
+    fp[8] = fp[6] - 0.5*(fp[1]-fp[3]) - (1.0/6.0)*rw*bc_uy + 0.5*rw*bc_ux;
+    rho[n]=rw; u[n*2+0]=bc_ux; u[n*2+1]=bc_uy;
+}
+
+__global__ void bc_zou_he_vel_south(double* f, double* rho, double* u,
+                                     int nx, double bc_ux, double bc_uy)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = i;
+    double* fp = &f[n*9];
+    const double rw = (fp[0]+fp[1]+fp[3] + 2.0*(fp[4]+fp[7]+fp[8])) / (1.0-bc_uy);
+    fp[2] = fp[4] + (2.0/3.0)*rw*bc_uy;
+    fp[5] = fp[7] - 0.5*(fp[1]-fp[3]) + (1.0/6.0)*rw*bc_uy + 0.5*rw*bc_ux;
+    fp[6] = fp[8] + 0.5*(fp[1]-fp[3]) + (1.0/6.0)*rw*bc_uy - 0.5*rw*bc_ux;
+    rho[n]=rw; u[n*2+0]=bc_ux; u[n*2+1]=bc_uy;
+}
+
+__global__ void bc_zou_he_vel_west(double* f, double* rho, double* u,
+                                    int nx, int ny, double bc_ux, double bc_uy)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx;
+    double* fp = &f[n*9];
+    const double rw = (fp[0]+fp[2]+fp[4] + 2.0*(fp[3]+fp[6]+fp[7])) / (1.0-bc_ux);
+    fp[1] = fp[3] + (2.0/3.0)*rw*bc_ux;
+    fp[5] = fp[7] - 0.5*(fp[2]-fp[4]) + (1.0/6.0)*rw*bc_ux + 0.5*rw*bc_uy;
+    fp[8] = fp[6] + 0.5*(fp[2]-fp[4]) + (1.0/6.0)*rw*bc_ux - 0.5*rw*bc_uy;
+    rho[n]=rw; u[n*2+0]=bc_ux; u[n*2+1]=bc_uy;
+}
+
+__global__ void bc_zou_he_vel_east(double* f, double* rho, double* u,
+                                    int nx, int ny, double bc_ux, double bc_uy)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx + (nx-1);
+    double* fp = &f[n*9];
+    const double rw = (fp[0]+fp[2]+fp[4] + 2.0*(fp[1]+fp[5]+fp[8])) / (1.0+bc_ux);
+    fp[3] = fp[1] - (2.0/3.0)*rw*bc_ux;
+    fp[6] = fp[8] - 0.5*(fp[2]-fp[4]) - (1.0/6.0)*rw*bc_ux + 0.5*rw*bc_uy;
+    fp[7] = fp[5] + 0.5*(fp[2]-fp[4]) - (1.0/6.0)*rw*bc_ux - 0.5*rw*bc_uy;
+    rho[n]=rw; u[n*2+0]=bc_ux; u[n*2+1]=bc_uy;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Zou-He 压力边界条件
+// ---------------------------------------------------------------------------
+__global__ void bc_zou_he_pres_north(double* f, double* rho, double* u,
+                                      int nx, int ny, double bc_rho, double bc_ux_t)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = (ny-1)*nx + i;
+    double* fp = &f[n*9];
+    const double uy = -1.0 + (fp[0]+fp[1]+fp[3] + 2.0*(fp[2]+fp[5]+fp[6])) / bc_rho;
+    fp[4] = fp[2] - (2.0/3.0)*bc_rho*uy;
+    fp[7] = fp[5] + 0.5*(fp[1]-fp[3]) - (1.0/6.0)*bc_rho*uy - 0.5*bc_rho*bc_ux_t;
+    fp[8] = fp[6] - 0.5*(fp[1]-fp[3]) - (1.0/6.0)*bc_rho*uy + 0.5*bc_rho*bc_ux_t;
+    rho[n]=bc_rho; u[n*2+0]=bc_ux_t; u[n*2+1]=uy;
+}
+
+__global__ void bc_zou_he_pres_south(double* f, double* rho, double* u,
+                                      int nx, double bc_rho, double bc_ux_t)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n = i;
+    double* fp = &f[n*9];
+    const double uy = 1.0 - (fp[0]+fp[1]+fp[3] + 2.0*(fp[4]+fp[7]+fp[8])) / bc_rho;
+    fp[2] = fp[4] + (2.0/3.0)*bc_rho*uy;
+    fp[5] = fp[7] - 0.5*(fp[1]-fp[3]) + (1.0/6.0)*bc_rho*uy + 0.5*bc_rho*bc_ux_t;
+    fp[6] = fp[8] + 0.5*(fp[1]-fp[3]) + (1.0/6.0)*bc_rho*uy - 0.5*bc_rho*bc_ux_t;
+    rho[n]=bc_rho; u[n*2+0]=bc_ux_t; u[n*2+1]=uy;
+}
+
+__global__ void bc_zou_he_pres_west(double* f, double* rho, double* u,
+                                     int nx, int ny, double bc_rho, double bc_uy_t)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx;
+    double* fp = &f[n*9];
+    const double ux = 1.0 - (fp[0]+fp[2]+fp[4] + 2.0*(fp[3]+fp[6]+fp[7])) / bc_rho;
+    fp[1] = fp[3] + (2.0/3.0)*bc_rho*ux;
+    fp[5] = fp[7] - 0.5*(fp[2]-fp[4]) + (1.0/6.0)*bc_rho*ux + 0.5*bc_rho*bc_uy_t;
+    fp[8] = fp[6] + 0.5*(fp[2]-fp[4]) + (1.0/6.0)*bc_rho*ux - 0.5*bc_rho*bc_uy_t;
+    rho[n]=bc_rho; u[n*2+0]=ux; u[n*2+1]=bc_uy_t;
+}
+
+__global__ void bc_zou_he_pres_east(double* f, double* rho, double* u,
+                                     int nx, int ny, double bc_rho, double bc_uy_t)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n = j*nx + (nx-1);
+    double* fp = &f[n*9];
+    const double ux = -1.0 + (fp[0]+fp[2]+fp[4] + 2.0*(fp[1]+fp[5]+fp[8])) / bc_rho;
+    fp[3] = fp[1] - (2.0/3.0)*bc_rho*ux;
+    fp[6] = fp[8] - 0.5*(fp[2]-fp[4]) - (1.0/6.0)*bc_rho*ux + 0.5*bc_rho*bc_uy_t;
+    fp[7] = fp[5] + 0.5*(fp[2]-fp[4]) - (1.0/6.0)*bc_rho*ux - 0.5*bc_rho*bc_uy_t;
+    rho[n]=bc_rho; u[n*2+0]=ux; u[n*2+1]=bc_uy_t;
+}
+
+// ---------------------------------------------------------------------------
+// 5. 充分发展出口（FullyDeveloped）— 复制上游相邻节点分布函数
+// ---------------------------------------------------------------------------
+__global__ void bc_fully_developed_south(double* f, int nx)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n_out = i;
+    const int n_in  = nx + i;  // j=1
+    for (int a = 0; a < 9; ++a) f[n_out*9+a] = f[n_in*9+a];
+}
+
+__global__ void bc_fully_developed_north(double* f, int nx, int ny)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n_out = (ny-1)*nx + i;
+    const int n_in  = (ny-2)*nx + i;
+    for (int a = 0; a < 9; ++a) f[n_out*9+a] = f[n_in*9+a];
+}
+
+__global__ void bc_fully_developed_west(double* f, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n_out = j*nx;
+    const int n_in  = j*nx + 1;
+    for (int a = 0; a < 9; ++a) f[n_out*9+a] = f[n_in*9+a];
+}
+
+__global__ void bc_fully_developed_east(double* f, int nx, int ny)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n_out = j*nx + (nx-1);
+    const int n_in  = j*nx + (nx-2);
+    for (int a = 0; a < 9; ++a) f[n_out*9+a] = f[n_in*9+a];
+}
+
+// ---------------------------------------------------------------------------
+// 6. 郭照立非平衡外推格式（Guo_Extrapolation）
+//    f[a](x_b) = f_eq[a](ρ_b, u_b) + (f[a](x_f) - f_eq[a](ρ_f, u_f))
+// ---------------------------------------------------------------------------
+__global__ void bc_guo_extrap_south(double* f, const double* rho, const double* u,
+                                     int nx, double bc_ux, double bc_uy, double bc_rho)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n_b = i;          // j=0
+    const int n_f = nx + i;     // j=1
+    const double rho_f = rho[n_f];
+    const double ux_f  = u[n_f*2+0];
+    const double uy_f  = u[n_f*2+1];
+    const double rho_b = (bc_rho > 0.0) ? bc_rho : rho_f;
+    const double ux_b  = (bc_rho > 0.0) ? ux_f   : bc_ux;
+    const double uy_b  = (bc_rho > 0.0) ? uy_f   : bc_uy;
+    for (int a = 0; a < 9; ++a)
+        f[n_b*9+a] = feq_device(rho_b,ux_b,uy_b,a)
+                   + (f[n_f*9+a] - feq_device(rho_f,ux_f,uy_f,a));
+}
+
+__global__ void bc_guo_extrap_north(double* f, const double* rho, const double* u,
+                                     int nx, int ny, double bc_ux, double bc_uy, double bc_rho)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+    const int n_b = (ny-1)*nx + i;
+    const int n_f = (ny-2)*nx + i;
+    const double rho_f = rho[n_f];
+    const double ux_f  = u[n_f*2+0];
+    const double uy_f  = u[n_f*2+1];
+    const double rho_b = (bc_rho > 0.0) ? bc_rho : rho_f;
+    const double ux_b  = (bc_rho > 0.0) ? ux_f   : bc_ux;
+    const double uy_b  = (bc_rho > 0.0) ? uy_f   : bc_uy;
+    for (int a = 0; a < 9; ++a)
+        f[n_b*9+a] = feq_device(rho_b,ux_b,uy_b,a)
+                   + (f[n_f*9+a] - feq_device(rho_f,ux_f,uy_f,a));
+}
+
+__global__ void bc_guo_extrap_west(double* f, const double* rho, const double* u,
+                                    int nx, int ny, double bc_ux, double bc_uy, double bc_rho)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n_b = j*nx;
+    const int n_f = j*nx + 1;
+    const double rho_f = rho[n_f];
+    const double ux_f  = u[n_f*2+0];
+    const double uy_f  = u[n_f*2+1];
+    const double rho_b = (bc_rho > 0.0) ? bc_rho : rho_f;
+    const double ux_b  = (bc_rho > 0.0) ? ux_f   : bc_ux;
+    const double uy_b  = (bc_rho > 0.0) ? uy_f   : bc_uy;
+    for (int a = 0; a < 9; ++a)
+        f[n_b*9+a] = feq_device(rho_b,ux_b,uy_b,a)
+                   + (f[n_f*9+a] - feq_device(rho_f,ux_f,uy_f,a));
+}
+
+__global__ void bc_guo_extrap_east(double* f, const double* rho, const double* u,
+                                    int nx, int ny, double bc_ux, double bc_uy, double bc_rho)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+    const int n_b = j*nx + (nx-1);
+    const int n_f = j*nx + (nx-2);
+    const double rho_f = rho[n_f];
+    const double ux_f  = u[n_f*2+0];
+    const double uy_f  = u[n_f*2+1];
+    const double rho_b = (bc_rho > 0.0) ? bc_rho : rho_f;
+    const double ux_b  = (bc_rho > 0.0) ? ux_f   : bc_ux;
+    const double uy_b  = (bc_rho > 0.0) ? uy_f   : bc_uy;
+    for (int a = 0; a < 9; ++a)
+        f[n_b*9+a] = feq_device(rho_b,ux_b,uy_b,a)
+                   + (f[n_f*9+a] - feq_device(rho_f,ux_f,uy_f,a));
+}
+
 // ---------------------------------------------------------------------------
 // GpuSolver 实现
 // ---------------------------------------------------------------------------
@@ -226,7 +559,119 @@ void GpuSolver::compute_macroscopic()
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-void GpuSolver::download(LatticeGrid& g) const
+void GpuSolver::add_boundary_condition(const BoundaryCondition& bc)
+{
+    bcs_.push_back(bc);
+}
+
+void GpuSolver::apply_boundary_conditions_gpu()
+{
+    // 边界核函数的线程块大小。边界面节点数通常为 nx 或 ny（O(√n)），
+    // BLOCK_BC=128 对 nx/ny ≤ 128 的情况也能正常工作（不足 1 个 block）。
+    constexpr int BLOCK_BC = 128;
+
+    for (const auto& bc : bcs_) {
+        // 根据面的方向确定本次 kernel 覆盖的节点数
+        const int count = (bc.face == Face::South || bc.face == Face::North) ? nx_ : ny_;
+        const int grid_bc = (count + BLOCK_BC - 1) / BLOCK_BC;
+
+        switch (bc.type) {
+        case BCType::BounceBack:
+            // 半步长反弹：从 d_f_tmp（碰后迁移前）读取，写入 d_f
+            switch (bc.face) {
+            case Face::South:
+                bc_bounce_back_south<<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_);            break;
+            case Face::North:
+                bc_bounce_back_north<<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            case Face::West:
+                bc_bounce_back_west <<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            case Face::East:
+                bc_bounce_back_east <<<grid_bc, BLOCK_BC>>>(d_f, d_f_tmp, nx_, ny_);       break;
+            default: break;
+            }
+            break;
+
+        case BCType::BounceBackFullWay:
+            // 全步长反弹：仅使用 d_f（就地交换对称方向）
+            switch (bc.face) {
+            case Face::South:
+                bc_bounce_back_fw_south<<<grid_bc, BLOCK_BC>>>(d_f, nx_);         break;
+            case Face::North:
+                bc_bounce_back_fw_north<<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
+            case Face::West:
+                bc_bounce_back_fw_west <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
+            case Face::East:
+                bc_bounce_back_fw_east <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);    break;
+            default: break;
+            }
+            break;
+
+        case BCType::ZouHe_Velocity:
+            switch (bc.face) {
+            case Face::North:
+                bc_zou_he_vel_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            case Face::South:
+                bc_zou_he_vel_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy);      break;
+            case Face::West:
+                bc_zou_he_vel_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            case Face::East:
+                bc_zou_he_vel_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy); break;
+            default: break;
+            }
+            break;
+
+        case BCType::ZouHe_Pressure:
+            switch (bc.face) {
+            case Face::North:
+                bc_zou_he_pres_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.ux); break;
+            case Face::South:
+                bc_zou_he_pres_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.rho, bc.ux);      break;
+            case Face::West:
+                bc_zou_he_pres_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
+            case Face::East:
+                bc_zou_he_pres_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.rho, bc.uy); break;
+            default: break;
+            }
+            break;
+
+        case BCType::FullyDeveloped:
+            switch (bc.face) {
+            case Face::South:
+                bc_fully_developed_south<<<grid_bc, BLOCK_BC>>>(d_f, nx_);        break;
+            case Face::North:
+                bc_fully_developed_north<<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
+            case Face::West:
+                bc_fully_developed_west <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
+            case Face::East:
+                bc_fully_developed_east <<<grid_bc, BLOCK_BC>>>(d_f, nx_, ny_);   break;
+            default: break;
+            }
+            break;
+
+        case BCType::Guo_Extrapolation:
+            // Guo 外推需要相邻节点的 rho/u，所以必须在 macroscopic_kernel 之前调用
+            // （此时 d_rho/d_u 来自上一步，用于读取内部节点值，精度足够）
+            switch (bc.face) {
+            case Face::South:
+                bc_guo_extrap_south<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, bc.ux, bc.uy, bc.rho);          break;
+            case Face::North:
+                bc_guo_extrap_north<<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            case Face::West:
+                bc_guo_extrap_west <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            case Face::East:
+                bc_guo_extrap_east <<<grid_bc, BLOCK_BC>>>(d_f, d_rho, d_u, nx_, ny_, bc.ux, bc.uy, bc.rho);     break;
+            default: break;
+            }
+            break;
+
+        default:
+            break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+
 {
     const std::size_t f_bytes   = static_cast<std::size_t>(n_) * 9 * sizeof(double);
     const std::size_t rho_bytes = static_cast<std::size_t>(n_)     * sizeof(double);
@@ -248,15 +693,21 @@ void GpuSolver::upload(const LatticeGrid& g)
 // ---------------------------------------------------------------------------
 // GpuSolver::step() — single-synchronize fused step
 //
-// Launches three kernels (collide → stream → macroscopic) back-to-back in
-// the default CUDA stream (which serialises them automatically) and issues
-// ONE cudaDeviceSynchronize at the end.  This avoids the two extra host-GPU
-// round-trips that the individual collide() / stream() methods would incur.
+// Launches three compute kernels (collide → stream → macroscopic) and,
+// if any boundary conditions have been registered via add_boundary_condition(),
+// the corresponding GPU BC kernels are launched between stream and macroscopic.
+// All kernels run in the default CUDA stream (serialised automatically).
+// ONE cudaDeviceSynchronize is issued at the end — catching execution errors
+// from all kernels while minimising host-GPU round-trips.
+//
+// Key property: when BCs are registered with add_boundary_condition(), NO
+// per-step GPU↔CPU data transfer is needed.  download() should only be
+// called when the caller needs to read back results (e.g. for output).
 //
 // After this call:
-//   d_f     — post-stream distribution function (ready for download / BC)
+//   d_f     — post-BC, post-stream distribution function
 //   d_f_tmp — post-collision, pre-stream distribution (for half-way BB BC)
-//   d_rho, d_u — updated macroscopic fields
+//   d_rho, d_u — updated macroscopic fields (reflect BC corrections)
 // ---------------------------------------------------------------------------
 void GpuSolver::step()
 {
@@ -278,11 +729,19 @@ void GpuSolver::step()
     d_f     = d_f_tmp;
     d_f_tmp = tmp;
 
-    // 3. Compute macroscopic fields (ρ, u) from the updated d_f
+    // 3. Apply registered boundary conditions directly on GPU —
+    //    no CPU↔GPU transfer required.  BCs that need the previous step's
+    //    rho/u (Guo_Extrapolation) read from d_rho/d_u which are still
+    //    valid from the prior macroscopic kernel call.
+    if (!bcs_.empty()) {
+        apply_boundary_conditions_gpu();
+    }
+
+    // 4. Compute macroscopic fields (ρ, u) from the BC-corrected d_f
     macroscopic_kernel<<<g, BLOCK>>>(d_f, d_rho, d_u, n_);
     CUDA_CHECK(cudaGetLastError());
 
-    // Single synchronise — catches execution errors from all three kernels
+    // Single synchronise — catches execution errors from all kernels
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
