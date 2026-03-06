@@ -517,15 +517,25 @@ fn main() {
     // manifest_dir = /path/to/repo/bindings/
     // repo_root    = /path/to/repo/
 
+    // 步骤 1b：推断构建类型（与 Cargo OPT_LEVEL 对齐，防止 MSVC 运行时库冲突）
+    let cmake_build_type = if std::env::var("OPT_LEVEL").unwrap_or_default() == "0" {
+        "Debug"
+    } else {
+        "Release"
+    };
+
     // 步骤 2：调用 CMake 构建 liblbm_core.a
     let dst = cmake::Config::new(repo_root)
         .define("BUILD_TESTS", "OFF")   // 不需要编译 C++ 测试可执行文件
-        .define("ENABLE_MPI", std::env::var("LBM_ENABLE_MPI")
-                               .unwrap_or_else(|_| "OFF".into()))
+        .define("ENABLE_MPI",    std::env::var("LBM_ENABLE_MPI")
+                                 .unwrap_or_else(|_| "OFF".into()))
+        .define("ENABLE_OPENMP", std::env::var("LBM_ENABLE_OPENMP")
+                                 .unwrap_or_else(|_| "OFF".into()))
         .define("CMAKE_BUILD_TYPE", cmake_build_type)  // Debug 或 Release
         .build();
     // dst = <cargo_target_dir>/build/lbm-bindings-xxxxx/out/
     // 生成物：dst/lib/liblbm_core.a
+    //         dst/mpi_link.txt（仅 ENABLE_MPI=ON 时）
 
     // 步骤 3：告诉 rustc 去哪里找 .a 文件
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
@@ -540,9 +550,32 @@ fn main() {
         _               => println!("cargo:rustc-link-lib=stdc++"),
     }
 
-    // 步骤 6：增量构建守卫（只有这些文件变化才重新编译）
+    // 步骤 6：MPI 启用时链接 MPI 库（解决 Windows LNK1120 / Linux undefined symbol）
+    // CMakeLists.txt 将 MPI 链接信息写入 mpi_link.txt；此处读取并发出 cargo: 指令
+    let mpi_enabled = matches!(
+        std::env::var("LBM_ENABLE_MPI").unwrap_or_default().to_uppercase().as_str(),
+        "ON" | "1" | "TRUE" | "YES"
+    );
+    if mpi_enabled {
+        let mpi_file = dst.join("mpi_link.txt");
+        if mpi_file.exists() {
+            for line in std::fs::read_to_string(&mpi_file).unwrap().lines() {
+                let line = line.trim();
+                if let Some(dir) = line.strip_prefix("search:") {
+                    println!("cargo:rustc-link-search=native={}", dir);
+                } else if let Some(lib) = line.strip_prefix("lib:") {
+                    // lib 可能是完整路径或纯库名；emit_mpi_lib 处理两种情况
+                    emit_mpi_lib(lib);
+                }
+            }
+        }
+    }
+
+    // 步骤 7：增量构建守卫（只有这些文件变化才重新编译）
     println!("cargo:rerun-if-changed=../core/src");
     println!("cargo:rerun-if-changed=../core/include");
+    println!("cargo:rerun-if-env-changed=LBM_ENABLE_MPI");
+    println!("cargo:rerun-if-env-changed=LBM_ENABLE_OPENMP");
 }
 ```
 
@@ -553,6 +586,7 @@ fn main() {
 | `cargo:rustc-link-search=native=<路径>` | 告诉 `rustc` 在此目录搜索 `.a` / `.lib` 文件 |
 | `cargo:rustc-link-lib=static=lbm_core` | 静态链接 `liblbm_core.a`（Unix）或 `lbm_core.lib`（Windows） |
 | `cargo:rustc-link-lib=stdc++` | 动态链接 `libstdc++.so`（C++ 运行时） |
+| `cargo:rustc-link-lib=mpi` | 链接 MPI 库（Linux OpenMPI/MPICH）；Windows MS-MPI 为 `msmpi` |
 | `cargo:rerun-if-changed=<路径>` | 指定路径变化时才重新运行 build.rs |
 | `cargo:rerun-if-env-changed=<VAR>` | 指定环境变量变化时才重新运行 build.rs |
 
@@ -792,6 +826,51 @@ assert!(!ptr.is_null(), "lbm_grid_new returned null");
 println!("rho[0] = {}", grid.rho(0));   // 初始值应为 1.0
 solver.step(&mut grid);
 println!("rho[0] = {}", grid.rho(0));   // 碰撞/迁移后应有轻微变化
+```
+
+### 11.5 LNK1120 / undefined symbol：MPI 符号未解析（Windows MS-MPI / Linux）
+
+**错误信息（Windows）**：
+```
+error: linking with `link.exe` failed: exit code: 1120
+LINK1120: 1 unresolved externals
+```
+
+**错误信息（Linux）**：
+```
+error: linking with `cc` failed: exit code: 1
+undefined reference to `MPI_Init'
+```
+
+**原因**：当 `LBM_ENABLE_MPI=ON` 时，`liblbm_core.a` 中包含对 MPI 库符号的引用。Rust 最终链接步骤需要找到这些符号，但 `build.rs` 未将 MPI 库目录 / 库名传递给 rustc。
+
+**修复**（已在本项目中实现）：
+
+1. `CMakeLists.txt` 在 MPI 启用时将链接信息写入 `<build>/mpi_link.txt`：
+
+```cmake
+set(_mpi_link_content "")
+foreach(_lib ${MPI_CXX_LIBRARIES})
+    string(APPEND _mpi_link_content "lib:${_lib}\n")
+endforeach()
+foreach(_dir ${MPI_CXX_LIBRARY_DIRS})
+    string(APPEND _mpi_link_content "search:${_dir}\n")
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/mpi_link.txt" "${_mpi_link_content}")
+install(FILES "${CMAKE_BINARY_DIR}/mpi_link.txt" DESTINATION .)
+```
+
+2. `build.rs` 读取该文件并向 rustc 发出链接指令（见 §8.2 步骤 6）。
+
+**使用方式**：
+
+```bash
+# Windows（MS-MPI 已安装）
+set LBM_ENABLE_MPI=ON
+cargo build --release
+
+# Linux（OpenMPI / MPICH 已安装）
+LBM_ENABLE_MPI=ON cargo build --release
 ```
 
 ---
