@@ -86,7 +86,11 @@ void collide_bgk_kernel(double* __restrict__ f,
 // 流式迁移核函数（push 方案）
 //
 // 每个线程处理节点 (i, j) 的全部 9 个方向。
-// 使用周期性边界条件（(x + dx + nx) % nx）。
+// 使用周期性边界条件处理域边界节点。
+//
+// 性能优化：由于 D2Q9 的每个方向速度分量仅为 {-1, 0, +1}，
+// 周期性回绕只会越界至多一格，因此用条件加减代替整数取模，
+// 避免硬件代价较高的除法指令。
 // f_src[node*Q+a] → f_dst[dest_node*Q+a]
 // ---------------------------------------------------------------------------
 __global__
@@ -102,8 +106,14 @@ void stream_kernel(const double* __restrict__ f_src,
     const int jj = node / nx;
 
     for (int a = 0; a < 9; ++a) {
-        const int di = (ii + d_Cx[a] + nx) % nx;
-        const int dj = (jj + d_Cy[a] + ny) % ny;
+        // Periodic wrap using conditional arithmetic — avoids costly integer
+        // division that `% nx` / `% ny` would produce on GPU.
+        // Each lattice velocity component is in {-1, 0, +1}, so at most one
+        // conditional branch is taken.
+        int di = ii + d_Cx[a];
+        if (di < 0) di += nx; else if (di >= nx) di -= nx;
+        int dj = jj + d_Cy[a];
+        if (dj < 0) dj += ny; else if (dj >= ny) dj -= ny;
         f_dst[(dj * nx + di) * 9 + a] = f_src[node * 9 + a];
     }
 }
@@ -112,6 +122,9 @@ void stream_kernel(const double* __restrict__ f_src,
 // 宏观量核函数
 //
 // ρ = Σ_a f_a,   u = (Σ_a c_a f_a) / ρ
+//
+// 稳定性：当 ρ ≤ 0（所有 f 为零或数值发散）时，令 u = 0 而非产生 NaN/Inf，
+// 防止后续碰撞步因非有限速度导致整个模拟崩溃。
 // ---------------------------------------------------------------------------
 __global__
 void macroscopic_kernel(const double* __restrict__ f,
@@ -129,9 +142,16 @@ void macroscopic_kernel(const double* __restrict__ f,
         cx_sum += fa * d_Cx[a];
         cy_sum += fa * d_Cy[a];
     }
-    rho[node]      = r;
-    u[node * 2 + 0] = cx_sum / r;
-    u[node * 2 + 1] = cy_sum / r;
+    rho[node] = r;
+    // Guard against divide-by-zero: if density is non-positive (degenerate
+    // state), set velocity to zero rather than producing NaN/Inf.
+    if (r > 0.0) {
+        u[node * 2 + 0] = cx_sum / r;
+        u[node * 2 + 1] = cy_sum / r;
+    } else {
+        u[node * 2 + 0] = 0.0;
+        u[node * 2 + 1] = 0.0;
+    }
 }
 
 // ---------------------------------------------------------------------------

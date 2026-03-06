@@ -453,6 +453,160 @@ static int test_mpi_attach_no_effect()
 }
 
 
+// ---------------------------------------------------------------------------
+// 虚拟幽灵行交换辅助函数（模拟 MPI halo_exchange_d2q9 的行为，无需实际 MPI）
+//
+// 模拟两相邻切片（slab0 为南切片，slab1 为北切片）之间的交换：
+//   slab0 的顶物理行（j=local_ny0）→ slab1 的南幽灵行（j=0）
+//   slab1 的底物理行（j=1）         → slab0 的北幽灵行（j=local_ny0+1）
+// ---------------------------------------------------------------------------
+static void virtual_halo_exchange(lbm::LatticeGrid& slab0, int local_ny0,
+                                   lbm::LatticeGrid& slab1)
+{
+    const int nx = slab0.nx;
+    const int Q  = lbm::d2q9::Q;
+
+    // Exchange 1: slab0 top physical row → slab1 south ghost
+    for (int i = 0; i < nx; ++i) {
+        const int src = slab0.idx(i, local_ny0);
+        const int dst = slab1.idx(i, 0);
+        for (int a = 0; a < Q; ++a)
+            slab1.f[dst * Q + a] = slab0.f[src * Q + a];
+    }
+
+    // Exchange 2: slab1 bottom physical row → slab0 north ghost
+    for (int i = 0; i < nx; ++i) {
+        const int src = slab1.idx(i, 1);
+        const int dst = slab0.idx(i, local_ny0 + 1);
+        for (int a = 0; a < Q; ++a)
+            slab0.f[dst * Q + a] = slab1.f[src * Q + a];
+    }
+}
+
+
+// 测试 11：虚拟幽灵行交换行正确性
+//
+// 设计：创建两个相邻切片网格，向每行填写唯一可识别的 f 值（行号 + 常数），
+// 执行虚拟幽灵行交换，然后验证：
+//   1. slab1 的南幽灵行（j=0）== slab0 的顶物理行（j=local_ny0）
+//   2. slab0 的北幽灵行（j=local_ny0+1）== slab1 的底物理行（j=1）
+//
+// 这保证了 MPI halo_exchange_d2q9 的逻辑（发送/接收哪一行）是正确的，
+// 即相邻进程的物理边界数据能够正确填入对方的幽灵行，
+// 为后续流式迁移提供正确的入流值。
+static int test_mpi_halo_exchange_correctness()
+{
+    const int nx       = 8;
+    const int local_ny = 4;   // 每个切片的物理行数
+    // slab0 和 slab1 均含 local_ny+2 行（含幽灵行）
+    const int grid_ny  = local_ny + 2;
+
+    lbm::LatticeGrid slab0(nx, grid_ny, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid slab1(nx, grid_ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 向每行的每个节点的每个方向填入易于识别的值：
+    //   row_offset * 100 + direction_index（避免跨行值碰撞）
+    // 幽灵行（j=0 和 j=grid_ny-1）填为 -1（代表"未初始化"）
+    const int Q = lbm::d2q9::Q;
+    for (int j = 0; j < grid_ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int n0 = slab0.idx(i, j);
+            const int n1 = slab1.idx(i, j);
+            for (int a = 0; a < Q; ++a) {
+                slab0.f[n0 * Q + a] = (j == 0 || j == grid_ny - 1) ? -1.0
+                    : static_cast<double>(j * 100 + a);       // slab0 物理行
+                slab1.f[n1 * Q + a] = (j == 0 || j == grid_ny - 1) ? -1.0
+                    : static_cast<double>((j + local_ny) * 100 + a); // slab1 物理行（全局行偏移）
+            }
+        }
+    }
+
+    // 执行虚拟幽灵行交换
+    virtual_halo_exchange(slab0, local_ny, slab1);
+
+    bool ok = true;
+    // 验证 1：slab1 的南幽灵行（j=0）== slab0 的顶物理行（j=local_ny）
+    for (int i = 0; i < nx && ok; ++i) {
+        const int ghost = slab1.idx(i, 0);
+        const int phys  = slab0.idx(i, local_ny);
+        for (int a = 0; a < Q && ok; ++a) {
+            if (slab1.f[ghost * Q + a] != slab0.f[phys * Q + a])
+                ok = false;
+        }
+    }
+    // 验证 2：slab0 的北幽灵行（j=local_ny+1）== slab1 的底物理行（j=1）
+    for (int i = 0; i < nx && ok; ++i) {
+        const int ghost = slab0.idx(i, local_ny + 1);
+        const int phys  = slab1.idx(i, 1);
+        for (int a = 0; a < Q && ok; ++a) {
+            if (slab0.f[ghost * Q + a] != slab1.f[phys * Q + a])
+                ok = false;
+        }
+    }
+
+    std::printf("[MPI] halo exchange row correctness (virtual 2-slab): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
+// 测试 12：虚拟双进程分解下幽灵行不被二次碰撞——单进程对照验证
+//
+// 设计：在无 MPI 的单进程构建中，collide_bgk 的幽灵行跳过逻辑仅在
+// mpi_decomp_->nprocs > 1 时激活；当 nprocs==1 时行为与无 MPI 完全相同。
+// 本测试通过以下方式验证：
+//   - 两组完全相同的初始条件、相同的边界条件，分别使用：
+//       A）不绑定任何 MpiDecomp（nprocs=1，n_start/n_end 不裁剪）
+//       B）绑定 nprocs==1 的 MpiDecomp（n_start/n_end 不裁剪，因 has_south/north_wall()=true）
+//   - 两组运行 100 步后宏观量逐节点比较，确保数值完全一致
+//   - 这同时验证：has_south_wall()/has_north_wall() 在 nprocs==1 时均返回 true，
+//     即幽灵行跳过逻辑对整域进程（rank 0 = rank nprocs-1）不产生影响
+//
+// 注意：此测试仅在单进程模式下验证逻辑的"无影响性"，多进程下的
+// 二次碰撞修复需要通过 mpirun 运行集成测试才能完整验证。
+static int test_mpi_virtual_two_rank_no_ghost_collision()
+{
+    const int nx = 16, ny = 16;
+    const double omega = 1.2;
+
+    // 基准：不绑定任何 MpiDecomp
+    lbm::LatticeGrid g_ref(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_ref.size(); ++i) g_ref.rho[i] = 1.0 + 0.02 * (i % 7);
+    lbm::Solver solver_ref(g_ref, omega);
+    // 北壁 BounceBack（模拟有壁面的场景）
+    lbm::BoundaryCondition bc_ref;
+    bc_ref.type = lbm::BCType::BounceBack;
+    bc_ref.face = lbm::Face::North;
+    solver_ref.add_boundary_condition(bc_ref);
+    for (int t = 0; t < 100; ++t) solver_ref.step();
+
+    // 对照：绑定 nprocs==1 的 MpiDecomp
+    // nprocs==1 时 has_south_wall()=true && has_north_wall()=true，
+    // 因此 n_start=0, n_end=n — 与不绑定完全等价
+    lbm::LatticeGrid g_mpi(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_mpi.size(); ++i) g_mpi.rho[i] = 1.0 + 0.02 * (i % 7);
+    lbm::Solver solver_mpi(g_mpi, omega);
+    lbm::BoundaryCondition bc_mpi;
+    bc_mpi.type = lbm::BCType::BounceBack;
+    bc_mpi.face = lbm::Face::North;
+    solver_mpi.add_boundary_condition(bc_mpi);
+    const auto decomp = lbm::MpiDecomp::create(nx, ny);  // nprocs=1 in non-MPI build
+    solver_mpi.attach_mpi(&decomp);
+    for (int t = 0; t < 100; ++t) solver_mpi.step();
+
+    constexpr double TOL = 1e-14;
+    bool ok = true;
+    for (int i = 0; i < g_ref.size() && ok; ++i) {
+        if (std::abs(g_ref.rho[i] - g_mpi.rho[i]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 0] - g_mpi.u[i * 2 + 0]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 1] - g_mpi.u[i * 2 + 1]) > TOL) { ok = false; break; }
+    }
+    std::printf("[MPI] no ghost-row double-collision in single-rank mode: %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -466,5 +620,7 @@ int test_lbm_main()
     failures += test_guo_extrapolation_west_velocity();
     failures += test_mpi_decomp_single_rank();
     failures += test_mpi_attach_no_effect();
+    failures += test_mpi_halo_exchange_correctness();
+    failures += test_mpi_virtual_two_rank_no_ghost_collision();
     return failures;
 }

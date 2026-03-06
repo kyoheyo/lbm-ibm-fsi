@@ -97,11 +97,34 @@ void Solver::collide_bgk()
     const int n = grid_.size();
     const int d = grid_.dim();
 
+    // MPI 模式下，幽灵行（ghost rows）持有相邻进程传来的物理行数据，
+    // 已在对方进程完成了一次碰撞；若再次对幽灵行执行碰撞（二次碰撞），
+    // 会导致边界区域的分布函数被过度松弛，引起物理错误（边界附近的密度/速度误差）。
+    // 因此仅对当前进程持有的物理行（以及南/北物理壁节点）执行碰撞。
+    //
+    // 节点索引布局（MPI，nprocs > 1）：
+    //   j=0           : 南幽灵（或南物理壁，rank 0）   → 节点 0..nx-1
+    //   j=1..local_ny : 物理行                          → 节点 nx..(local_ny)*nx-1
+    //   j=local_ny+1  : 北幽灵（或北物理壁，最后 rank）→ 节点 (local_ny+1)*nx..n-1
+    //
+    // has_south_wall()=true  → j=0 是物理壁，应碰撞（n_start=0）
+    // has_south_wall()=false → j=0 是幽灵行，跳过  （n_start=nx）
+    // has_north_wall()=true  → j=ny-1 是物理壁，应碰撞（n_end=n）
+    // has_north_wall()=false → j=ny-1 是幽灵行，跳过  （n_end=n-nx）
+    int n_start = 0;
+    int n_end   = n;
+#ifdef LBM_ENABLE_MPI
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
+        if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
+    }
+#endif
+
     if (grid_.model == LatticeModel::D2Q9) {
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int i = 0; i < n; ++i) {
+        for (int i = n_start; i < n_end; ++i) {
             const double* ui = &grid_.u[i * d];
             const double  ri = grid_.rho[i];
             const double* Fi = &grid_.force[i * d];
@@ -126,7 +149,7 @@ void Solver::collide_bgk()
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int i = 0; i < n; ++i) {
+        for (int i = n_start; i < n_end; ++i) {
             const double* ui = &grid_.u[i * d];
             const double  ri = grid_.rho[i];
             const double* Fi = &grid_.force[i * d];
@@ -179,10 +202,20 @@ void Solver::collide_mrt()
     const int n = grid_.size();
     const int d = 2;
 
+    // MPI 幽灵行跳过逻辑（同 collide_bgk，防止二次碰撞）
+    int n_start = 0;
+    int n_end   = n;
+#ifdef LBM_ENABLE_MPI
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
+        if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
+    }
+#endif
+
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < n; ++i) {
+    for (int i = n_start; i < n_end; ++i) {
         const double* fi = &grid_.f[i * d2q9::Q];
         const double* ui = &grid_.u[i * d];
         const double  ri = grid_.rho[i];
