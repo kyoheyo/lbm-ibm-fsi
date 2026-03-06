@@ -90,59 +90,54 @@ void Solver::collide()
 }
 
 // ---------------------------------------------------------------------------
+// 幽灵层跳过参数计算（供 collide_bgk / collide_mrt 共用）
+// ---------------------------------------------------------------------------
+Solver::CollideGuard Solver::make_collide_guard() const
+{
+    const int n = grid_.size();
+    CollideGuard g;
+    g.n_start = 0;
+    g.n_end   = n;
+#ifdef LBM_ENABLE_MPI
+    // 一维（Y 方向）幽灵行
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        if (!mpi_decomp_->has_south_wall()) g.n_start = grid_.nx;
+        if (!mpi_decomp_->has_north_wall()) g.n_end   = n - grid_.nx;
+    }
+    // 二维（XY 方向）幽灵层
+    g.use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
+    if (g.use_mpi2d) {
+        g.gnx2d = grid_.nx;
+        g.gny2d = grid_.ny;
+        g.sg2d  = mpi_decomp2d_->has_south_ghost();
+        g.ng2d  = mpi_decomp2d_->has_north_ghost();
+        g.wg2d  = mpi_decomp2d_->has_west_ghost();
+        g.eg2d  = mpi_decomp2d_->has_east_ghost();
+        // 二维模式下 n_start/n_end 不适用，交由 is_ghost() 逐节点检查
+        g.n_start = 0;
+        g.n_end   = n;
+    }
+#endif
+    return g;
+}
+
+// ---------------------------------------------------------------------------
 // BGK 碰撞（单松弛时间）
 // ---------------------------------------------------------------------------
 void Solver::collide_bgk()
 {
-    const int n = grid_.size();
     const int d = grid_.dim();
 
-    // MPI 一维模式下，幽灵行（ghost rows）持有相邻进程传来的物理行数据，
-    // 已在对方进程完成了一次碰撞；若再次对幽灵行执行碰撞（二次碰撞），
-    // 会导致边界区域的分布函数被过度松弛，引起物理错误（边界附近的密度/速度误差）。
-    // 因此仅对当前进程持有的物理行（以及南/北物理壁节点）执行碰撞。
-    //
-    // 节点索引布局（MPI 一维，nprocs > 1）：
-    //   j=0           : 南幽灵（或南物理壁，rank 0）   → 节点 0..nx-1
-    //   j=1..local_ny : 物理行                          → 节点 nx..(local_ny)*nx-1
-    //   j=local_ny+1  : 北幽灵（或北物理壁，最后 rank）→ 节点 (local_ny+1)*nx..n-1
-    //
-    // has_south_wall()=true  → j=0 是物理壁，应碰撞（n_start=0）
-    // has_south_wall()=false → j=0 是幽灵行，跳过  （n_start=nx）
-    // has_north_wall()=true  → j=ny-1 是物理壁，应碰撞（n_end=n）
-    // has_north_wall()=false → j=ny-1 是幽灵行，跳过  （n_end=n-nx）
-    int n_start = 0;
-    int n_end   = n;
-#ifdef LBM_ENABLE_MPI
-    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-        if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
-        if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
-    }
-
-    // MPI 二维模式：幽灵层在四个方向上均存在，通过逐节点检查跳过幽灵节点
-    // 注意：n_start/n_end 在二维模式下不适用（改用内循环 is_ghost 检查）
-    const bool use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
-    const int gnx2d = use_mpi2d ? grid_.nx : 0;
-    const int gny2d = use_mpi2d ? grid_.ny : 0;
-    const bool sg2d = use_mpi2d && mpi_decomp2d_->has_south_ghost();
-    const bool ng2d = use_mpi2d && mpi_decomp2d_->has_north_ghost();
-    const bool wg2d = use_mpi2d && mpi_decomp2d_->has_west_ghost();
-    const bool eg2d = use_mpi2d && mpi_decomp2d_->has_east_ghost();
-    if (use_mpi2d) { n_start = 0; n_end = n; }
-#endif
+    // 计算幽灵层跳过参数（避免幽灵节点二次碰撞）
+    const CollideGuard guard = make_collide_guard();
 
     if (grid_.model == LatticeModel::D2Q9) {
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int i = n_start; i < n_end; ++i) {
+        for (int i = guard.n_start; i < guard.n_end; ++i) {
 #ifdef LBM_ENABLE_MPI
-            // 二维模式：跳过幽灵层节点（南/北幽灵行 或 西/东幽灵列）
-            if (use_mpi2d) {
-                const int ix = i % gnx2d;
-                const int iy = i / gnx2d;
-                if ((sg2d && iy == 0) || (ng2d && iy == gny2d - 1)) continue;
-                if ((wg2d && ix == 0) || (eg2d && ix == gnx2d - 1)) continue;
+            if (guard.is_ghost(i)) continue;
             }
 #endif
             const double* ui = &grid_.u[i * d];
@@ -169,7 +164,7 @@ void Solver::collide_bgk()
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int i = n_start; i < n_end; ++i) {
+        for (int i = guard.n_start; i < guard.n_end; ++i) {
             const double* ui = &grid_.u[i * d];
             const double  ri = grid_.rho[i];
             const double* Fi = &grid_.force[i * d];
@@ -219,38 +214,17 @@ void Solver::collide_mrt()
         { 0,  0,  0,  0,  0,  1, -1,  1, -1},
     };
 
-    const int n = grid_.size();
     const int d = 2;
 
-    // MPI 幽灵层跳过逻辑（同 collide_bgk，防止二次碰撞）
-    int n_start = 0;
-    int n_end   = n;
-#ifdef LBM_ENABLE_MPI
-    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-        if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
-        if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
-    }
-    const bool use_mpi2d_mrt = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
-    const int gnx2d_mrt = use_mpi2d_mrt ? grid_.nx : 0;
-    const int gny2d_mrt = use_mpi2d_mrt ? grid_.ny : 0;
-    const bool sg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_south_ghost();
-    const bool ng2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_north_ghost();
-    const bool wg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_west_ghost();
-    const bool eg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_east_ghost();
-    if (use_mpi2d_mrt) { n_start = 0; n_end = n; }
-#endif
+    // 计算幽灵层跳过参数（与 collide_bgk 使用同一辅助方法）
+    const CollideGuard guard = make_collide_guard();
 
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = n_start; i < n_end; ++i) {
+    for (int i = guard.n_start; i < guard.n_end; ++i) {
 #ifdef LBM_ENABLE_MPI
-        if (use_mpi2d_mrt) {
-            const int ix = i % gnx2d_mrt;
-            const int iy = i / gnx2d_mrt;
-            if ((sg2d_mrt && iy == 0) || (ng2d_mrt && iy == gny2d_mrt - 1)) continue;
-            if ((wg2d_mrt && ix == 0) || (eg2d_mrt && ix == gnx2d_mrt - 1)) continue;
-        }
+        if (guard.is_ghost(i)) continue;
 #endif
         const double* fi = &grid_.f[i * d2q9::Q];
         const double* ui = &grid_.u[i * d];

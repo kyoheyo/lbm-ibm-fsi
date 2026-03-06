@@ -7,6 +7,7 @@
 
 #include <queue>
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace lbm {
@@ -45,8 +46,8 @@ MgNode* MgTree::add_level(MgNode* parent, MgExtent child_extent, int refine_rati
                       + std::to_string(child_extent.y_end) + "]"
         );
     }
-    if (refine_ratio < 1) {
-        throw std::invalid_argument("MgTree::add_level: refine_ratio must be >= 1");
+    if (refine_ratio < 1 || refine_ratio > 1024) {
+        throw std::invalid_argument("MgTree::add_level: refine_ratio must be in [1, 1024]");
     }
 
     auto node           = std::make_unique<MgNode>();
@@ -113,6 +114,147 @@ std::vector<MgNode*> MgTree::nodes_at_level(int level) const
         }
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// AMR 延拓算子（Prolongation）：粗 → 细，双线性插值 ρ/u
+//
+// 坐标映射说明（2D，D2Q9）：
+//   细节点 (if, jf)（0-based 本地细格索引）在粗坐标系中的节点位置：
+//     px = fine.extent.x_start + if / r
+//     py = fine.extent.y_start + jf / r
+//   双线性插值：取 floor(px) 和 floor(py) 确定左下粗节点，alpha = px - floor(px)。
+//   这与 LBM 节点布局一致（节点在整数坐标处，不是格心）。
+// ---------------------------------------------------------------------------
+void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
+{
+    if (!coarse.grid || !fine.grid) {
+        throw std::invalid_argument("mg_prolong_rho_u: both coarse and fine nodes must have grids");
+    }
+
+    const LatticeGrid& cg = *coarse.grid;
+    LatticeGrid&       fg = *fine.grid;
+    const int r  = fine.refine_ratio;
+    const int d  = cg.dim();  // 2 for D2Q9
+
+    // 在 x/y 方向上循环细节点（fine LatticeGrid 的本地尺寸）
+    const int fn_x = fg.nx;
+    const int fn_y = fg.ny;
+
+    for (int jf = 0; jf < fn_y; ++jf) {
+        for (int if_ = 0; if_ < fn_x; ++if_) {
+            // 细节点在粗坐标系中的浮点位置（节点位于整数坐标处）
+            const double px = fine.extent.x_start + static_cast<double>(if_) / r;
+            const double py = fine.extent.y_start + static_cast<double>(jf)  / r;
+
+            // 双线性插值的左下粗节点（全局粗坐标系）
+            const int i0 = static_cast<int>(std::floor(px));
+            const int j0 = static_cast<int>(std::floor(py));
+
+            // 双线性权重（alpha=0 → 完全使用左节点；alpha=1 → 完全使用右节点）
+            const double alpha = px - i0;  // [0, 1]
+            const double beta  = py - j0;
+
+            // 四角粗节点的本地索引（夹持到粗格有效范围）
+            auto clamp_ci = [&](int ci) -> int {
+                return std::max(coarse.extent.x_start,
+                                std::min(coarse.extent.x_end, ci));
+            };
+            auto clamp_cj = [&](int cj) -> int {
+                return std::max(coarse.extent.y_start,
+                                std::min(coarse.extent.y_end, cj));
+            };
+
+            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
+            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
+            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
+            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+
+            // 粗节点索引
+            const int c00 = cg.idx(ci00, cj00);
+            const int c10 = cg.idx(ci10, cj00);
+            const int c01 = cg.idx(ci00, cj10);
+            const int c11 = cg.idx(ci10, cj10);
+
+            // 双线性插值权重
+            const double w00 = (1.0 - alpha) * (1.0 - beta);
+            const double w10 = alpha          * (1.0 - beta);
+            const double w01 = (1.0 - alpha)  * beta;
+            const double w11 = alpha           * beta;
+
+            const int fi = fg.idx(if_, jf);
+
+            // 插值 ρ
+            fg.rho[fi] = w00 * cg.rho[c00]
+                       + w10 * cg.rho[c10]
+                       + w01 * cg.rho[c01]
+                       + w11 * cg.rho[c11];
+
+            // 插值 u（每个空间分量）
+            for (int k = 0; k < d; ++k) {
+                fg.u[fi * d + k] = w00 * cg.u[c00 * d + k]
+                                 + w10 * cg.u[c10 * d + k]
+                                 + w01 * cg.u[c01 * d + k]
+                                 + w11 * cg.u[c11 * d + k];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AMR 限制算子（Restriction）：细 → 粗，体积平均 ρ/u
+//
+// 对粗格 (ic_local, jc_local)，覆盖细格范围 if ∈ [ic_local*r, (ic_local+1)*r)，
+// 取这 r×r 个细格的简单平均写入粗格。
+// ---------------------------------------------------------------------------
+void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse)
+{
+    if (!fine.grid || !coarse.grid) {
+        throw std::invalid_argument("mg_restrict_rho_u: both fine and coarse nodes must have grids");
+    }
+
+    const LatticeGrid& fg = *fine.grid;
+    LatticeGrid&       cg = *coarse.grid;
+    const int r  = fine.refine_ratio;
+    const int d  = fg.dim();
+
+    // 遍历细网格覆盖的粗格范围（以本地粗格索引）
+    const int cx_lo = fine.extent.x_start - coarse.extent.x_start;
+    const int cy_lo = fine.extent.y_start - coarse.extent.y_start;
+    const int cx_hi = fine.extent.x_end   - coarse.extent.x_start;
+    const int cy_hi = fine.extent.y_end   - coarse.extent.y_start;
+
+    for (int jc = cy_lo; jc <= cy_hi; ++jc) {
+        for (int ic = cx_lo; ic <= cx_hi; ++ic) {
+            // 对应细格的起始本地索引
+            const int if0 = (ic - cx_lo) * r;
+            const int jf0 = (jc - cy_lo) * r;
+
+            double rho_sum = 0.0;
+            double u_sum[3] = {0.0, 0.0, 0.0};
+            int    count    = 0;
+
+            for (int djf = 0; djf < r && jf0 + djf < fg.ny; ++djf) {
+                for (int dif = 0; dif < r && if0 + dif < fg.nx; ++dif) {
+                    const int fi = fg.idx(if0 + dif, jf0 + djf);
+                    rho_sum += fg.rho[fi];
+                    for (int k = 0; k < d; ++k) {
+                        u_sum[k] += fg.u[fi * d + k];
+                    }
+                    ++count;
+                }
+            }
+
+            if (count > 0) {
+                const double inv = 1.0 / count;
+                const int ci = cg.idx(ic, jc);
+                cg.rho[ci] = rho_sum * inv;
+                for (int k = 0; k < d; ++k) {
+                    cg.u[ci * d + k] = u_sum[k] * inv;
+                }
+            }
+        }
+    }
 }
 
 } // namespace lbm

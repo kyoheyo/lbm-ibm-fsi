@@ -1127,6 +1127,191 @@ static int test_mpi_decomp3d_single_rank()
 }
 
 
+
+// ---------------------------------------------------------------------------
+// 测试：mg_prolong_rho_u — 双线性延拓（粗→细）
+//
+// 常数场验证：若粗格 ρ/u 处处相等，延拓后细格应精确还原该常数（插值不改变常数场）。
+// 线性场验证：ρ(i,j) = a*i + b*j + c，双线性插值应精确还原（线性场是双线性的特例）。
+// ---------------------------------------------------------------------------
+static int test_mg_prolong_rho_u()
+{
+    bool ok = true;
+
+    // --- 子测试 1：常数场 ---
+    {
+        lbm::LatticeGrid coarse(4, 4, 1, lbm::LatticeModel::D2Q9);
+        for (int k = 0; k < coarse.size(); ++k) {
+            coarse.rho[k]       = 1.25;
+            coarse.u[k * 2 + 0] = 0.03;
+            coarse.u[k * 2 + 1] = -0.01;
+        }
+        lbm::LatticeGrid fine(4, 4, 1, lbm::LatticeModel::D2Q9);
+
+        lbm::MgTree tree({0, 3, 0, 3, 0, 0}, lbm::MgDim::D2);
+        auto* root_node = tree.root();
+        root_node->grid  = &coarse;
+        auto* fine_node  = tree.add_level(root_node, {0, 1, 0, 1, 0, 0}, 2);
+        fine_node->grid  = &fine;
+        lbm::mg_prolong_rho_u(*root_node, *fine_node);
+
+        for (int k = 0; k < fine.size(); ++k) {
+            ok &= (std::fabs(fine.rho[k] - 1.25) < 1e-12);
+            ok &= (std::fabs(fine.u[k * 2 + 0] - 0.03)  < 1e-12);
+            ok &= (std::fabs(fine.u[k * 2 + 1] - (-0.01)) < 1e-12);
+        }
+    }
+
+    // --- 子测试 2：线性场 ρ(i,j) = 1.0 + 0.1*i + 0.05*j（以粗节点整数坐标为参考）---
+    // 双线性插值对线性函数精确：ρ_f = ρ(px, py) 精确（无边界夹持时）
+    {
+        lbm::LatticeGrid coarse(4, 4, 1, lbm::LatticeModel::D2Q9);
+        for (int j = 0; j < 4; ++j) {
+            for (int i = 0; i < 4; ++i) {
+                coarse.rho[coarse.idx(i, j)] = 1.0 + 0.1 * i + 0.05 * j;
+                coarse.u[coarse.idx(i, j) * 2 + 0] = 0.0;
+                coarse.u[coarse.idx(i, j) * 2 + 1] = 0.0;
+            }
+        }
+        // 细网格覆盖粗格 {1,2,1,2}（远离边界，避免夹持），加密比 2 → 3×3 细节点
+        // fine_extent.nx() = 2, r=2 → 4 细节点 (0..3) 覆盖粗坐标 1.0..2.0
+        lbm::LatticeGrid fine(4, 4, 1, lbm::LatticeModel::D2Q9);
+
+        lbm::MgTree tree2({0, 3, 0, 3, 0, 0}, lbm::MgDim::D2);
+        auto* root2 = tree2.root();
+        root2->grid  = &coarse;
+        // fine extent {1,2,1,2}: fine_nx = (2-1+1)*2 = 4, fine_ny = 4
+        auto* fine2  = tree2.add_level(root2, {1, 2, 1, 2, 0, 0}, 2);
+        fine2->grid  = &fine;
+        lbm::mg_prolong_rho_u(*root2, *fine2);
+
+        // fine cell (if,jf): px = 1 + if/2, py = 1 + jf/2
+        // 在 0 <= if <= 4-1=3 时，px in [1.0, 2.5]；至多夹持在 coarse x_end=3
+        // 对 if=0..3：px = 1.0, 1.5, 2.0, 2.5 → 无夹持（2.5 < 3）
+        const int r2 = 2;
+        for (int jf = 0; jf < 4; ++jf) {
+            for (int if_ = 0; if_ < 4; ++if_) {
+                const double px = 1 + static_cast<double>(if_) / r2;
+                const double py = 1 + static_cast<double>(jf)  / r2;
+                // 双线性对线性函数精确（节点坐标无需夹持）
+                const double expected = 1.0 + 0.1 * px + 0.05 * py;
+                const double actual   = fine.rho[fine.idx(if_, jf)];
+                ok &= (std::fabs(actual - expected) < 1e-10);
+            }
+        }
+    }
+
+    std::printf("[MgTree] mg_prolong_rho_u bilinear: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// 测试：mg_restrict_rho_u — 体积平均限制（细→粗）
+//
+// 细网格 4×4（覆盖粗格 {0,1, 0,1}，加密比 2）。
+// 细网格赋常数 ρ=1.5，限制后粗格对应区域应得 ρ=1.5（精确）。
+// ---------------------------------------------------------------------------
+static int test_mg_restrict_rho_u()
+{
+    // 粗网格 4×4
+    lbm::LatticeGrid coarse(4, 4, 1, lbm::LatticeModel::D2Q9);
+
+    // 细网格：覆盖粗格 {0,1, 0,1}，加密比 2 → 4×4 细格
+    lbm::LatticeGrid fine(4, 4, 1, lbm::LatticeModel::D2Q9);
+    // 赋常数宏观量
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            const int fi = fine.idx(i, j);
+            fine.rho[fi]       = 1.5;
+            fine.u[fi * 2 + 0] = 0.01;
+            fine.u[fi * 2 + 1] = 0.02;
+        }
+    }
+
+    lbm::MgTree tree({0, 3, 0, 3, 0, 0}, lbm::MgDim::D2);
+    auto* root_node = tree.root();
+    root_node->grid  = &coarse;
+    auto* fine_node  = tree.add_level(root_node, {0, 1, 0, 1, 0, 0}, 2);
+    fine_node->grid  = &fine;
+
+    // 初始化粗格为0
+    for (int k = 0; k < coarse.size(); ++k) coarse.rho[k] = 0.0;
+    lbm::mg_restrict_rho_u(*fine_node, *root_node);
+
+    bool ok = true;
+    // 粗格 (0,0) 和 (1,0), (0,1), (1,1) 都被 4 个细格平均 → ρ = 1.5
+    for (int jc = 0; jc <= 1; ++jc) {
+        for (int ic = 0; ic <= 1; ++ic) {
+            const double rho_c = coarse.rho[coarse.idx(ic, jc)];
+            ok &= (std::fabs(rho_c - 1.5) < 1e-12);
+            const double ux_c  = coarse.u[coarse.idx(ic, jc) * 2 + 0];
+            const double uy_c  = coarse.u[coarse.idx(ic, jc) * 2 + 1];
+            ok &= (std::fabs(ux_c - 0.01) < 1e-12);
+            ok &= (std::fabs(uy_c - 0.02) < 1e-12);
+        }
+    }
+    // 粗格 (2..3, 2..3) 未被修改，保持 0
+    ok &= (std::fabs(coarse.rho[coarse.idx(2, 2)]) < 1e-12);
+
+    std::printf("[MgTree] mg_restrict_rho_u volume-avg: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// 测试：MgTree overflow guard（refine_ratio 超限时抛出异常）
+// 和 void* → std::variant decomp 字段
+// ---------------------------------------------------------------------------
+static int test_mg_tree_guards()
+{
+    lbm::MgTree tree({0, 63, 0, 63, 0, 0}, lbm::MgDim::D2);
+    auto* root = tree.root();
+    bool ok = true;
+
+    // refine_ratio > 1024 应抛出异常
+    bool threw = false;
+    try {
+        tree.add_level(root, {0, 31, 0, 31, 0, 0}, 1025);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    ok &= threw;
+
+    // refine_ratio < 1 应抛出异常
+    threw = false;
+    try {
+        tree.add_level(root, {0, 31, 0, 31, 0, 0}, 0);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    ok &= threw;
+
+    // refine_ratio == 1024 应正常通过
+    bool noThrow = true;
+    try {
+        tree.add_level(root, {0, 31, 0, 31, 0, 0}, 1024);
+    } catch (...) {
+        noThrow = false;
+    }
+    ok &= noThrow;
+
+    // std::variant decomp 默认为 monostate（未绑定）
+    ok &= !root->has_decomp();
+
+    // 绑定 MpiDecomp2D*（仅测试类型安全，不测试 MPI 行为）
+    auto decomp2d = lbm::MpiDecomp2D::create(64, 64, 1, 1);
+    root->decomp = &decomp2d;
+    ok &= root->has_decomp();
+    ok &= std::holds_alternative<lbm::MpiDecomp2D*>(root->decomp);
+
+    // volume_ratio 用 long long 防溢出
+    auto* child = tree.nodes_at_level(1)[0];
+    const long long vr = child->volume_ratio();
+    ok &= (vr == 1024LL * 1024LL);  // D2: 1024^2
+
+    std::printf("[MgTree] overflow guards + std::variant decomp: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -1150,6 +1335,9 @@ int test_lbm_main()
     failures += test_mg_tree_basic();
     failures += test_mg_tree_traversal();
     failures += test_mpi_decomp3d_single_rank();
+    failures += test_mg_prolong_rho_u();
+    failures += test_mg_restrict_rho_u();
+    failures += test_mg_tree_guards();
     if (failures == 0)
         std::printf("1: All tests PASSED\n");
     return failures;

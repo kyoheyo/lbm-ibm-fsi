@@ -65,6 +65,29 @@ private:
 
     // Guo 体力格式 — 在碰撞过程中添加体力修正项
     void apply_guo_forcing(int node, const double* F, double* f_post);
+
+    /// MPI 幽灵层跳过控制（供 collide_bgk/collide_mrt 共用）
+    struct CollideGuard {
+        int  n_start   = 0;
+        int  n_end     = 0;
+        bool use_mpi2d = false;
+        int  gnx2d     = 0;
+        int  gny2d     = 0;
+        bool sg2d = false, ng2d = false, wg2d = false, eg2d = false;
+
+        /// 判断节点索引 i 是否属于幽灵层（二维模式时使用）
+        bool is_ghost(int i) const {
+            if (!use_mpi2d) return false;
+            const int ix = i % gnx2d;
+            const int iy = i / gnx2d;
+            if ((sg2d && iy == 0) || (ng2d && iy == gny2d - 1)) return true;
+            if ((wg2d && ix == 0) || (eg2d && ix == gnx2d - 1)) return true;
+            return false;
+        }
+    };
+
+    /// 计算碰撞时的幽灵层跳过参数（同时处理 1D 和 2D MPI 模式）
+    CollideGuard make_collide_guard() const;
 };
 
 } // namespace lbm

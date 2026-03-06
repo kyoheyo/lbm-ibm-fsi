@@ -541,6 +541,38 @@ int lbm_mg_node_child_count (const MgNodeHandle* h) {
     return h ? static_cast<int>(reinterpret_cast<const lbm::MgNode*>(h)->children.size()) : 0;
 }
 
+/// 延拓算子：从粗网格双线性插值 ρ/u 到细网格。
+/// 两个节点必须均已绑定 LatticeGrid（通过 lbm_mg_node_set_grid 设置）。
+/// 返回 0 表示成功，-1 表示参数错误。
+int lbm_mg_prolong_rho_u(const MgNodeHandle* coarse, MgNodeHandle* fine)
+{
+    if (!coarse || !fine) return -1;
+    try {
+        lbm::mg_prolong_rho_u(
+            *reinterpret_cast<const lbm::MgNode*>(coarse),
+            *reinterpret_cast<lbm::MgNode*>(fine));
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+/// 限制算子：从细网格体积平均 ρ/u 到粗网格。
+/// 两个节点必须均已绑定 LatticeGrid（通过 lbm_mg_node_set_grid 设置）。
+/// 返回 0 表示成功，-1 表示参数错误。
+int lbm_mg_restrict_rho_u(const MgNodeHandle* fine, MgNodeHandle* coarse)
+{
+    if (!fine || !coarse) return -1;
+    try {
+        lbm::mg_restrict_rho_u(
+            *reinterpret_cast<const lbm::MgNode*>(fine),
+            *reinterpret_cast<lbm::MgNode*>(coarse));
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 } // extern "C"
 
 // ===========================================================================

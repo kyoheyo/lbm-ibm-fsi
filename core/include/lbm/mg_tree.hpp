@@ -59,9 +59,11 @@
 #include <memory>
 #include <functional>
 #include <stdexcept>
+#include <variant>
 
-// 前向声明，避免在仅使用树结构时引入完整 LatticeGrid 头
-namespace lbm { struct LatticeGrid; }
+// 引入 LatticeGrid 及 MPI 域分解结构（MgNode 需要 MpiDecomp2D/3D 完整类型以使用 std::variant）
+#include "lattice.hpp"
+#include "mpi_decomp.hpp"
 
 namespace lbm {
 
@@ -138,11 +140,10 @@ struct MgNode {
     MgNode*      parent = nullptr; ///< 父节点（最粗节点的 parent==nullptr）
     std::vector<MgNode*> children; ///< 子节点（更细的嵌套网格块）
 
-    /// 可选 MPI 域分解句柄（nullptr=单进程）
-    /// 调用方负责管理生命周期；MgNode 不持有分解对象的所有权。
-    /// - 2D 时绑定 `MpiDecomp2D*`（从 `lbm_mpi_decomp2d_new()` 获取）
-    /// - 3D 时绑定 `MpiDecomp3D*`（预留，暂未实现幽灵交换）
-    void* decomp = nullptr;
+    /// 可选 MPI 域分解句柄（monostate=单进程）
+    /// MpiDecomp2D*：二维 XY 块分解；MpiDecomp3D*：三维 XYZ 块分解。
+    /// MgNode 不持有分解对象的所有权，调用方负责管理生命周期。
+    std::variant<std::monostate, MpiDecomp2D*, MpiDecomp3D*> decomp;
 
     // ---- 便捷查询方法 ----
 
@@ -155,15 +156,14 @@ struct MgNode {
     /// 是否为二维节点（z_start == z_end）
     bool is_2d()    const { return !extent.is_3d(); }
     /// 是否已绑定 MPI 域分解
-    bool has_decomp() const { return decomp != nullptr; }
+    bool has_decomp() const { return !std::holds_alternative<std::monostate>(decomp); }
 
-    /// 本层相对于全局根网格的体积加密比
+    /// 本层相对于全局根网格的体积加密比（返回 long long 防止溢出）
     /// D2: refine_ratio^2；D3: refine_ratio^3
-    int volume_ratio() const {
-        if (refine_ratio <= 1) return 1;
-        return (dim == MgDim::D3)
-            ? refine_ratio * refine_ratio * refine_ratio
-            : refine_ratio * refine_ratio;
+    long long volume_ratio() const {
+        if (refine_ratio <= 1) return 1LL;
+        const long long r = refine_ratio;
+        return (dim == MgDim::D3) ? r * r * r : r * r;
     }
 };
 
@@ -210,9 +210,11 @@ public:
     /// @param parent        父节点（细网格嵌套于其空间范围内，不可为 nullptr）
     /// @param child_extent  细网格在**全局坐标**中的空间范围（须是 parent->extent 的子集）
     /// @param refine_ratio  线性加密比（默认 2：每个粗格对应 2×2（2D）或 2×2×2（3D）个细格）
+    ///                      取值范围 [1, 1024]；超出范围抛出 std::invalid_argument。
     /// @return  新创建的子节点指针（由树管理，调用方不得 delete）
     ///
-    /// @throws std::invalid_argument 若 parent==nullptr 或 child_extent 不在 parent->extent 内
+    /// @throws std::invalid_argument 若 parent==nullptr、child_extent 不在 parent->extent 内，
+    ///         或 refine_ratio 超出 [1, 1024] 范围
     MgNode* add_level(MgNode* parent, MgExtent child_extent, int refine_ratio = 2);
 
     // ---- 遍历 ----
@@ -240,5 +242,44 @@ private:
     MgNode* root_ = nullptr;
     std::vector<std::unique_ptr<MgNode>> all_nodes_;  ///< 所有节点的所有权
 };
+
+// ---------------------------------------------------------------------------
+// AMR 粗-细网格数据传递算子
+//
+// 这些函数在多重网格步骤中传递宏观量（密度 ρ 和速度 u），用于：
+//   - 时间步细化（每步开始时，用粗网格 ρ/u 初始化细化边界层）
+//   - 粗网格修正（限制）：从细网格返回更新的 ρ/u 到粗网格
+//
+// 注意：这些算子仅传递宏观量（ρ, u），而非分布函数 f。
+// 如需传递完整分布函数（例如用于 AMR 初始化），需另行实现 f 的插值。
+// ---------------------------------------------------------------------------
+
+/// 延拓算子（Prolongation）：从粗网格双线性插值 ρ/u 到细网格。
+///
+/// 对 fine 节点覆盖范围内的每个细节点（if, jf），在粗网格上进行双线性插值：
+///   ρ_f(if,jf) = bilinear(ρ_c, px, py)
+///   u_f(if,jf) = bilinear(u_c, px, py)
+/// 其中 px = fine.extent.x_start + if/r（细节点在粗坐标系中的位置，
+/// 节点位于整数坐标处，与 LBM 节点布局一致）。
+///
+/// @pre coarse.has_grid() && fine.has_grid()
+/// @pre fine 是 coarse 的子节点（fine.extent ⊂ coarse.extent）
+/// @pre coarse.grid->nx == coarse.extent.nx()，fine.grid->nx == fine.extent.nx()*refine_ratio
+///
+/// @throws std::invalid_argument 若 grid 指针为 nullptr
+void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine);
+
+/// 限制算子（Restriction）：从细网格体积平均 ρ/u 到粗网格。
+///
+/// 对 coarse 节点中与 fine 重叠区域的每个粗格（ic, jc），
+/// 计算覆盖它的 r×r 个细格的简单平均：
+///   ρ_c(ic,jc) = mean(ρ_f[if0..if0+r-1][jf0..jf0+r-1])
+///   u_c(ic,jc) = mean(u_f[...])
+///
+/// @pre coarse.has_grid() && fine.has_grid()
+/// @pre fine 是 coarse 的子节点（fine.extent ⊂ coarse.extent）
+///
+/// @throws std::invalid_argument 若 grid 指针为 nullptr
+void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse);
 
 } // namespace lbm
