@@ -488,6 +488,63 @@ __global__ void bc_guo_extrap_east(double* f, const double* rho, const double* u
 }
 
 // ---------------------------------------------------------------------------
+// 7. 边角点半步长反弹修正（一次性处理全部 4 个角节点）
+//
+// 与 CPU 端 apply_corner_bounce_back() 逻辑完全对应（见 boundary.cpp §7）：
+//   在所有面 BC 核函数执行完毕后，对 4 个角节点的幽灵方向施加 f[a]=f_pre[opp(a)]。
+//
+// 线程映射：1 个 block，4 个线程，每线程处理 1 个角节点。
+//   tid=0 → SW(0,0)       幽灵方向：1,2,5,6,8
+//   tid=1 → SE(nx-1,0)    幽灵方向：2,3,5,6,7
+//   tid=2 → NW(0,ny-1)    幽灵方向：1,4,5,7,8
+//   tid=3 → NE(nx-1,ny-1) 幽灵方向：3,4,6,7,8
+// ---------------------------------------------------------------------------
+__global__ void bc_corner_bounce_back_all(double* f, const double* f_pre,
+                                           int nx, int ny)
+{
+    // 对立方向表：opp[a]
+    const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int n;
+    // 各角节点的幽灵方向（须由 BC 覆盖的 5 个方向）
+    if (tid == 0) {
+        // SW (0, 0)
+        n = 0;
+        const int ghosts[5] = {1, 2, 5, 6, 8};
+        for (int k = 0; k < 5; ++k) {
+            const int a = ghosts[k];
+            f[n*9 + a] = f_pre[n*9 + OPP[a]];
+        }
+    } else if (tid == 1) {
+        // SE (nx-1, 0)
+        n = nx - 1;
+        const int ghosts[5] = {2, 3, 5, 6, 7};
+        for (int k = 0; k < 5; ++k) {
+            const int a = ghosts[k];
+            f[n*9 + a] = f_pre[n*9 + OPP[a]];
+        }
+    } else if (tid == 2) {
+        // NW (0, ny-1)
+        n = (ny - 1) * nx;
+        const int ghosts[5] = {1, 4, 5, 7, 8};
+        for (int k = 0; k < 5; ++k) {
+            const int a = ghosts[k];
+            f[n*9 + a] = f_pre[n*9 + OPP[a]];
+        }
+    } else if (tid == 3) {
+        // NE (nx-1, ny-1)
+        n = (ny - 1) * nx + (nx - 1);
+        const int ghosts[5] = {3, 4, 6, 7, 8};
+        for (int k = 0; k < 5; ++k) {
+            const int a = ghosts[k];
+            f[n*9 + a] = f_pre[n*9 + OPP[a]];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GpuSolver 实现
 // ---------------------------------------------------------------------------
 
@@ -663,6 +720,12 @@ void GpuSolver::apply_boundary_conditions_on_stream(cudaStream_t s)
         default:
             break;
         }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 所有面 BC 核函数完成后，用角点半步长反弹修正 4 个角节点（对应 CPU 端逻辑）。
+    if (!bcs_.empty()) {
+        bc_corner_bounce_back_all<<<1, 4, 0, s>>>(d_f, d_f_tmp, nx_, ny_);
         CUDA_CHECK(cudaGetLastError());
     }
 }

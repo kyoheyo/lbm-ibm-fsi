@@ -607,6 +607,107 @@ static int test_mpi_virtual_two_rank_no_ghost_collision()
 }
 
 
+// 测试：边角点反弹修正（直接验证角节点幽灵方向使用 f_tmp 而非幽灵周期值）
+//
+// apply_corner_bounce_back() 应对每个角节点的幽灵方向满足 f[a] = f_tmp[opp(a)]。
+// 本测试在 ZouHe + BounceBack 组合下运行一步后，直接检验此不变量。
+//
+// 时序说明（与 solver.cpp 第 60–69 行一致）：
+//   step() 内部顺序：collide() → stream()（结束时 swap(f, f_tmp)）
+//                   → apply_boundary_conditions()（读 f_tmp，写 f）
+//                   → compute_macroscopic()（读 f，不修改 f）
+//   step() 结束后：
+//     g.f_tmp = 本步 collide 后、stream 前的值（apply_corner_bounce_back 的读来源）
+//     g.f     = BC + macroscopic 修正后的当前状态
+//   因此，不变量 f[ghost_a] == f_tmp[opp(a)] 在 step() 结束后严格成立，
+//   直到下一个 step() 的 collide() 修改 g.f 为止。
+//
+// 同时验证：
+//   (a) 4 个角节点的 f 值均有限（无 NaN/Inf）
+//   (b) 幽灵方向 f[a] == f_tmp[opp(a)]（角点修正的直接证据）
+static int test_corner_bounce_back_fix()
+{
+    const int nx = 16, ny = 16;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    const double omega = 1.0;
+    lbm::Solver solver(g, omega);
+
+    // 北壁 ZouHe 速度 BC（ux=0.1），其余三面 BounceBack
+    lbm::BoundaryCondition bc_north;
+    bc_north.type = lbm::BCType::ZouHe_Velocity;
+    bc_north.face = lbm::Face::North;
+    bc_north.ux   = 0.1;
+    bc_north.uy   = 0.0;
+    solver.add_boundary_condition(bc_north);
+
+    for (auto face : {lbm::Face::South, lbm::Face::West, lbm::Face::East}) {
+        lbm::BoundaryCondition bc_wall;
+        bc_wall.type = lbm::BCType::BounceBack;
+        bc_wall.face = face;
+        solver.add_boundary_condition(bc_wall);
+    }
+
+    // 先运行几步建立非零场，再做一步后检查
+    for (int t = 0; t < 10; ++t) solver.step();
+    // step() 返回后 g.f_tmp = 本步 collide-post/stream-pre 值（角点修正的读来源）
+    solver.step();
+
+    // 对立方向查找表
+    const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+    const char* corner_names[4] = {"SW(0,0)", "SE(nx-1,0)", "NW(0,ny-1)", "NE(nx-1,ny-1)"};
+    struct CornerInfo { int i, j; int ghosts[5]; };
+    CornerInfo corners[4] = {
+        {0,      0,      {1, 2, 5, 6, 8}},
+        {nx-1,   0,      {2, 3, 5, 6, 7}},
+        {0,      ny-1,   {1, 4, 5, 7, 8}},
+        {nx-1,   ny-1,   {3, 4, 6, 7, 8}},
+    };
+
+    bool ok = true;
+    constexpr double TOL = 1e-14;
+
+    for (int ci = 0; ci < 4; ++ci) {
+        const auto& c = corners[ci];
+        const int n = g.idx(c.i, c.j);
+        const double* f     = &g.f    [n * lbm::d2q9::Q];
+        const double* f_tmp = &g.f_tmp[n * lbm::d2q9::Q];
+
+        // (a) 所有 f 值有限
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            if (!std::isfinite(f[a])) {
+                std::printf("[LBM] corner BB fix: %s f[%d] not finite\n",
+                            corner_names[ci], a);
+                ok = false;
+            }
+        }
+
+        // (b) 幽灵方向满足 f[a] = f_tmp[opp(a)]（角点修正的直接验证）
+        for (int a : c.ghosts) {
+            const double diff = std::abs(f[a] - f_tmp[OPP[a]]);
+            if (diff > TOL) {
+                std::printf("[LBM] corner BB fix: %s f[%d]=%.6e != f_tmp[%d]=%.6e diff=%.2e\n",
+                            corner_names[ci], a, f[a], OPP[a], f_tmp[OPP[a]], diff);
+                ok = false;
+            }
+        }
+    }
+
+    // 全域 f 有限检查
+    for (int idx = 0; idx < g.size() * lbm::d2q9::Q; ++idx) {
+        if (!std::isfinite(g.f[idx])) {
+            std::printf("[LBM] corner BB fix: global f[%d] not finite\n", idx);
+            ok = false;
+            break;
+        }
+    }
+
+    std::printf("[LBM] corner BB fix (f[ghost]==f_tmp[opp]): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -618,6 +719,7 @@ int test_lbm_main()
     failures += test_zou_he_pressure_east();
     failures += test_fully_developed_east();
     failures += test_guo_extrapolation_west_velocity();
+    failures += test_corner_bounce_back_fix();
     failures += test_mpi_decomp_single_rank();
     failures += test_mpi_attach_no_effect();
     failures += test_mpi_halo_exchange_correctness();

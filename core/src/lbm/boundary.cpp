@@ -756,6 +756,78 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 
 
 // ---------------------------------------------------------------------------
+// 7. 边角点半步长反弹修正（内部辅助函数，自动在面 BC 后调用）
+//
+// 问题根源：
+//   push 流式迁移（以周期取模实现）后，4 个边角节点各有 5 个幽灵方向，
+//   这些方向的值来自对面边界的周期折叠，并非真实物理值。
+//   面 BC（如 ZouHe、Guo）的密度公式假设部分"已知"方向是来自流体内部的真值，
+//   但在角点处这些方向同样是幽灵值，导致密度计算偏差，进而产生错误的 f 值。
+//
+//   具体地，对 4 个角点，幽灵方向为：
+//     SW (0, 0)       : f[1](E), f[2](N), f[5](NE), f[6](NW), f[8](SE)
+//     SE (nx-1, 0)    : f[2](N), f[3](W), f[5](NE), f[6](NW), f[7](SW)
+//     NW (0, ny-1)    : f[1](E), f[4](S), f[5](NE), f[7](SW), f[8](SE)
+//     NE (nx-1, ny-1) : f[3](W), f[4](S), f[6](NW), f[7](SW), f[8](SE)
+//
+// 修正方案：
+//   在所有面 BC 完成后，对每个角节点的全部 5 个幽灵方向施加**半步长反弹**，
+//   使用 g.f_tmp（碰撞后、迁移前的值，不受任何面 BC 修改）覆盖由面 BC
+//   设置的近似值。公式为：f[a] = f_tmp[opp(a)]（见对立方向表）。
+//
+//   对于纯 BounceBack 面 BC 的配置，此步骤与面 BC 的结果完全一致（幂等）；
+//   对于 ZouHe、Guo 等面 BC，此步骤修正角点的幽灵方向为精确的无滑移反弹值。
+//
+// 物理意义：
+//   角点为两固壁的交汇奇点，在无滑移 Navier-Stokes 方程中速度为零。
+//   半步长反弹在角点处等价于强制施加 u = 0 边界条件，物理上始终正确。
+// ---------------------------------------------------------------------------
+static void apply_corner_bounce_back(LatticeGrid& g)
+{
+    if (g.model != LatticeModel::D2Q9) return;
+
+    const int nx = g.nx;
+    const int ny = g.ny;
+
+    // 对立方向查找表（D2Q9）
+    // 0↔0, 1↔3, 2↔4, 3↔1, 4↔2, 5↔7, 6↔8, 7↔5, 8↔6
+    static const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+    // --- SW 角 (0, 0)：幽灵方向 1,2,5,6,8 ---
+    {
+        const int n = g.idx(0, 0);
+        double*       f  = &g.f    [n * d2q9::Q];
+        const double* fp = &g.f_tmp[n * d2q9::Q];
+        for (int a : {1, 2, 5, 6, 8}) f[a] = fp[OPP[a]];
+    }
+
+    // --- SE 角 (nx-1, 0)：幽灵方向 2,3,5,6,7 ---
+    {
+        const int n = g.idx(nx - 1, 0);
+        double*       f  = &g.f    [n * d2q9::Q];
+        const double* fp = &g.f_tmp[n * d2q9::Q];
+        for (int a : {2, 3, 5, 6, 7}) f[a] = fp[OPP[a]];
+    }
+
+    // --- NW 角 (0, ny-1)：幽灵方向 1,4,5,7,8 ---
+    {
+        const int n = g.idx(0, ny - 1);
+        double*       f  = &g.f    [n * d2q9::Q];
+        const double* fp = &g.f_tmp[n * d2q9::Q];
+        for (int a : {1, 4, 5, 7, 8}) f[a] = fp[OPP[a]];
+    }
+
+    // --- NE 角 (nx-1, ny-1)：幽灵方向 3,4,6,7,8 ---
+    {
+        const int n = g.idx(nx - 1, ny - 1);
+        double*       f  = &g.f    [n * d2q9::Q];
+        const double* fp = &g.f_tmp[n * d2q9::Q];
+        for (int a : {3, 4, 6, 7, 8}) f[a] = fp[OPP[a]];
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // 应用所有已注册的边界条件
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
@@ -786,6 +858,13 @@ void apply_boundary_conditions(LatticeGrid& grid,
                 // 周期边界在流式迁移的周期性取模中隐式处理
                 break;
         }
+    }
+
+    // 所有面 BC 完成后，对 4 个角节点施加半步长反弹修正：
+    // 覆盖面 BC 中因使用幽灵值而引入的近似误差（ZouHe/Guo 角点误差修正）。
+    // 对纯 BounceBack 配置此步骤幂等（无副作用）。
+    if (!bcs.empty()) {
+        apply_corner_bounce_back(grid);
     }
 }
 
