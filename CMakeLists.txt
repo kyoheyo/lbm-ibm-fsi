@@ -31,6 +31,20 @@ endif()
 if(ENABLE_MPI)
     find_package(MPI REQUIRED)
     message(STATUS "MPI found: ${MPI_CXX_COMPILER}")
+
+    # Write MPI link info so that bindings/build.rs can emit the correct
+    # cargo:rustc-link-lib / cargo:rustc-link-search directives.  Without
+    # this, the Rust final-link step leaves MPI symbols unresolved, producing
+    # LNK1120 (Windows) or undefined-symbol errors (Linux/macOS).
+    set(_mpi_link_content "")
+    foreach(_lib ${MPI_CXX_LIBRARIES})
+        string(APPEND _mpi_link_content "lib:${_lib}\n")
+    endforeach()
+    foreach(_dir ${MPI_CXX_LIBRARY_DIRS})
+        string(APPEND _mpi_link_content "search:${_dir}\n")
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/mpi_link.txt" "${_mpi_link_content}")
+    install(FILES "${CMAKE_BINARY_DIR}/mpi_link.txt" DESTINATION .)
 endif()
 
 if(ENABLE_OPENMP)

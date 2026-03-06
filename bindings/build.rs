@@ -40,10 +40,67 @@ fn main() {
         _               => println!("cargo:rustc-link-lib=stdc++"), // Linux/FreeBSD 等使用 libstdc++
     }
 
-    // 步骤 7：增量构建守卫
+    // 步骤 7：当 MPI 启用时链接 MPI 库
+    // CMakeLists.txt 在构建时将 MPI 链接信息写入 <dst>/mpi_link.txt，
+    // 此处解析该文件并向 rustc 发出链接搜索路径 / 库名指令。
+    // 若不这样做，Rust 最终链接步骤会因 MPI 符号未解析而失败
+    // （Windows: LNK1120，Linux: undefined symbol）。
+    let mpi_val = std::env::var("LBM_ENABLE_MPI").unwrap_or_else(|_| "OFF".into());
+    let mpi_enabled = matches!(mpi_val.to_uppercase().as_str(), "ON" | "1" | "TRUE" | "YES");
+    if mpi_enabled {
+        let mpi_file = dst.join("mpi_link.txt");
+        if mpi_file.exists() {
+            let info = std::fs::read_to_string(&mpi_file)
+                .unwrap_or_else(|e| panic!("Failed to read {:?}: {}", mpi_file, e));
+            for line in info.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(dir) = line.strip_prefix("search:") {
+                    if !dir.is_empty() {
+                        println!("cargo:rustc-link-search=native={}", dir);
+                    }
+                } else if let Some(lib_spec) = line.strip_prefix("lib:") {
+                    if !lib_spec.is_empty() {
+                        emit_mpi_lib(lib_spec);
+                    }
+                }
+            }
+        }
+    }
+
+    // 步骤 8：增量构建守卫
     println!("cargo:rerun-if-changed=../core/src");
     println!("cargo:rerun-if-changed=../core/include");
     println!("cargo:rerun-if-env-changed=LBM_ENABLE_MPI");
     println!("cargo:rerun-if-env-changed=LBM_ENABLE_OPENMP");
     println!("cargo:rerun-if-env-changed=LBM_ENABLE_CUDA");
+}
+
+/// 将 CMake 给出的 MPI 库规格转换为 `cargo:rustc-link-*` 指令。
+///
+/// CMake FindMPI 模块通常给出以下两种形式之一：
+/// - 完整路径：`/usr/lib/x86_64-linux-gnu/libmpi.so`（Linux）
+///             `C:/Program Files (x86)/Microsoft SDKs/MPI/Lib/x64/msmpi.lib`（Windows MS-MPI）
+/// - 纯库名：  `mpi`、`msmpi`
+fn emit_mpi_lib(spec: &str) {
+    let p = std::path::Path::new(spec);
+    if p.is_absolute() {
+        // 完整路径：将目录加入搜索路径，将文件茎作为库名
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+        }
+        if let Some(stem) = p.file_stem() {
+            let name = stem.to_string_lossy();
+            // 去掉 Unix 惯例的 "lib" 前缀（例如 "libmpi" → "mpi"）
+            let lib_name = name.strip_prefix("lib").unwrap_or(&name);
+            println!("cargo:rustc-link-lib={}", lib_name);
+        }
+    } else {
+        // 纯库名，直接透传
+        println!("cargo:rustc-link-lib={}", spec);
+    }
 }
