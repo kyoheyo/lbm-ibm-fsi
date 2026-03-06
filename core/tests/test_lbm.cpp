@@ -830,6 +830,79 @@ static int test_corner_bounce_back_skip_nonwall()
 }
 
 
+// 测试：速度入口角节点不被相邻 FullyDeveloped BC 覆盖
+//
+// 问题描述（已修复）：
+//   若按注册顺序施加边界条件，West=ZouHe_Velocity 先执行后，
+//   South/North=FullyDeveloped 会将角节点 (0,0) 和 (0,ny-1) 的 ALL f[a]
+//   替换为 j=1 / j=ny-2 行的值，销毁 ZouHe 的入口约束。
+//   修复方案：三轮优先级排序（FD/FO → BB → ZouHe/Guo），ZouHe 最后施加。
+//
+// 测试方案：
+//   配置：West=ZouHe_Velocity(ux=0.05), East=FullyDeveloped,
+//         South=FullyDeveloped, North=FullyDeveloped。
+//   运行 500 步后，West 面所有节点（含角节点 j=0, j=ny-1）的
+//   g.u[i=0, j] 均应满足 ux ≈ 0.05 (±1%容差)。
+//   若优先级排序缺失，角节点的 f[1,5,8] 被 FD 覆盖，ZouHe 公式失效，
+//   角节点的 ux 会偏离 0.05（通常偏高或不稳定）。
+static int test_inlet_corner_not_overwritten_by_fd()
+{
+    const int nx = 20, ny = 10;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    const double omega = 1.2;  // ν = (1/omega - 0.5)/3 ≈ 0.083
+    lbm::Solver solver(g, omega);
+
+    // West: Zou-He 速度入口
+    lbm::BoundaryCondition bc_west;
+    bc_west.type = lbm::BCType::ZouHe_Velocity;
+    bc_west.face = lbm::Face::West;
+    bc_west.ux   = 0.05;
+    bc_west.uy   = 0.0;
+    solver.add_boundary_condition(bc_west);
+
+    // East / South / North: 充分发展出口（自由出口，零法向梯度）
+    for (auto face : {lbm::Face::East, lbm::Face::South, lbm::Face::North}) {
+        lbm::BoundaryCondition bc;
+        bc.type = lbm::BCType::FullyDeveloped;
+        bc.face = face;
+        solver.add_boundary_condition(bc);
+    }
+
+    for (int t = 0; t < 500; ++t) solver.step();
+
+    // 验证 West 面（i=0）所有行的 ux 接近 0.05（含角节点 j=0 和 j=ny-1）
+    // 容差选取依据：ny=10, omega=1.2（ν≈0.083）, Re=ux*ny/ν≈6；
+    // 流动发展长度 ~0.06*Re*ny ≈ 4 格点 << nx=20，500 步已充分收敛。
+    // 全域 FD 出口（无压力参考）的稳态速度应精确等于 ZouHe 规定值（1% 容差）。
+    const double UX_TARGET = 0.05;
+    const double TOL = UX_TARGET * 0.01;   // 1% 容差，经收敛分析验证合理
+    bool inlet_ok = true;
+    for (int j = 0; j < ny; ++j) {
+        const int n   = g.idx(0, j);
+        const double ux = g.u[n * 2 + 0];
+        if (std::abs(ux - UX_TARGET) > TOL) {
+            std::printf("[LBM] inlet corner: j=%d ux=%.6f (expected %.4f ± %.4f)\n",
+                        j, ux, UX_TARGET, TOL);
+            inlet_ok = false;
+        }
+    }
+
+    // 验证所有 f 有限
+    bool finite_ok = true;
+    for (int idx = 0; idx < g.size() * lbm::d2q9::Q; ++idx) {
+        if (!std::isfinite(g.f[idx])) { finite_ok = false; break; }
+    }
+
+    const bool ok = inlet_ok && finite_ok;
+    std::printf("[LBM] inlet corner not overwritten by FD: "
+                "inlet_ux_ok=%s finite=%s → %s\n",
+                inlet_ok ? "yes" : "NO", finite_ok ? "yes" : "NO",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -843,6 +916,7 @@ int test_lbm_main()
     failures += test_guo_extrapolation_west_velocity();
     failures += test_corner_bounce_back_fix();
     failures += test_corner_bounce_back_skip_nonwall();
+    failures += test_inlet_corner_not_overwritten_by_fd();
     failures += test_mpi_decomp_single_rank();
     failures += test_mpi_attach_no_effect();
     failures += test_mpi_halo_exchange_correctness();

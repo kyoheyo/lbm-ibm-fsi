@@ -849,10 +849,38 @@ static void apply_corner_bounce_back(LatticeGrid& g, unsigned wall_face_bits)
 
 // ---------------------------------------------------------------------------
 // 应用所有已注册的边界条件
+//
+// 施加顺序（优先级由低到高，高优先级 BC 最后施加以覆盖角节点处的低优先级值）：
+//
+//   第一轮 — FullyDeveloped / FreeOutlet（零法向梯度外推，最弱约束）
+//             对整个面（含角节点）执行拷贝，为角节点提供一个"兜底"的背景值。
+//
+//   第二轮 — BounceBack / BounceBackFullWay（固壁反弹，中等约束）
+//             覆盖固壁面的幽灵方向，第一轮在固壁面上的零梯度值被修正为无滑移值。
+//
+//   第三轮 — ZouHe_Velocity / ZouHe_Pressure / Guo_Extrapolation（最强约束）
+//             最后施加，确保入/出口规定的速度或压力在角节点处不被第一轮覆盖。
+//
+// 设计动机（角节点冲突问题）：
+//   push 流式迁移后，每个角节点同时属于两个面，各自有对应的幽灵方向。
+//   若注册了 West=ZouHe_Velocity 和 South=FullyDeveloped，且 FullyDeveloped
+//   在 ZouHe 之后执行，则 FD 会将 SW 角节点的 ALL f[a] 替换为 j=1 行的值，
+//   销毁 ZouHe 精心计算的入口 f 值，导致入口角节点速度约束失效。
+//   三轮优先级排序确保 ZouHe/Guo 始终"最后说话"，角节点处入口 BC 正确生效。
+//
+// 注意：各轮内部按注册顺序执行，保持用户对同一优先级内多个 BC 的顺序语义。
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
                                 const std::vector<BoundaryCondition>& bcs)
 {
+    // ---- 第一轮：FullyDeveloped / FreeOutlet ----
+    for (const auto& bc : bcs) {
+        if (bc.type == BCType::FullyDeveloped || bc.type == BCType::FreeOutlet) {
+            apply_fully_developed(grid, bc.face);
+        }
+    }
+
+    // ---- 第二轮：BounceBack / BounceBackFullWay ----
     for (const auto& bc : bcs) {
         switch (bc.type) {
             case BCType::BounceBack:
@@ -861,21 +889,27 @@ void apply_boundary_conditions(LatticeGrid& grid,
             case BCType::BounceBackFullWay:
                 apply_bounce_back_fullway(grid, bc.face);
                 break;
+            default:
+                break;
+        }
+    }
+
+    // ---- 第三轮：ZouHe / Guo（最强约束，最后施加） ----
+    for (const auto& bc : bcs) {
+        switch (bc.type) {
             case BCType::ZouHe_Velocity:
                 apply_zou_he_velocity(grid, bc);
                 break;
             case BCType::ZouHe_Pressure:
                 apply_zou_he_pressure(grid, bc);
                 break;
-            case BCType::FullyDeveloped:
-            case BCType::FreeOutlet:
-                apply_fully_developed(grid, bc.face);
-                break;
             case BCType::Guo_Extrapolation:
                 apply_guo_extrapolation(grid, bc);
                 break;
             case BCType::Periodic:
                 // 周期边界在流式迁移的周期性取模中隐式处理
+                break;
+            default:
                 break;
         }
     }
