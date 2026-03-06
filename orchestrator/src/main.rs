@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use config::Config;
-use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face,
-                   mpi_rank, mpi_size, mpi_local_ny};
+use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face};
 
 // ---------------------------------------------------------------------------
 /// LBM + IBM + FSI 求解器
@@ -200,25 +199,51 @@ fn main() -> Result<()> {
     let rank   = lbm_bindings::mpi_rank();
     let nprocs = lbm_bindings::mpi_size();
 
-    // 确定本进程实际使用的网格尺寸
-    let (grid_nx, grid_ny, grid_nz) = match cfg.mpi.mode.as_str() {
+    // -----------------------------------------------------------------------
+    // 提前创建 MPI 分解对象（同时用于确定本地网格尺寸和绑定到求解器），
+    // 声明持有者以延长生命周期到仿真循环结束
+    // -----------------------------------------------------------------------
+    let mut _decomp1d: Option<lbm_bindings::LbmMpiDecomp>   = None;
+    let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
+
+    // 标记：若 2d_xy 验证失败，降级到 1d_y
+    let effective_mode: &str = {
+        let px = cfg.mpi.nx_blocks as i32;
+        let py = cfg.mpi.ny_blocks as i32;
+        if cfg.mpi.mode == "2d_xy" && px * py != nprocs {
+            eprintln!(
+                "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
+                 Falling back to 1d_y decomposition.",
+                px, py, px * py, nprocs
+            );
+            "1d_y"
+        } else {
+            cfg.mpi.mode.as_str()
+        }
+    };
+
+    match effective_mode {
         "2d_xy" => {
-            // 二维块分解：本进程的 nx/ny 由 LbmMpiDecomp2D 计算
             let px = cfg.mpi.nx_blocks as i32;
             let py = cfg.mpi.ny_blocks as i32;
-            if px * py != nprocs {
-                eprintln!(
-                    "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
-                     Falling back to 1d_y decomposition.",
-                    px, py, px * py, nprocs
-                );
-                // Fallback：使用 1D Y 分解
-                let (gny, _, _) = lbm_bindings::mpi_local_ny(cfg.fluid.ny as i32);
-                (cfg.fluid.nx as i32, gny, cfg.fluid.nz as i32)
-            } else if let Some(d2) = lbm_bindings::LbmMpiDecomp2D::new(
-                cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py)
-            {
-                (d2.grid_nx(), d2.grid_ny(), cfg.fluid.nz as i32)
+            _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py);
+        }
+        "multi_grid" => {
+            // 无 MPI 通信，不创建任何分解对象
+        }
+        _ => {
+            // "1d_y"（默认）
+            _decomp1d = lbm_bindings::LbmMpiDecomp::new(
+                cfg.fluid.nx as i32, cfg.fluid.ny as i32);
+        }
+    }
+
+    // 确定本进程实际使用的网格尺寸（从已创建的分解对象中读取，或计算 1D 值）
+    let (grid_nx, grid_ny, grid_nz) = match effective_mode {
+        "2d_xy" => {
+            if let Some(ref d) = _decomp2d {
+                (d.grid_nx(), d.grid_ny(), cfg.fluid.nz as i32)
             } else {
                 // MPI 未启用时退化为全局网格
                 (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
@@ -229,7 +254,7 @@ fn main() -> Result<()> {
             (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
         }
         _ => {
-            // "1d_y"（默认）：Y 方向一维切片
+            // "1d_y"（默认）
             let (gny, _, _) = lbm_bindings::mpi_local_ny(cfg.fluid.ny as i32);
             (cfg.fluid.nx as i32, gny, cfg.fluid.nz as i32)
         }
@@ -246,31 +271,12 @@ fn main() -> Result<()> {
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
 
     // -----------------------------------------------------------------------
-    // MPI 域分解绑定：根据模式创建并绑定 MpiDecomp 或 MpiDecomp2D
+    // MPI 域分解绑定：将已创建的分解对象绑定到求解器
     // -----------------------------------------------------------------------
-    // 声明持有者以延长生命周期到仿真循环结束
-    let mut _decomp1d: Option<lbm_bindings::LbmMpiDecomp>   = None;
-    let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
-
-    match cfg.mpi.mode.as_str() {
+    match effective_mode {
         "2d_xy" => {
-            let px = cfg.mpi.nx_blocks as i32;
-            let py = cfg.mpi.ny_blocks as i32;
-            if px * py == nprocs {
-                if let Some(mut d) = lbm_bindings::LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py)
-                {
-                    solver.attach_mpi2d(Some(&mut d));
-                    _decomp2d = Some(d);
-                }
-            } else {
-                // 已在上方打印警告，退化为 1D
-                if let Some(mut d) = lbm_bindings::LbmMpiDecomp::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32)
-                {
-                    solver.attach_mpi(Some(&mut d));
-                    _decomp1d = Some(d);
-                }
+            if let Some(ref mut d) = _decomp2d {
+                solver.attach_mpi2d(Some(d));
             }
         }
         "multi_grid" => {
@@ -278,11 +284,8 @@ fn main() -> Result<()> {
         }
         _ => {
             // "1d_y"（默认）
-            if let Some(mut d) = lbm_bindings::LbmMpiDecomp::new(
-                cfg.fluid.nx as i32, cfg.fluid.ny as i32)
-            {
-                solver.attach_mpi(Some(&mut d));
-                _decomp1d = Some(d);
+            if let Some(ref mut d) = _decomp1d {
+                solver.attach_mpi(Some(d));
             }
         }
     }

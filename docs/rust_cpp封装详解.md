@@ -271,6 +271,34 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 | `lbm_solver_step_n(s, g, step, dt)` | 带时间信息版本 | void |
 | `lbm_set_plugins(…8 个参数…)` | 更新 PluginRegistry 单例 | void |
 
+**MPI 并行接口（需 `ENABLE_MPI=ON` 编译）**
+
+| C ABI 函数 | 对应 Rust 函数 | C++ 操作 | 说明 |
+|-----------|--------------|---------|------|
+| `lbm_mpi_init()` | `mpi_init()` | `MPI_Init(…)` | 初始化 MPI（幂等） |
+| `lbm_mpi_finalize()` | `mpi_finalize()` | `MPI_Finalize()` | 结束 MPI |
+| `lbm_mpi_rank()` | `mpi_rank()` | `MPI_Comm_rank(…)` | 当前进程编号 |
+| `lbm_mpi_size()` | `mpi_size()` | `MPI_Comm_size(…)` | 进程总数 |
+| `lbm_mpi_local_ny(gny, &yst, &lny)` | `mpi_local_ny(gny)` → `(grid_ny, y_start, local_ny)` | 均匀分配 Y 行 | 一维切片本地 ny 计算 |
+| `lbm_mpi_decomp_new(gnx, gny)` | `LbmMpiDecomp::new(gnx, gny)` | `new MpiDecomp(…)` | 创建一维分解 |
+| `lbm_mpi_decomp_free(h)` | `Drop for LbmMpiDecomp` | `delete h` | 释放一维分解 |
+| `lbm_solver_attach_mpi(s, h)` | `LbmSolver::attach_mpi(d)` | `s->attach_mpi(h)` | 绑定一维分解（自动 halo 交换）|
+| `lbm_mpi_decomp2d_new(gnx, gny, px, py)` | `LbmMpiDecomp2D::new(gnx, gny, px, py)` | `new MpiDecomp2D(…)` | 创建二维块分解 |
+| `lbm_mpi_decomp2d_free(h)` | `Drop for LbmMpiDecomp2D` | `delete h` | 释放二维块分解 |
+| `lbm_solver_attach_mpi2d(s, h)` | `LbmSolver::attach_mpi2d(d)` | `s->attach_mpi2d(h)` | 绑定二维分解（自动 2D halo 交换）|
+| `lbm_mpi_decomp2d_grid_nx(h)` | `LbmMpiDecomp2D::grid_nx()` | `h->grid_nx()` | 本地含幽灵列 nx |
+| `lbm_mpi_decomp2d_grid_ny(h)` | `LbmMpiDecomp2D::grid_ny()` | `h->grid_ny()` | 本地含幽灵行 ny |
+| `lbm_mpi_decomp2d_x_start(h)` | `LbmMpiDecomp2D::x_start()` | `h->x_start` | 全局 X 起始坐标 |
+| `lbm_mpi_decomp2d_y_start(h)` | `LbmMpiDecomp2D::y_start()` | `h->y_start` | 全局 Y 起始坐标 |
+
+**OpenMP 接口（需 `ENABLE_OPENMP=ON` 编译）**
+
+| C ABI 函数 | 对应 Rust 函数 | 说明 |
+|-----------|--------------|------|
+| `lbm_omp_set_num_threads(n)` | `set_omp_num_threads(n)` | 设置 OMP 线程数（等价于 `omp_set_num_threads()`）；n≤0 无操作 |
+| `lbm_openmp_enabled()` | — | 返回 1 表示编译时启用了 OpenMP |
+| `lbm_openmp_max_threads()` | — | 返回当前最大线程数（`omp_get_max_threads()`） |
+
 **GPU 求解器（`lbm_gpu_*`，需 `ENABLE_CUDA=ON` 编译）**
 
 | C ABI 函数 | C++ 内部操作 | 返回 |
@@ -441,10 +469,71 @@ impl From<LatticeModel> for ffi::LatticeModelC {
 ```rust
 unsafe impl Send for LbmGrid {}
 unsafe impl Send for LbmSolver {}
+unsafe impl Send for LbmMpiDecomp {}
+unsafe impl Send for LbmMpiDecomp2D {}
 ```
 
 Rust 默认不允许含有裸指针的类型跨线程传递（`*mut T` 没有实现 `Send`）。  
-这里手动标注 `Send` 的**含义**是：我们（作为封装作者）承诺——C++ 的 `LatticeGrid` 在堆上分配，指针不会被多个线程同时修改（调用方必须保证同步）。
+这里手动标注 `Send` 的**含义**是：我们（作为封装作者）承诺——C++ 的对象在堆上分配，指针不会被多个线程同时修改（调用方必须保证同步）。
+
+### 6.5 MPI 封装类型
+
+#### LbmMpiDecomp — 一维 Y 方向域分解
+
+```rust
+/// 持有堆上的 C++ MpiDecomp 对象（一维 Y 切片）
+pub struct LbmMpiDecomp { ptr: *mut ffi::MpiDecompHandle }
+
+impl LbmMpiDecomp {
+    /// 创建一维 Y 方向域分解（需先调用 mpi_init()）
+    /// 未启用 MPI 时返回 None
+    pub fn new(global_nx: i32, global_ny: i32) -> Option<Self>;
+}
+```
+
+#### LbmMpiDecomp2D — 二维 XY 块分解
+
+```rust
+/// 持有堆上的 C++ MpiDecomp2D 对象（二维 XY 块分解）
+pub struct LbmMpiDecomp2D { ptr: *mut ffi::MpiDecomp2DHandle }
+
+impl LbmMpiDecomp2D {
+    /// 创建 px×py 二维块分解（需先调用 mpi_init()）
+    /// px * py 必须等于 MPI 进程总数；否则返回 None
+    pub fn new(global_nx: i32, global_ny: i32, px: i32, py: i32) -> Option<Self>;
+    pub fn grid_nx(&self) -> i32;      // 本地含幽灵列的 nx
+    pub fn grid_ny(&self) -> i32;      // 本地含幽灵行的 ny
+    pub fn x_start(&self) -> i32;     // 全局 X 起始坐标
+    pub fn y_start(&self) -> i32;     // 全局 Y 起始坐标
+}
+```
+
+#### LbmSolver 扩展方法
+
+```rust
+impl LbmSolver {
+    /// 绑定一维 Y 切片分解（之后 step() 自动执行南北幽灵行交换）
+    pub fn attach_mpi(&mut self, decomp: Option<&mut LbmMpiDecomp>);
+
+    /// 绑定二维 XY 块分解（之后 step() 自动执行四向幽灵层交换）
+    pub fn attach_mpi2d(&mut self, decomp: Option<&mut LbmMpiDecomp2D>);
+}
+```
+
+#### set_omp_num_threads — OpenMP 线程数设置
+
+```rust
+/// 设置 OpenMP 线程数（进程内即时生效，优先级高于 OMP_NUM_THREADS 环境变量）
+/// 若未以 LBM_ENABLE_OPENMP=ON 编译，此函数为空操作
+pub fn set_omp_num_threads(n: i32);
+```
+
+**与 `OMP_NUM_THREADS` 的对比**：
+
+| 方法 | 作用时机 | 优先级 | 适合场景 |
+|------|---------|--------|---------|
+| `set_omp_num_threads(n)` | 进程内即时（调用后立刻生效） | 高（覆盖环境变量） | TOML 配置驱动、代码控制 |
+| `OMP_NUM_THREADS=N` 环境变量 | 进程启动时 | 低（被 `omp_set_num_threads` 覆盖） | 外部脚本设置、SLURM 集群 |
 
 ---
 

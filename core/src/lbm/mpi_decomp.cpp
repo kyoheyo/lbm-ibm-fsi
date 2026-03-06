@@ -98,6 +98,17 @@ void halo_exchange_d2q9(LatticeGrid& g, const MpiDecomp& decomp)
 
 // ---------------------------------------------------------------------------
 // 辅助函数：计算 rank r 在均匀分布 total 个条目（nprocs 个进程）时的本地数量和起始索引
+//
+// 分配策略：前 (total % nprocs) 个进程各多分配一个条目（处理不整除情况）
+//   local_n = total/nprocs + (r < total%nprocs ? 1 : 0)
+//   start   = r * (total/nprocs) + min(r, total%nprocs)
+//
+// 参数：
+//   total    — 需要分配的条目总数（全局节点数 nx 或 ny）
+//   nprocs   — 参与分配的进程总数
+//   r        — 当前进程的坐标（0..nprocs-1），即 col_rank 或 row_rank
+//   local_n  — 输出：本进程分到的本地条目数
+//   start    — 输出：本进程在全局坐标中的起始索引
 // ---------------------------------------------------------------------------
 static void uniform_partition(int total, int nprocs, int r, int& local_n, int& start)
 {

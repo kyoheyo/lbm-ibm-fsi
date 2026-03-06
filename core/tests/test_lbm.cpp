@@ -903,6 +903,81 @@ static int test_inlet_corner_not_overwritten_by_fd()
 }
 
 
+// 测试：MpiDecomp2D 在单进程（无 MPI 构建）下的正确初始化
+//
+// 验证点：
+//   - nprocs == 1, rank == 0, px == 1, py == 1
+//   - col_rank == 0, row_rank == 0
+//   - local_nx == global_nx, local_ny == global_ny
+//   - has_south_wall() == true, has_north_wall() == true
+//   - has_west_wall()  == true, has_east_wall()  == true
+//   - 无任何幽灵层（has_*_ghost() == false）
+//   - grid_nx() == global_nx, grid_ny() == global_ny
+static int test_mpi_decomp2d_single_rank()
+{
+    const int gnx = 32, gny = 24;
+    const auto d = lbm::MpiDecomp2D::create(gnx, gny, 1, 1);
+
+    bool ok = true;
+    ok = ok && (d.nprocs   == 1);
+    ok = ok && (d.rank     == 0);
+    ok = ok && (d.px       == 1);
+    ok = ok && (d.py       == 1);
+    ok = ok && (d.col_rank == 0);
+    ok = ok && (d.row_rank == 0);
+    ok = ok && (d.local_nx == gnx);
+    ok = ok && (d.local_ny == gny);
+    ok = ok && (d.x_start  == 0);
+    ok = ok && (d.y_start  == 0);
+    ok = ok && (d.x_end    == gnx - 1);
+    ok = ok && (d.y_end    == gny - 1);
+    ok = ok && d.has_south_wall() && d.has_north_wall();
+    ok = ok && d.has_west_wall()  && d.has_east_wall();
+    ok = ok && !d.has_south_ghost() && !d.has_north_ghost();
+    ok = ok && !d.has_west_ghost()  && !d.has_east_ghost();
+    ok = ok && (d.grid_nx() == gnx);
+    ok = ok && (d.grid_ny() == gny);
+
+    std::printf("[MPI] MpiDecomp2D single-rank fields: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：attach_mpi2d() 在单进程模式下对仿真结果无影响
+//
+// 验证：attach_mpi2d() 在 nprocs==1 时是无操作，
+//   100 步仿真后与不绑定 2D 分解的结果完全一致（逐节点差异 < 1e-14）。
+static int test_mpi_attach_mpi2d_no_effect()
+{
+    const int nx = 16, ny = 16;
+    const double omega = 1.2;
+
+    // 基准：不绑定任何分解
+    lbm::LatticeGrid g_ref(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_ref.size(); ++i) g_ref.rho[i] = 1.0 + 0.01 * (i % 7);
+    lbm::Solver solver_ref(g_ref, omega);
+    for (int t = 0; t < 100; ++t) solver_ref.step();
+
+    // 对照：绑定 nprocs==1 的 MpiDecomp2D（px=1, py=1）
+    lbm::LatticeGrid g_2d(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_2d.size(); ++i) g_2d.rho[i] = 1.0 + 0.01 * (i % 7);
+    lbm::Solver solver_2d(g_2d, omega);
+    const auto decomp2d = lbm::MpiDecomp2D::create(nx, ny, 1, 1);
+    solver_2d.attach_mpi2d(&decomp2d);
+    for (int t = 0; t < 100; ++t) solver_2d.step();
+
+    constexpr double TOL = 1e-14;
+    bool ok = true;
+    for (int i = 0; i < g_ref.size() && ok; ++i) {
+        if (std::abs(g_ref.rho[i] - g_2d.rho[i]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 0] - g_2d.u[i * 2 + 0]) > TOL) { ok = false; break; }
+        if (std::abs(g_ref.u[i * 2 + 1] - g_2d.u[i * 2 + 1]) > TOL) { ok = false; break; }
+    }
+    std::printf("[MPI] attach_mpi2d single-rank no-op (results identical): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -921,5 +996,7 @@ int test_lbm_main()
     failures += test_mpi_attach_no_effect();
     failures += test_mpi_halo_exchange_correctness();
     failures += test_mpi_virtual_two_rank_no_ghost_collision();
+    failures += test_mpi_decomp2d_single_rank();
+    failures += test_mpi_attach_mpi2d_no_effect();
     return failures;
 }
