@@ -7,24 +7,24 @@
 namespace fsi {
 
 // ---------------------------------------------------------------------------
-// FSI coupling parameters
+// FSI 耦合参数
 // ---------------------------------------------------------------------------
 struct CouplingParams {
-    double dx;                    ///< Eulerian grid spacing
-    double dt;                    ///< Time step
-    ibm::DeltaKernel delta_kernel; ///< IBM delta-function kernel
-    int    sub_iterations;        ///< Inner iterations for implicit coupling (1 = explicit)
+    double dx;                    ///< 欧拉网格间距
+    double dt;                    ///< 时间步长
+    ibm::DeltaKernel delta_kernel; ///< IBM δ 函数核类型
+    int    sub_iterations;        ///< 隐式耦合的内迭代次数（1 = 显式）
 };
 
 // ---------------------------------------------------------------------------
-// Partitioned (explicit) FSI coupling step
+// 分区（显式）FSI 耦合步骤
 //
-//  Given the current state of the fluid grid and beam, one FSI sub-cycle is:
-//   1. Interpolate fluid velocity at IBM markers (velocity coupling)
-//   2. Move markers to match the interpolated velocity
-//   3. Compute IBM restoring force (penalty / direct-forcing)
-//   4. Spread IBM force back onto the Eulerian grid
-//   5. Advance the structural solver by dt
+//  给定流体网格和梁的当前状态，一个 FSI 子循环包含：
+//   1. 在 IBM 标记点处插值流体速度（速度耦合）
+//   2. 将标记点移动到匹配的插值速度位置
+//   3. 计算 IBM 恢复力（惩罚法 / 直接力法）
+//   4. 将 IBM 力展布回欧拉网格
+//   5. 将结构求解器推进 dt
 // ---------------------------------------------------------------------------
 void fsi_step(lbm::LatticeGrid& fluid,
               ibm::MarkerSet&   markers,
@@ -32,8 +32,8 @@ void fsi_step(lbm::LatticeGrid& fluid,
               const CouplingParams& params);
 
 // ---------------------------------------------------------------------------
-// Synchronise Lagrangian marker positions with the beam node positions
-// (call after the structural solver has advanced)
+// 将拉格朗日标记点位置与梁节点位置同步
+//（结构求解器推进后调用）
 // ---------------------------------------------------------------------------
 void sync_markers_from_beam(ibm::MarkerSet& markers,
                              const BeamSolver& beam);

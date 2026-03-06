@@ -81,6 +81,8 @@ def plot_velocity_magnitude(
     cmap: str = "viridis",
     add_colorbar: bool = True,
     figsize: tuple[float, float] = (8, 6),
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Filled-contour plot of velocity magnitude |u|.
@@ -92,15 +94,59 @@ def plot_velocity_magnitude(
     cmap        : Matplotlib colormap name
     add_colorbar: whether to draw a colourbar
     figsize     : figure size in inches
+    vmin, vmax  : explicit colour-range bounds (lattice units/step).
+                  When both are *None* (default) and the velocity field is
+                  nearly uniform (peak-to-peak variation < 1 % of the mean),
+                  the range is automatically clamped to ``[0, 1.5 × mean]``
+                  so that machine-precision noise (≤ 10⁻¹⁴) is not amplified
+                  into spurious visual artifacts such as fake velocity
+                  reversals or tree-like stripe patterns.
 
     Returns
     -------
     (fig, ax)
+
+    Notes
+    -----
+    The auto-clamp is only applied when *both* ``vmin`` and ``vmax`` are
+    ``None``.  To override it and zoom into sub-percent variations, pass
+    explicit numeric values, e.g. ``vmin=0.049, vmax=0.051``.
+    Passing ``None`` for either parameter keeps that bound at its default.
     """
     fig, ax = _make_fig("Velocity magnitude |u|", snap, figsize)
     x, y = _grid_axes(snap)
     mag = snap.velocity_magnitude()
-    cf = ax.contourf(x, y, mag, levels=n_levels, cmap=cmap)
+
+    # ------------------------------------------------------------------
+    # Smart normalisation: prevent matplotlib from auto-scaling to
+    # machine-precision noise when the velocity field is nearly uniform.
+    #
+    # Background: in a free-outlet / fully-developed-outlet channel, the
+    # steady state is essentially uniform flow (all |u| ≈ u_inlet).  After
+    # many thousand steps the peak-to-peak variation can drop to 10⁻¹⁵,
+    # well below double-precision epsilon relative to the mean.  Without
+    # explicit bounds, contourf auto-scales its colour range to this tiny
+    # interval, making invisible noise appear as dramatic velocity reversals
+    # or striped patterns that look physically wrong but are NOT.
+    #
+    # Heuristic: if rel. variation < 1 % of the mean, clamp to [0, 1.5·mean].
+    # ------------------------------------------------------------------
+    if vmin is None and vmax is None:
+        mean_mag = float(np.mean(mag))
+        if mean_mag > 1e-30:
+            rel_var = float(mag.max() - mag.min()) / mean_mag
+            if rel_var < 1e-2:
+                vmin = 0.0
+                vmax = mean_mag * 1.5
+
+    if vmin is not None or vmax is not None:
+        v0 = vmin if vmin is not None else float(mag.min())
+        v1 = vmax if vmax is not None else float(mag.max())
+        levels = np.linspace(v0, v1, n_levels)
+        cf = ax.contourf(x, y, mag, levels=levels, cmap=cmap, extend="both")
+    else:
+        cf = ax.contourf(x, y, mag, levels=n_levels, cmap=cmap)
+
     if add_colorbar:
         fig.colorbar(cf, ax=ax, label="|u| (lattice units/step)")
     return fig, ax
@@ -203,7 +249,10 @@ def plot_vorticity(
 
     if symmetric:
         v = np.abs(omega).max()
-        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v)
+        # Guard against all-zero (or machine-precision-only) vorticity,
+        # e.g. a uniform channel flow.  Using TwoSlopeNorm with v ≤ 1e-10
+        # would amplify 10⁻¹⁵ noise into visually prominent fake vortices.
+        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v) if v > 1e-10 else None
     else:
         norm = None
 

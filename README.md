@@ -71,7 +71,8 @@ lbm-ibm-fsi/
 │   │   └── analysis.py      # Drag/lift, Q-criterion, error norms, convergence
 │   ├── tests/               # pytest suite (105 tests)
 │   └── examples/
-│       └── lid_driven_cavity.py   # End-to-end pre/post example
+│       ├── lid_driven_cavity.py   # End-to-end pre/post example (synthetic data)
+│       └── plot_solver_output.py  # Visualise real solver NPZ output
 │
 └── configs/                 # Example TOML configuration files
     └── lid_driven_cavity.toml
@@ -198,6 +199,90 @@ PYTHONPATH=. python3 examples/lid_driven_cavity.py
 
 This generates config, mesh, synthetic snapshots, and five publication-ready plots in
 `python/examples/output/lid_cavity/`.
+
+### Visualising real solver output
+
+After building and running the solver:
+
+```bash
+# Build
+cargo build --release
+
+# Run the lid-driven cavity simulation
+./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml
+```
+
+The solver writes `output/lid_cavity/fluid_NNNNNN.npz` snapshots at every
+`write_interval` step.  To visualise the results:
+
+```bash
+# Plot from anywhere — the script finds the output directory automatically
+python3 python/examples/plot_solver_output.py
+
+# Or point at a specific directory
+python3 python/examples/plot_solver_output.py --input output/lid_cavity
+
+# Save plots to a separate directory
+python3 python/examples/plot_solver_output.py \
+    --input output/lid_cavity --output my_plots/
+```
+
+The `[python]` section already added to `configs/lid_driven_cavity.toml` wires
+`post_script` so that the solver runs this visualisation step automatically
+once the simulation loop finishes.
+
+Plots produced:
+
+| File | Contents |
+|------|----------|
+| `velocity_magnitude.png` | Filled contour of \|u\| = √(ux²+uy²) |
+| `streamlines.png` | Integrated streamlines coloured by \|u\| |
+| `vorticity.png` | Vorticity ωz = ∂uy/∂x − ∂ux/∂y |
+| `ux_profile.png` | ux vertical profile at cavity centre (x = nx/2) |
+| `uy_profile.png` | uy horizontal profile at cavity centre (y = ny/2) |
+| `monitor_velocity.png` | \|u\| time series at the centre monitor point |
+
+### MPI block decomposition output
+
+When running with MPI block decomposition (`mpi.mode = "block"`), each rank writes its
+partition snapshots to `output/<dir>/rank_N/fluid_NNNNNN.npz` with embedded position
+metadata (`x_start`, `y_start`, `global_nx`, `global_ny`).
+
+**Option 1 — In-simulation global output** (`combine_blocks = true` in TOML):
+
+```toml
+[output]
+combine_blocks = true   # rank-0 gathers all partitions and writes global snapshots
+```
+
+This writes complete global snapshots (`<dir>/fluid_*.npz/.dat/.plt`) during the
+simulation. If `plot_interval` is also set (with `--features python-ffi`), the FFI
+plots (velocity magnitude, vorticity, **streamlines**) also use the global combined
+field.
+
+**Option 2 — Post-simulation combining** (offline, after the run):
+
+```bash
+# Combine partition NPZ files into a single global NPZ
+python3 python/examples/combine_blocks.py --dir output/my_run
+
+# Or write combined output as ASCII Tecplot .dat
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt dat
+
+# Or binary Tecplot .plt
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt plt
+```
+
+Or directly from Python:
+
+```python
+from lbm_post.vtk_reader import combine_block_snapshots
+written = combine_block_snapshots("output/my_run", fmt="npz")
+```
+
+> **Note:** Post-simulation combining reads NPZ partition files (which contain position
+> metadata). If the solver wrote `.dat`/`.plt` partition files, use `combine_blocks = true`
+> during the run instead.
 
 ## References
 

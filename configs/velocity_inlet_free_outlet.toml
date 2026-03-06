@@ -1,0 +1,101 @@
+# 速度入口 + 三面自由出口（充分发展/零法向梯度）
+#
+# 适用场景：
+#   开放域（远场）模拟 — 西壁规定均匀速度，其余三面均施加充分发展出口，
+#   允许流体自由进出东、南、北三个边界，近似无界流场效果。
+#   典型应用：孤立障碍物（圆柱）绕流、射流扩散等不含固壁的外流问题。
+#
+# 已知限制（使用前请注意）：
+#   1. 无压力参考点：本配置不包含任何 Zou-He 压力边界条件，
+#      域内无固定压力参考；在超长时间积分中可能出现密度（压力）的缓慢漂移。
+#      若需要严格的压力参考，请将东壁改为 bc_type = "zou_he_pressure"
+#      （参见 configs/velocity_inlet_pressure_outlet.toml）。
+#   2. 边界角点处理：BC 施加顺序采用三轮优先级排序
+#      （FullyDeveloped → BounceBack → ZouHe/Guo），确保 ZouHe 入口 BC
+#      在角节点（SW、NW）处优先生效，不被自由出口 BC 覆盖。
+#   3. 南北面反流：若域内出现强回流，南北面自由出口可能出现逆向流入，
+#      建议适当扩大 ny 或在入口附近检查流场合理性。
+#   4. 可视化注意事项（"速度反弹"与"树状条纹"假象）：
+#      本配置稳态解为全域均匀来流（|u| ≈ 0.05），峰-峰变化量最终降至
+#      机器精度（≤ 10⁻¹⁴）。若使用 matplotlib 默认自动色标，将对这
+#      几乎为零的变化量进行全程拉伸，导致看起来像速度逆向或树状条纹
+#      ——这是纯粹的可视化假象，物理结果完全正确。
+#
+#      lbm_post.plot.plot_velocity_magnitude 已内置智能归一化：
+#      当峰-峰相对变化 < 1%（均匀流判据）时自动将色标范围固定为
+#      [0, 1.5 × 均值]，消除上述假象。若需手动指定范围可传入
+#      vmin / vmax 参数。
+
+[simulation]
+n_steps        = 30000
+dt             = 1.0
+lattice_model  = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 300                     # 流向长度（格点）
+ny   = 120                     # 展向高度 H（格点）；较大以减小侧边界对核心流的影响
+nz   = 1
+nu   = 0.05                    # 运动粘度；Re = ux × ny / nu = 0.05 × 120 / 0.05 = 120
+rho0 = 1.0
+
+  # 西壁（速度入口）：Zou-He 速度边界条件，均匀来流
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_velocity"
+  face    = "west"
+  ux      = 0.05               # 来流速度（格子单位）
+  uy      = 0.0
+
+  # 东壁（自由出口）：充分发展出口，零法向梯度
+  [[fluid.boundary_conditions]]
+  bc_type = "fully_developed"
+  face    = "east"
+
+  # 南壁（自由出口）：充分发展出口，零法向梯度；允许侧向流出
+  [[fluid.boundary_conditions]]
+  bc_type = "fully_developed"
+  face    = "south"
+
+  # 北壁（自由出口）：充分发展出口，零法向梯度；允许侧向流出
+  [[fluid.boundary_conditions]]
+  bc_type = "fully_developed"
+  face    = "north"
+
+[output]
+# 每隔 write_interval 步写出一个完整的流场快照文件（密度场 ρ、速度场 ux/uy）。
+write_interval = 1000
+
+# 快照输出目录。
+directory      = "output/velocity_inlet_free_outlet"
+
+# 输出格式：
+#   "tecplot_asc" → fluid_NNNNNN.dat  ASCII Tecplot POINT 格式，可用 ParaView/Tecplot 打开。
+#                   适合观测来流发展与自由出口边界附近的流场细节。（★ 本配置已启用）
+#   "npz"         → NumPy .npz 压缩归档，Python lbm_post 后处理首选。
+#   "tecplot_bin" → 二进制 Tecplot TDV112，文件体积最小。
+format         = "tecplot_asc"
+
+# Python FFI 进程内实时绘图（每隔 plot_interval 步生成速度幅值和涡量云图）。
+#
+# 使用前提：以 --features python-ffi 特性编译：
+#   cargo build --release --features python-ffi
+# 图像保存至 <directory>/vel_NNNNNN.png 和 vor_NNNNNN.png。
+# 未启用 python-ffi 特性时本行被忽略，.dat 快照仍正常输出。
+plot_interval  = 5000   # 每 5000 步（5 次 .dat 快照之后）绘制一次云图
+
+# 每步向 CSV 文件追加监控量（step, time, ke），便于检测无压力参考点配置下的密度漂移。
+# enable_csv_monitor = true
+
+# MPI 块分解时合并各分区为全局场（rank-0 写出），单进程模式下无效。
+# combine_blocks = true
+
+[python]
+# Python 解释器（Windows 通常为 "python"，Linux/macOS 通常为 "python3"）。
+interpreter = "python"
+
+# 仿真结束后自动执行的后处理脚本。
+# 脚本以 <directory> 为第一个位置参数，读取 .dat 文件并绘制速度云图、流线及自由出口细节。
+post_script = "python/examples/plot_solver_output.py"
+
+# 无需 pip install 即可导入 lbm_post 的 sys.path 追加目录。
+pythonpath  = "python"

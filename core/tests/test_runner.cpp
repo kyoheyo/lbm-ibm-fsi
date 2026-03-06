@@ -1,8 +1,8 @@
-// Minimal test runner — prints PASS/FAIL for each test
+// 最小测试运行器 — 逐一打印每个测试的 PASS/FAIL 结果
 #include <cstdio>
 #include <cstdlib>
 
-// Forward declarations
+// 前向声明
 int test_lbm_main();
 int test_ibm_main();
 int test_fsi_main();

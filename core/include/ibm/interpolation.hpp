@@ -5,17 +5,17 @@
 namespace ibm {
 
 // ---------------------------------------------------------------------------
-// Peskin's regularised delta function  φ(r) = (1/h)*φ̂(r/h)
-// Supported kernels:
-//   2-point (linear) — width 2h
-//   4-point (Peskin) — width 4h
+// Peskin 正则化 δ 函数  φ(r) = (1/h)*φ̂(r/h)
+// 支持的核函数：
+//   2 点（线性）— 支撑宽度 2h
+//   4 点（Peskin）— 支撑宽度 4h
 // ---------------------------------------------------------------------------
 enum class DeltaKernel { TwoPoint, FourPoint };
 
 // ---------------------------------------------------------------------------
-// Velocity interpolation:
+// 速度插值：
 //   u_IB(X) = Σ_{x} u(x) δ(x - X) Δx^dim
-// Maps Eulerian fluid velocity → Lagrangian marker velocity.
+// 将欧拉流体速度映射到拉格朗日标记点速度。
 // ---------------------------------------------------------------------------
 void interpolate_velocity(const lbm::LatticeGrid& grid,
                           MarkerSet& ms,
@@ -23,9 +23,9 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
                           DeltaKernel kernel = DeltaKernel::FourPoint);
 
 // ---------------------------------------------------------------------------
-// Force spreading:
+// 力展布：
 //   f(x) = Σ_{X} F(X) δ(x - X) ΔS
-// Spreads Lagrangian IBM force density → Eulerian body force field.
+// 将拉格朗日 IBM 力密度展布到欧拉体力场。
 // ---------------------------------------------------------------------------
 void spread_force(lbm::LatticeGrid& grid,
                   const MarkerSet& ms,
@@ -33,7 +33,7 @@ void spread_force(lbm::LatticeGrid& grid,
                   DeltaKernel kernel = DeltaKernel::FourPoint);
 
 // ---------------------------------------------------------------------------
-// 1-D delta-function kernel value
+// 一维 δ 函数核值
 // ---------------------------------------------------------------------------
 double delta_phi(double r, double h, DeltaKernel kernel);
 

@@ -6,48 +6,48 @@
 namespace lbm {
 
 // ---------------------------------------------------------------------------
-// Supported lattice models
+// 支持的格子模型
 // ---------------------------------------------------------------------------
 enum class LatticeModel {
-    D2Q9,   ///< 2-D, 9 velocities
-    D3Q19,  ///< 3-D, 19 velocities
-    D3Q27,  ///< 3-D, 27 velocities
+    D2Q9,   ///< 二维，9 个离散速度方向
+    D3Q19,  ///< 三维，19 个离散速度方向
+    D3Q27,  ///< 三维，27 个离散速度方向
 };
 
 // ---------------------------------------------------------------------------
-// D2Q9 compile-time constants
+// D2Q9 编译期常量
 // ---------------------------------------------------------------------------
 namespace d2q9 {
 
 constexpr int Q = 9;
 
-/// Discrete velocity vectors  [direction][dim]
+/// 离散速度向量  [方向编号][维度]
 constexpr std::array<std::array<int, 2>, Q> C = {{
-    { 0,  0},  // 0 — rest
-    { 1,  0},  // 1 — E
-    { 0,  1},  // 2 — N
-    {-1,  0},  // 3 — W
-    { 0, -1},  // 4 — S
-    { 1,  1},  // 5 — NE
-    {-1,  1},  // 6 — NW
-    {-1, -1},  // 7 — SW
-    { 1, -1},  // 8 — SE
+    { 0,  0},  // 0 — 静止
+    { 1,  0},  // 1 — E（东）
+    { 0,  1},  // 2 — N（北）
+    {-1,  0},  // 3 — W（西）
+    { 0, -1},  // 4 — S（南）
+    { 1,  1},  // 5 — NE（东北）
+    {-1,  1},  // 6 — NW（西北）
+    {-1, -1},  // 7 — SW（西南）
+    { 1, -1},  // 8 — SE（东南）
 }};
 
-/// Lattice weights
+/// 格子权重
 constexpr std::array<double, Q> W = {{
     4.0 / 9.0,
     1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
     1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
 }};
 
-/// Opposite direction look-up  (bounce-back)
+/// 反方向查找表（用于反弹边界条件）
 constexpr std::array<int, Q> OPP = {{0, 3, 4, 1, 2, 7, 8, 5, 6}};
 
 } // namespace d2q9
 
 // ---------------------------------------------------------------------------
-// D3Q19 compile-time constants
+// D3Q19 编译期常量
 // ---------------------------------------------------------------------------
 namespace d3q19 {
 
@@ -92,54 +92,54 @@ constexpr std::array<int, Q> OPP = {{
 } // namespace d3q19
 
 // ---------------------------------------------------------------------------
-// Generic LatticeGrid — stores distribution functions f[idx][q]
+// 通用格子网格 — 存储分布函数 f[节点索引][方向]
 // ---------------------------------------------------------------------------
 struct LatticeGrid {
-    int nx;       ///< Grid size in x
-    int ny;       ///< Grid size in y
-    int nz;       ///< Grid size in z (1 for 2-D)
-    int q;        ///< Number of discrete velocities
+    int nx;       ///< x 方向格子数
+    int ny;       ///< y 方向格子数
+    int nz;       ///< z 方向格子数（二维时为 1）
+    int q;        ///< 离散速度方向数
     LatticeModel model;
 
-    /// Flat storage: f[node_index * q + direction]
+    /// 平坦存储：f[节点索引 * q + 方向]
     std::vector<double> f;
-    /// Temporary buffer for streaming step
+    /// 流式迁移步骤的临时缓冲区
     std::vector<double> f_tmp;
 
-    /// Macroscopic density ρ at each node
+    /// 各节点处的宏观密度 ρ
     std::vector<double> rho;
-    /// Macroscopic velocity u at each node [node_index * dim]
+    /// 各节点处的宏观速度 u，存储格式：[节点索引 * 维度]
     std::vector<double> u;
 
-    /// Body-force density at each node [node_index * dim]
+    /// 各节点处的体力密度，存储格式：[节点索引 * 维度]
     std::vector<double> force;
 
     LatticeGrid() = default;
     LatticeGrid(int nx, int ny, int nz, LatticeModel model);
 
-    /// Total number of nodes
+    /// 节点总数
     [[nodiscard]] int size() const { return nx * ny * nz; }
 
-    /// Flat node index
+    /// 平坦节点索引
     [[nodiscard]] int idx(int i, int j, int k = 0) const {
         return i + nx * (j + ny * k);
     }
 
-    /// Spatial dimension
+    /// 空间维度
     [[nodiscard]] int dim() const {
         return (model == LatticeModel::D2Q9) ? 2 : 3;
     }
 
-    /// Compute macroscopic quantities from distribution functions
+    /// 由分布函数计算宏观量（密度与速度）
     void compute_macroscopic();
 };
 
 // ---------------------------------------------------------------------------
-// Maxwell–Boltzmann equilibrium distribution
+// Maxwell-Boltzmann 平衡分布函数
 // ---------------------------------------------------------------------------
 double f_eq(double w, double rho,
-            const double* c,   ///< lattice velocity vector (dim)
-            const double* u,   ///< fluid velocity (dim)
+            const double* c,   ///< 格子速度向量（维度分量）
+            const double* u,   ///< 流体速度（维度分量）
             int dim);
 
 } // namespace lbm

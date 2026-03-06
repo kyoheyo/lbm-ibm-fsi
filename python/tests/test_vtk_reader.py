@@ -1,5 +1,5 @@
 """
-Tests for lbm_post.vtk_reader — snapshot data structures and I/O.
+测试 lbm_post.vtk_reader —— 快照数据结构与 I/O（NPZ、ASCII Tecplot、二进制 Tecplot）。
 """
 
 import numpy as np
@@ -9,6 +9,8 @@ from lbm_post.vtk_reader import (
     FieldSnapshot,
     MarkerSnapshot,
     NpzReader,
+    TecplotAscReader,
+    TecplotBinReader,
     load_snapshot,
     make_synthetic_lid_cavity,
     save_snapshot_npz,
@@ -128,7 +130,7 @@ class TestLoadSnapshot:
     def test_unsupported_format_raises(self, tmp_path):
         p = tmp_path / "data.xyz"
         p.write_text("dummy")
-        with pytest.raises(ValueError, match="Unsupported snapshot format"):
+        with pytest.raises(ValueError, match="不支持的快照格式"):
             load_snapshot(p)
 
 
@@ -149,3 +151,356 @@ class TestSyntheticData:
     def test_step_field(self):
         snap = make_synthetic_lid_cavity(step=9999)
         assert snap.step == 9999
+
+
+# ---------------------------------------------------------------------------
+# ASCII Tecplot 读取器（.dat）
+# ---------------------------------------------------------------------------
+
+def _write_tecplot_asc(path, snap: FieldSnapshot) -> None:
+    """将 FieldSnapshot 写为 ASCII Tecplot .dat 文件（格式与 Rust 输出一致）。"""
+    nx, ny = snap.nx, snap.ny
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f'TITLE = "LBM Flow Field step={snap.step:06} time={snap.time:.3f}"\n')
+        f.write('VARIABLES = "X" "Y" "RHO" "UX" "UY"\n')
+        f.write(f"ZONE T=\"fluid\", I={nx}, J={ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={snap.time}\n")
+        for j in range(ny):
+            for i in range(nx):
+                x = i + 0.5
+                y = j + 0.5
+                f.write(f"{x:.4f} {y:.4f} {snap.rho[j,i]:.8e} {snap.ux[j,i]:.8e} {snap.uy[j,i]:.8e}\n")
+
+
+class TestTecplotAscReader:
+    def test_round_trip(self, tmp_path):
+        """写出 ASCII Tecplot 后读回，验证场数据一致。"""
+        snap = make_synthetic_lid_cavity(nx=8, ny=8, step=200)
+        dat_path = tmp_path / "fluid_000200.dat"
+        _write_tecplot_asc(dat_path, snap)
+
+        reader = TecplotAscReader(tmp_path)
+        assert len(reader) == 1
+        loaded = reader.read(200)
+
+        assert loaded.step == 200
+        assert loaded.nx == 8
+        assert loaded.ny == 8
+        np.testing.assert_allclose(loaded.rho, snap.rho, rtol=1e-6)
+        np.testing.assert_allclose(loaded.ux,  snap.ux,  rtol=1e-6)
+        np.testing.assert_allclose(loaded.uy,  snap.uy,  rtol=1e-6)
+
+    def test_load_snapshot_dat(self, tmp_path):
+        """load_snapshot 自动检测 .dat 格式。"""
+        snap = make_synthetic_lid_cavity(nx=4, ny=4, step=10)
+        dat_path = tmp_path / "fluid_000010.dat"
+        _write_tecplot_asc(dat_path, snap)
+        loaded = load_snapshot(dat_path)
+        assert loaded.step == 10
+
+    def test_empty_directory_raises(self, tmp_path):
+        reader = TecplotAscReader(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            reader.last()
+
+    def test_steps_list(self, tmp_path):
+        for step in [100, 200]:
+            snap = make_synthetic_lid_cavity(step=step)
+            _write_tecplot_asc(tmp_path / f"fluid_{step:06d}.dat", snap)
+        reader = TecplotAscReader(tmp_path)
+        assert reader.steps() == [100, 200]
+
+
+# ---------------------------------------------------------------------------
+# 二进制 Tecplot 读取器（.plt，TDV112）
+# ---------------------------------------------------------------------------
+
+def _write_tecplot_bin(path, snap: FieldSnapshot) -> None:
+    """
+    将 FieldSnapshot 写为二进制 Tecplot TDV112 .plt 文件。
+    格式与 Rust output::write_snapshot_tecplot_bin 完全一致。
+    """
+    import struct
+    nx, ny = snap.nx, snap.ny
+    n = nx * ny
+
+    def w_i32(v):
+        return struct.pack("<i", v)
+
+    def w_f32(v):
+        return struct.pack("<f", v)
+
+    def w_f64(v):
+        return struct.pack("<d", v)
+
+    def w_str(s):
+        b = b""
+        for ch in s:
+            b += w_i32(ord(ch))
+        b += w_i32(0)  # 空字符终止
+        return b
+
+    buf = b""
+    # 1. 魔数 + 字节序
+    buf += b"#!TDV112"
+    buf += w_i32(1)
+    # 2. 文件类型
+    buf += w_i32(0)
+    # 3. 标题
+    title = f"LBM Flow Field step={snap.step:06d} time={snap.time:.3f}"
+    buf += w_str(title)
+    # 4. 变量数量
+    buf += w_i32(5)
+    # 5. 变量名
+    for name in ["X", "Y", "RHO", "UX", "UY"]:
+        buf += w_str(name)
+    # 6. Zone 头
+    buf += w_f32(299.0)
+    buf += w_str("fluid")
+    buf += w_i32(-1)  # 父 Zone
+    buf += w_i32(-1)  # Strand ID
+    buf += w_f64(snap.time)
+    buf += w_i32(-1)  # 颜色
+    buf += w_i32(0)   # Zone 类型（Ordered）
+    buf += w_i32(0)   # 变量位置（Nodal）
+    buf += w_i32(0)   # 原始邻居
+    buf += w_i32(0)   # 用户面邻居连接数
+    buf += w_i32(nx)
+    buf += w_i32(ny)
+    buf += w_i32(1)
+    buf += w_i32(0)   # 辅助数据对数
+    # 7. EOH
+    buf += w_f32(357.0)
+    # 8. 数据区域
+    buf += w_f32(299.0)
+    # 变量格式（2 = float64）
+    for _ in range(5):
+        buf += w_i32(2)
+    buf += w_i32(0)   # 无被动变量
+    buf += w_i32(0)   # 无共享变量
+    buf += w_i32(-1)  # 共享连接 Zone
+    # X, Y, RHO, UX, UY 数据
+    import numpy as np
+    for j in range(ny):
+        for i in range(nx):
+            buf += w_f64(i + 0.5)
+    for j in range(ny):
+        for _ in range(nx):
+            buf += w_f64(j + 0.5)
+    for j in range(ny):
+        for i in range(nx):
+            buf += w_f64(float(snap.rho[j, i]))
+    for j in range(ny):
+        for i in range(nx):
+            buf += w_f64(float(snap.ux[j, i]))
+    for j in range(ny):
+        for i in range(nx):
+            buf += w_f64(float(snap.uy[j, i]))
+
+    with open(path, "wb") as f:
+        f.write(buf)
+
+
+class TestTecplotBinReader:
+    def test_round_trip(self, tmp_path):
+        """写出二进制 Tecplot PLT 后读回，验证场数据一致。"""
+        snap = make_synthetic_lid_cavity(nx=8, ny=8, step=500)
+        plt_path = tmp_path / "fluid_000500.plt"
+        _write_tecplot_bin(plt_path, snap)
+
+        reader = TecplotBinReader(tmp_path)
+        assert len(reader) == 1
+        loaded = reader.read(500)
+
+        assert loaded.step == 500
+        assert loaded.nx == 8
+        assert loaded.ny == 8
+        np.testing.assert_allclose(loaded.rho, snap.rho, rtol=1e-10)
+        np.testing.assert_allclose(loaded.ux,  snap.ux,  rtol=1e-10)
+        np.testing.assert_allclose(loaded.uy,  snap.uy,  rtol=1e-10)
+
+    def test_load_snapshot_plt(self, tmp_path):
+        """load_snapshot 自动检测 .plt 格式。"""
+        snap = make_synthetic_lid_cavity(nx=4, ny=4, step=20)
+        plt_path = tmp_path / "fluid_000020.plt"
+        _write_tecplot_bin(plt_path, snap)
+        loaded = load_snapshot(plt_path)
+        assert loaded.step == 20
+
+    def test_empty_directory_raises(self, tmp_path):
+        reader = TecplotBinReader(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            reader.last()
+
+    def test_bad_magic_raises(self, tmp_path):
+        """非 TDV112 文件应抛出 ValueError。"""
+        p = tmp_path / "fluid_000001.plt"
+        p.write_bytes(b"NOTMAGIC" + b"\x00" * 64)
+        with pytest.raises(ValueError, match="TDV112"):
+            TecplotBinReader(tmp_path).read(p)
+
+
+# ---------------------------------------------------------------------------
+# combine_block_snapshots — MPI 分块结果拼合
+# ---------------------------------------------------------------------------
+
+from lbm_post.vtk_reader import combine_block_snapshots
+
+
+def _make_partition_npz(path, rho, ux, uy, step, time,
+                         x_start, y_start, global_nx, global_ny):
+    """写出含分区元数据的 NPZ 文件（模拟 Rust 求解器输出）。"""
+    import numpy as np
+    np.savez_compressed(
+        path,
+        rho=rho, ux=ux, uy=uy,
+        step=np.array(step),
+        time=np.array(time),
+        x_start=np.array(x_start),
+        y_start=np.array(y_start),
+        global_nx=np.array(global_nx),
+        global_ny=np.array(global_ny),
+    )
+
+
+class TestCombineBlockSnapshots:
+    """测试 combine_block_snapshots：从 rank_* 子目录拼合全局场。"""
+
+    def _make_2rank_output(self, tmp_path, nx=8, ny=6, step=100, time=1.0):
+        """
+        模拟 2 rank 的 1D-Y 切片输出：rank_0 持有 y=[0,ny//2)，rank_1 持有 y=[ny//2,ny)。
+        返回预期的全局 rho 数组。
+        """
+        global_rho = np.random.rand(ny, nx)
+        global_ux  = np.random.rand(ny, nx)
+        global_uy  = np.random.rand(ny, nx)
+
+        half = ny // 2
+
+        # rank_0: y=0..half
+        rank0_dir = tmp_path / "rank_0"
+        rank0_dir.mkdir(exist_ok=True)
+        _make_partition_npz(
+            rank0_dir / f"fluid_{step:06d}.npz",
+            rho=global_rho[:half, :],
+            ux=global_ux[:half, :],
+            uy=global_uy[:half, :],
+            step=step, time=time,
+            x_start=0, y_start=0,
+            global_nx=nx, global_ny=ny,
+        )
+
+        # rank_1: y=half..ny
+        rank1_dir = tmp_path / "rank_1"
+        rank1_dir.mkdir(exist_ok=True)
+        _make_partition_npz(
+            rank1_dir / f"fluid_{step:06d}.npz",
+            rho=global_rho[half:, :],
+            ux=global_ux[half:, :],
+            uy=global_uy[half:, :],
+            step=step, time=time,
+            x_start=0, y_start=half,
+            global_nx=nx, global_ny=ny,
+        )
+
+        return global_rho, global_ux, global_uy
+
+    def test_basic_combine(self, tmp_path):
+        """基本拼合：2 rank × 1 步，全局场应完整还原。"""
+        expected_rho, expected_ux, _ = self._make_2rank_output(tmp_path)
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert len(written) == 1
+
+        result = np.load(written[0])
+        np.testing.assert_allclose(result["rho"], expected_rho, rtol=1e-12)
+        np.testing.assert_allclose(result["ux"],  expected_ux,  rtol=1e-12)
+
+    def test_multiple_steps(self, tmp_path):
+        """多时间步拼合：每步均写出一个合并文件。"""
+        for s in [100, 200, 300]:
+            self._make_2rank_output(tmp_path, step=s, time=float(s))
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert len(written) == 3
+
+    def test_custom_out_dir(self, tmp_path):
+        """指定自定义输出目录。"""
+        self._make_2rank_output(tmp_path, step=50)
+        custom = tmp_path / "my_combined"
+        written = combine_block_snapshots(tmp_path, fmt="npz", out_dir=custom)
+        assert written[0].parent == custom
+
+    def test_default_out_dir_is_combined(self, tmp_path):
+        """默认输出目录为 <output_dir>/combined/。"""
+        self._make_2rank_output(tmp_path, step=1)
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert written[0].parent == tmp_path / "combined"
+
+    def test_metadata_preserved(self, tmp_path):
+        """合并文件中 step 和 time 字段应与输入一致。"""
+        self._make_2rank_output(tmp_path, step=999, time=9.99)
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        data = np.load(written[0])
+        assert int(data["step"]) == 999
+        assert abs(float(data["time"]) - 9.99) < 1e-6
+
+    def test_no_rank_dirs_raises(self, tmp_path):
+        """没有 rank_* 子目录时应抛出 FileNotFoundError。"""
+        with pytest.raises(FileNotFoundError):
+            combine_block_snapshots(tmp_path, fmt="npz")
+
+    def test_nonexistent_dir_raises(self):
+        """不存在的目录应抛出 FileNotFoundError。"""
+        with pytest.raises(FileNotFoundError):
+            combine_block_snapshots("/nonexistent/path_xyz", fmt="npz")
+
+    def test_dat_format_output(self, tmp_path):
+        """dat 输出格式：合并文件应为 ASCII Tecplot .dat 格式。"""
+        expected_rho, expected_ux, _ = self._make_2rank_output(tmp_path)
+        written = combine_block_snapshots(tmp_path, fmt="dat")
+        assert len(written) == 1
+        assert written[0].suffix == ".dat"
+        # 验证文件以 TITLE 行开头
+        text = written[0].read_text(encoding="ascii")
+        assert text.startswith("TITLE")
+        assert "VARIABLES" in text
+
+    def test_plt_format_output(self, tmp_path):
+        """plt 输出格式：合并文件应为二进制 Tecplot TDV112 格式。"""
+        self._make_2rank_output(tmp_path)
+        written = combine_block_snapshots(tmp_path, fmt="plt")
+        assert len(written) == 1
+        assert written[0].suffix == ".plt"
+        # 验证魔数
+        data = written[0].read_bytes()
+        assert data[:8] == b"#!TDV112"
+
+    def test_invalid_fmt_raises(self, tmp_path):
+        """不支持的输出格式应抛出 ValueError。"""
+        with pytest.raises(ValueError, match="不支持的输出格式"):
+            combine_block_snapshots(tmp_path, fmt="vtu")
+
+    def test_4rank_2d_decomposition(self, tmp_path):
+        """2×2 二维块分解：4 rank 拼合全局场。"""
+        nx, ny = 8, 8
+        hx, hy = nx // 2, ny // 2
+        global_rho = np.arange(nx * ny, dtype=np.float64).reshape(ny, nx)
+
+        for ry in range(2):
+            for rx in range(2):
+                rank = ry * 2 + rx
+                rd = tmp_path / f"rank_{rank}"
+                rd.mkdir()
+                _make_partition_npz(
+                    rd / "fluid_000010.npz",
+                    rho=global_rho[ry*hy:(ry+1)*hy, rx*hx:(rx+1)*hx],
+                    ux=np.zeros((hy, hx)),
+                    uy=np.zeros((hy, hx)),
+                    step=10, time=0.1,
+                    x_start=rx*hx, y_start=ry*hy,
+                    global_nx=nx, global_ny=ny,
+                )
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        result = np.load(written[0])
+        np.testing.assert_allclose(result["rho"], global_rho, rtol=1e-12)
