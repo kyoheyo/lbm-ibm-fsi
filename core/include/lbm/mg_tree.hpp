@@ -249,9 +249,6 @@ private:
 // 这些函数在多重网格步骤中传递宏观量（密度 ρ 和速度 u），用于：
 //   - 时间步细化（每步开始时，用粗网格 ρ/u 初始化细化边界层）
 //   - 粗网格修正（限制）：从细网格返回更新的 ρ/u 到粗网格
-//
-// 注意：这些算子仅传递宏观量（ρ, u），而非分布函数 f。
-// 如需传递完整分布函数（例如用于 AMR 初始化），需另行实现 f 的插值。
 // ---------------------------------------------------------------------------
 
 /// 延拓算子（Prolongation）：从粗网格双线性插值 ρ/u 到细网格。
@@ -262,10 +259,6 @@ private:
 /// 其中 px = fine.extent.x_start + if/r（细节点在粗坐标系中的位置，
 /// 节点位于整数坐标处，与 LBM 节点布局一致）。
 ///
-/// @pre coarse.has_grid() && fine.has_grid()
-/// @pre fine 是 coarse 的子节点（fine.extent ⊂ coarse.extent）
-/// @pre coarse.grid->nx == coarse.extent.nx()，fine.grid->nx == fine.extent.nx()*refine_ratio
-///
 /// @throws std::invalid_argument 若 grid 指针为 nullptr
 void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine);
 
@@ -274,12 +267,114 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine);
 /// 对 coarse 节点中与 fine 重叠区域的每个粗格（ic, jc），
 /// 计算覆盖它的 r×r 个细格的简单平均：
 ///   ρ_c(ic,jc) = mean(ρ_f[if0..if0+r-1][jf0..jf0+r-1])
-///   u_c(ic,jc) = mean(u_f[...])
-///
-/// @pre coarse.has_grid() && fine.has_grid()
-/// @pre fine 是 coarse 的子节点（fine.extent ⊂ coarse.extent）
+///   u_c(ic,jc) = mean(u_f[if0..if0+r-1][jf0..jf0+r-1])  （逐分量）
 ///
 /// @throws std::invalid_argument 若 grid 指针为 nullptr
 void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse);
+
+// ---------------------------------------------------------------------------
+// 分布函数延拓（平衡态重建）
+// ---------------------------------------------------------------------------
+
+/// @brief f 分布函数延拓：从粗网格初始化细网格的分布函数 f。
+///
+/// 算法（"平衡态重建"法，overset/AMR 初始化时推荐）：
+///   1. 调用 mg_prolong_rho_u 将粗网格 ρ/u 双线性插值到细网格
+///   2. 对细网格每个节点，用插值得到的 (ρ, u) 重建局部平衡分布函数：
+///        f_α(if,jf) = f_eq(W_α, ρ, c_α, u)
+///
+/// 物理依据：
+///   - 细网格被首次激活（或粗化后重新细化）时，无先验分布函数信息
+///   - 用粗网格宏观量插值并重建平衡态 f 是最自然的初始化方式
+///   - 经过少量时间步松弛后，非平衡部分将由细网格自身动力学建立
+///
+/// 与 mg_prolong_rho_u 的关系：
+///   mg_prolong_f 隐含调用 mg_prolong_rho_u，然后对每个细节点执行 f_eq 重建。
+///   若仅需更新 ρ/u（例如 fringe BC），使用 mg_prolong_rho_u 即可。
+///
+/// @pre coarse.has_grid() && fine.has_grid()
+/// @pre fine.grid->model == D2Q9（仅支持 D2Q9）
+/// @throws std::invalid_argument 若 grid 指针为 nullptr 或模型非 D2Q9
+void mg_prolong_f(const MgNode& coarse, MgNode& fine);
+
+// ---------------------------------------------------------------------------
+// 覆盖网格（Overset/Fringe）耦合
+// ---------------------------------------------------------------------------
+
+/// @brief 在细网格 fringe 区域施加来自粗网格的边界条件（重叠网格耦合）。
+///
+/// Overset/Chimera 风格的多重网格耦合中，细网格的外边界（fringe 区域）
+/// 从粗网格插值获得 Dirichlet 型边界条件，实现物理一致的接口。
+///
+/// 算法：
+///   对细网格外边界（宽度 fringe_width 格的环形区域，以细网格本地坐标计）：
+///     - 用粗网格 ρ/u 对该 fringe 节点进行双线性插值
+///     - 用插值后的 (ρ, u) 重建平衡分布 f_eq，替换该节点的 f
+///     - 等价于：在 fringe 区域强制施加由粗网格主导的 Dirichlet BC
+///
+/// 耦合时机（推荐）：
+///   在每个粗网格时间步的开始（粗网格碰撞前）调用一次，以更新细网格 fringe BC。
+///   对时间步细化（r 细步 / 1 粗步）：
+///     粗步 t₀  → 调用 mg_apply_fringe_bc → 细网格 BC 更新
+///     细步 t₁..t₁₊ᵣ（细网格 r 步）
+///     → 调用 mg_restrict_rho_u → 粗网格更新
+///
+/// @param coarse        粗网格节点（提供 fringe BC 的插值源）
+/// @param fine          细网格节点（fringe BC 施加目标）
+/// @param fringe_width  fringe 区域宽度（细网格格子数，默认 2；建议 ≥ 1）
+///
+/// @pre coarse.has_grid() && fine.has_grid()
+/// @pre fine.grid->model == D2Q9
+/// @throws std::invalid_argument 若 grid 指针为 nullptr
+void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine, int fringe_width = 2);
+
+// ---------------------------------------------------------------------------
+// 时间步细化辅助
+// ---------------------------------------------------------------------------
+
+/// @brief 计算细网格相对于粗网格的时间步细化倍数。
+///
+/// 对加密比为 r 的细网格，为维持相同的 CFL 条件，细网格的时间步应为：
+///   Δt_fine = Δt_coarse / r
+/// 即每个粗步对应 r 个细步。
+///
+/// 对树中多层细化，层 l 相对于根节点（层 0）的总细化倍数为：
+///   r_total = r_1 * r_2 * ... * r_l（每层加密比的乘积）
+///
+/// @param node  目标细网格节点（需有 parent）
+/// @return      细网格相对于其直接父节点的时间步细化倍数
+///              （若为根节点，返回 1）
+inline int mg_subcycle_steps(const MgNode& node) {
+    return node.parent ? node.refine_ratio : 1;
+}
+
+/// @brief 计算某节点相对于根节点的累积时间步细化倍数
+///
+/// 遍历从 node 到根节点的路径，将所有 refine_ratio 相乘。
+///
+/// @param node  目标节点
+/// @return      累积细化倍数（根节点返回 1）
+int mg_total_subcycle_steps(const MgNode& node);
+
+// ---------------------------------------------------------------------------
+// AMR 自适应网格细化标记与判据
+// ---------------------------------------------------------------------------
+
+/// @brief 计算网格节点的密度梯度范数（用于 AMR 细化判据）
+///
+/// 使用二阶中心差分近似 |∇ρ| 在每个内部节点处的值。
+/// 边界节点使用单侧差分。结果存入 refinement_indicator（大小 = grid.size()）。
+///
+/// 典型用法：
+///   std::vector<double> indicator(grid.size());
+///   mg_compute_refinement_indicator(node, indicator);
+///   // indicator[n] > threshold → 标记节点 n 为需要细化区域
+///
+/// @param node              含 LatticeGrid 的多重网格节点
+/// @param indicator         输出：每节点的细化指标值（大小 = node.grid->size()）
+/// @throws std::invalid_argument 若 node.grid == nullptr
+void mg_compute_refinement_indicator(
+    const MgNode& node,
+    std::vector<double>& indicator);
 
 } // namespace lbm

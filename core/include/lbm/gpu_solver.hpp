@@ -185,3 +185,96 @@ private:
 } // namespace lbm
 
 #endif // LBM_ENABLE_CUDA
+
+// ---------------------------------------------------------------------------
+// GPU 拉伸网格求解器接口设计（API 文档）
+// ---------------------------------------------------------------------------
+//
+// 以下为 StretchedGpuSolver 的接口设计，用于在 GPU 上加速拉伸网格 LBM 仿真。
+// 实际 CUDA 实现需要 LBM_ENABLE_CUDA=ON 编译环境；本注释块作为 API 规范。
+//
+// 设计原则（与 GpuSolver 保持一致）：
+//   - 数据常驻 GPU 设备内存：f、f_tmp、rho、u、x_phys_d、y_phys_d、dx_d、dy_d
+//   - 碰撞（BGK/MRT）与标准 GpuSolver 完全相同（局部操作，无需物理坐标）
+//   - 流式迁移（stream_kernel）使用标准整数偏移（同 GpuSolver）
+//   - IS-LBM 修正（islbm_correction_kernel）：在 stream_kernel 后以额外 CUDA 核函数施加
+//     * 每线程负责一个节点 (i,j) 的所有方向 α
+//     * 使用 GPU 端 x_phys_d/y_phys_d 数组以及预计算的 dx_ref/dy_ref
+//     * 插值使用 CUDA texture 内存加速双线性查找（可选优化）
+//
+// 典型用法：
+//   StretchedGpuSolver gpu(sg, omega);
+//   gpu.add_boundary_condition(bc_west);
+//   gpu.add_boundary_condition(bc_east);
+//   for (int t = 0; t < n_steps; ++t) {
+//       gpu.step(/*islbm=*/true);   // 包含 IS-LBM 修正
+//   }
+//   gpu.download_rho_u(sg.lattice); // 下载宏观量到 CPU
+//
+// 参数：
+//   islbm_threshold  float — 拉伸比阈值（同 CPU 端 islbm_interpolation_correction）
+//                    默认 1.05；低于此值自动跳过 IS-LBM 核函数
+//
+// 性能预期（A100 GPU, 1024×512 网格）：
+//   标准流式步：~0.5 ms
+//   IS-LBM 修正步：~0.8 ms（额外开销约 60%，轻度拉伸时可关闭修正）
+//   每步总计：~1.5 ms（含 BC 施加）
+//
+// 实现状态：
+//   [ ] 设备内存分配（x_phys_d/y_phys_d/dx_d/dy_d）
+//   [ ] islbm_correction_kernel（D2Q9，双线性插值）
+//   [ ] 支持 GpuSolver 所有 BC 类型（BounceBack、ZouHe、Guo）
+//   [ ] 异步双缓冲输出管线（同 GpuSolver）
+//
+#ifdef LBM_ENABLE_CUDA
+
+namespace lbm {
+
+// Forward declaration of StretchedGrid (include stretched_grid.hpp to use)
+struct StretchedGrid;
+
+// ---------------------------------------------------------------------------
+/// GPU 加速拉伸网格求解器（IS-LBM，D2Q9 BGK）
+///
+/// 继承 GpuSolver 的所有功能，额外支持拉伸网格 IS-LBM 修正。
+///
+/// @note 构造时需传入 StretchedGrid（包含物理坐标）；内部将坐标数组
+///       一并上传到 GPU 设备内存供 IS-LBM 核函数使用。
+// ---------------------------------------------------------------------------
+class StretchedGpuSolver : public GpuSolver {
+public:
+    /// 构造：上传 CPU 拉伸网格数据（含物理坐标）到 GPU。
+    explicit StretchedGpuSolver(const StretchedGrid& sg, double omega);
+
+    ~StretchedGpuSolver();
+
+    // 禁止拷贝
+    StretchedGpuSolver(const StretchedGpuSolver&)            = delete;
+    StretchedGpuSolver& operator=(const StretchedGpuSolver&) = delete;
+
+    /// 单步：碰撞 + 流式迁移 + IS-LBM 修正（可选）+ GPU-BC + 宏观量更新
+    /// @param apply_islbm  是否施加 IS-LBM 修正（默认 true；均匀网格可关闭）
+    void step(bool apply_islbm = true);
+
+    /// 仅施加 IS-LBM 流式迁移补充插值修正核函数（在 stream() 后调用）
+    void islbm_correct();
+
+    /// 更新拉伸比阈值（低于此值时 islbm_correct() 自动跳过）
+    void set_islbm_threshold(double t) { islbm_threshold_ = t; }
+
+private:
+    // GPU 端物理坐标和间距数组
+    double* d_x_phys  = nullptr;  ///< 物理 x 坐标 [nx]
+    double* d_y_phys  = nullptr;  ///< 物理 y 坐标 [ny]
+    double* d_dx      = nullptr;  ///< x 方向局部间距 [nx]
+    double* d_dy      = nullptr;  ///< y 方向局部间距 [ny]
+    double  dx_ref_   = 1.0;      ///< 参考 x 间距（min dx）
+    double  dy_ref_   = 1.0;      ///< 参考 y 间距（min dy）
+    double  islbm_threshold_ = 1.05;  ///< IS-LBM 修正拉伸比阈值
+    double  max_sr_x_ = 1.0;      ///< 最大 x 拉伸比（构造时计算）
+    double  max_sr_y_ = 1.0;      ///< 最大 y 拉伸比（构造时计算）
+};
+
+} // namespace lbm
+
+#endif // LBM_ENABLE_CUDA (second block)

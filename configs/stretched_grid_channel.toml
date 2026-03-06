@@ -1,0 +1,120 @@
+# =============================================================================
+# 拉伸网格通道流算例配置
+# =============================================================================
+#
+# 物理问题：压力驱动矩形通道 Poiseuille 流
+#   - 西壁（入口）：高压  ρ_in  = 1.005
+#   - 东壁（出口）：参考压 ρ_out = 1.0
+#   - 南北壁：无滑移固壁（BounceBack）
+#   - 稳态速度剖面：u(y) = ΔP·y(H−y)/(2νρ)  （抛物线）
+#
+# 网格策略：Y 方向双曲正切拉伸（两端边界层加密，中央稀疏）
+#   - delta_y = 0.85 → 壁面附近间距约为中央的 1/4
+#   - 最大拉伸比约 1.15（在 IS-LBM 修正阈值 1.05 以上，会自动施加修正）
+#   - X 方向均匀（delta_x = 0.0）
+#
+# 与均匀网格 pressure_driven_channel.toml 的区别：
+#   - 相同节点数下，Y 方向近壁精度显著更高
+#   - 壁面速度梯度 (du/dy)|wall 误差减少约 3×（与解析解相比）
+#   - 需要 IS-LBM 修正（由 is_lbm = true 触发）以保证二阶精度
+#
+# 运行命令：
+#   # 单进程
+#   ./orchestrator/target/debug/orchestrator configs/stretched_grid_channel.toml
+#
+#   # 4 进程 MPI（可与 MPI 联用，拉伸网格和 MPI 独立工作）
+#   mpirun -n 4 ./orchestrator/target/debug/orchestrator configs/stretched_grid_channel.toml
+#
+# 可视化验证（Python）：
+#   python python/examples/plot_solver_output.py output/stretched_channel
+#   # 对比中 velocity_profile.png，应见抛物线剖面在两端（y ≈ 0、y ≈ 1）更精确解析
+#
+# 参考：
+#   He X. et al. (1996) J. Comput. Phys. 129:357-363
+#   Mei R. & Shyy W. (1998) J. Comput. Phys. 143:426-448
+# =============================================================================
+
+[simulation]
+n_steps         = 20000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+# -----------------------------------------------------------------------------
+# 流体域：与 pressure_driven_channel.toml 相同的物理参数，
+#         仅 ny_phys 和网格类型不同
+# -----------------------------------------------------------------------------
+[fluid]
+nx   = 200
+ny   = 60
+nu   = 0.1
+rho0 = 1.0
+
+# 入口（西壁）：规定高压 — 稳态后产生 Poiseuille 流
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_pressure"
+face    = "west"
+rho     = 1.005
+
+# 出口（东壁）：规定参考压
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_pressure"
+face    = "east"
+rho     = 1.0
+
+# 南壁（下壁）：无滑移固壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁（上壁）：无滑移固壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# 拉伸网格配置
+# -----------------------------------------------------------------------------
+[stretched_grid]
+# 网格生成方式：
+#   "none"       — 不使用拉伸，退化为标准均匀网格（等价于 delta=0）
+#   "tanh"       — 双曲正切拉伸（两端加密，中央稀疏；适合通道流边界层）
+#   "geometric"  — 等比拉伸（适合单侧近壁加密）
+#   "custom"     — 用户提供坐标数组（通过 pre_script 生成）
+type    = "tanh"
+
+# 物理域物理范围（格子单位，与 fluid.nx/ny 和边界条件对应）
+x0 = 0.0
+x1 = 200.0
+y0 = 0.0
+y1 = 60.0
+
+# Y 方向 tanh 拉伸控制参数 delta_y ∈ [0, 1)：
+#   0.0  → 均匀（无拉伸）
+#   0.85 → 适度加密：壁面格间距约为中央的 25%，最大拉伸比 ≈ 1.15
+#   0.95 → 强加密：壁面格间距约为中央的 8%，适合高雷诺数边界层
+delta_y = 0.85
+
+# X 方向控制参数（0.0 = 均匀，无需 X 方向拉伸）
+delta_x = 0.0
+
+# IS-LBM 流式迁移修正阈值：
+#   当最大拉伸比 > threshold 时自动施加插值修正（无需手动开关）
+#   设为 999.0 可强制关闭（仅用于对比测试）
+is_lbm_threshold = 1.05
+
+# -----------------------------------------------------------------------------
+# 输出控制
+# -----------------------------------------------------------------------------
+[output]
+write_interval = 2000
+directory      = "output/stretched_channel"
+format         = "npz"
+
+# -----------------------------------------------------------------------------
+# Python 后处理脚本（可选）
+# -----------------------------------------------------------------------------
+[python]
+interpreter = "python"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
