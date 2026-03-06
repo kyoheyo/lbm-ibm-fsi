@@ -3,6 +3,7 @@
 #include "lbm/solver.hpp"
 #include "lbm/boundary.hpp"
 #include "lbm/mpi_decomp.hpp"
+#include "lbm/mg_tree.hpp"
 #include <cmath>
 #include <cstdio>
 #include <numeric>
@@ -977,6 +978,154 @@ static int test_mpi_attach_mpi2d_no_effect()
     return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// 测试：MgTree 基本结构（单进程，2D，三层嵌套）
+// ---------------------------------------------------------------------------
+static int test_mg_tree_basic()
+{
+    // 创建根节点（粗网格 256×256，2D）
+    lbm::MgExtent root_ext{0, 255, 0, 255, 0, 0};
+    lbm::MgTree tree(root_ext, lbm::MgDim::D2);
+
+    bool ok = true;
+
+    // 根节点验证
+    auto* root = tree.root();
+    ok &= (root != nullptr);
+    ok &= (root->level == 0);
+    ok &= (root->refine_ratio == 1);
+    ok &= root->is_root();
+    ok &= root->is_leaf();
+    ok &= !root->has_grid();
+    ok &= (root->extent.nx() == 256);
+    ok &= (root->extent.ny() == 256);
+    ok &= (root->extent.nz() == 1);
+    ok &= !root->extent.is_3d();
+    ok &= (tree.max_level() == 0);
+    ok &= (tree.node_count() == 1);
+
+    // 在粗网格中嵌套第一层细化（中心 64×64 区域，加密比 2）
+    lbm::MgExtent child1_ext{96, 159, 96, 159, 0, 0};
+    auto* child1 = tree.add_level(root, child1_ext, 2);
+    ok &= (child1 != nullptr);
+    ok &= (child1->level == 1);
+    ok &= (child1->refine_ratio == 2);
+    ok &= !child1->is_root();
+    ok &= child1->is_leaf();
+    ok &= (child1->parent == root);
+    ok &= !root->is_leaf();
+    ok &= ((int)root->children.size() == 1);
+    ok &= (tree.max_level() == 1);
+    ok &= (tree.node_count() == 2);
+
+    // 在第一层细化中嵌套第二层（更细，加密比 4）
+    lbm::MgExtent child2_ext{112, 143, 112, 143, 0, 0};
+    auto* child2 = tree.add_level(child1, child2_ext, 4);
+    ok &= (child2 != nullptr);
+    ok &= (child2->level == 2);
+    ok &= (child2->refine_ratio == 4);
+    ok &= !child2->is_root();
+    ok &= child2->is_leaf();
+    ok &= (child2->parent == child1);
+    ok &= (tree.max_level() == 2);
+    ok &= (tree.node_count() == 3);
+
+    // nodes_at_level
+    auto lvl0 = tree.nodes_at_level(0);
+    auto lvl1 = tree.nodes_at_level(1);
+    auto lvl2 = tree.nodes_at_level(2);
+    ok &= (lvl0.size() == 1 && lvl0[0] == root);
+    ok &= (lvl1.size() == 1 && lvl1[0] == child1);
+    ok &= (lvl2.size() == 1 && lvl2[0] == child2);
+
+    // volume_ratio
+    ok &= (child1->volume_ratio() == 4);   // 2D: refine_ratio^2 = 4
+    ok &= (child2->volume_ratio() == 16);  // 2D: 4^2 = 16
+
+    // 绑定 LatticeGrid（仅验证 has_grid 状态）
+    lbm::LatticeGrid g1(256, 256, 1, lbm::LatticeModel::D2Q9);
+    root->grid = &g1;
+    ok &= root->has_grid();
+    root->grid = nullptr;
+    ok &= !root->has_grid();
+
+    std::printf("[MgTree] basic structure (2D 3-level): %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// 测试：MgTree 遍历顺序（粗→细 和 细→粗）
+// ---------------------------------------------------------------------------
+static int test_mg_tree_traversal()
+{
+    // 构建三层树：root → child1a, child1b → child2（child1b 的子节点）
+    lbm::MgExtent root_ext{0, 127, 0, 127, 0, 0};
+    lbm::MgTree tree(root_ext);
+    auto* root   = tree.root();
+    auto* c1a    = tree.add_level(root, {0, 63, 0, 63, 0, 0}, 2);
+    auto* c1b    = tree.add_level(root, {64, 127, 64, 127, 0, 0}, 2);
+    auto* c2     = tree.add_level(c1b, {80, 111, 80, 111, 0, 0}, 2);
+    (void)c1a; (void)c2;
+
+    // 粗→细遍历（BFS）：应为 root, c1a/c1b（任意顺序），c2
+    std::vector<int> visit_ctf;
+    tree.traverse_coarse_to_fine([&](lbm::MgNode* n) {
+        visit_ctf.push_back(n->level);
+    });
+    bool ok = true;
+    ok &= (visit_ctf.size() == 4);
+    ok &= (visit_ctf[0] == 0);                       // root 第一
+    ok &= (visit_ctf[1] == 1 && visit_ctf[2] == 1);  // 两个 level-1 节点
+    ok &= (visit_ctf[3] == 2);                        // c2 最后
+
+    // 细→粗遍历（BFS 逆序）：应为 c2, c1b, c1a, root
+    std::vector<int> visit_ftc;
+    tree.traverse_fine_to_coarse([&](lbm::MgNode* n) {
+        visit_ftc.push_back(n->level);
+    });
+    ok &= (visit_ftc.size() == 4);
+    ok &= (visit_ftc[0] == 2);                        // c2 第一
+    ok &= (visit_ftc[1] == 1 && visit_ftc[2] == 1);  // 两个 level-1 节点
+    ok &= (visit_ftc[3] == 0);                        // root 最后
+
+    std::printf("[MgTree] traversal order (coarse-to-fine / fine-to-coarse): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// 测试：MpiDecomp3D 在单进程（无 MPI 构建）下的正确初始化
+// ---------------------------------------------------------------------------
+static int test_mpi_decomp3d_single_rank()
+{
+    const int gnx = 64, gny = 48, gnz = 32;
+    bool ok = true;
+    try {
+        const auto d = lbm::MpiDecomp3D::create(gnx, gny, gnz, 1, 1, 1);
+        ok &= (d.rank == 0 && d.nprocs == 1);
+        ok &= (d.px == 1 && d.py == 1 && d.pz == 1);
+        ok &= (d.col_rank == 0 && d.row_rank == 0 && d.pz_rank == 0);
+        ok &= (d.local_nx == gnx && d.local_ny == gny && d.local_nz == gnz);
+        ok &= (d.x_start == 0 && d.x_end == gnx - 1);
+        ok &= (d.y_start == 0 && d.y_end == gny - 1);
+        ok &= (d.z_start == 0 && d.z_end == gnz - 1);
+        // 无幽灵层（单进程）
+        ok &= !d.has_west_ghost() && !d.has_east_ghost();
+        ok &= !d.has_south_ghost() && !d.has_north_ghost();
+        ok &= !d.has_bottom_ghost() && !d.has_top_ghost();
+        // 有全局壁面
+        ok &= d.has_west_wall() && d.has_east_wall();
+        ok &= d.has_south_wall() && d.has_north_wall();
+        ok &= d.has_bottom_wall() && d.has_top_wall();
+        // grid_n* == local_n*（无幽灵）
+        ok &= (d.grid_nx() == gnx && d.grid_ny() == gny && d.grid_nz() == gnz);
+    } catch (...) {
+        ok = false;
+    }
+    std::printf("[MPI] MpiDecomp3D single-rank fields: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 
 int test_lbm_main()
 {
@@ -998,5 +1147,10 @@ int test_lbm_main()
     failures += test_mpi_virtual_two_rank_no_ghost_collision();
     failures += test_mpi_decomp2d_single_rank();
     failures += test_mpi_attach_mpi2d_no_effect();
+    failures += test_mg_tree_basic();
+    failures += test_mg_tree_traversal();
+    failures += test_mpi_decomp3d_single_rank();
+    if (failures == 0)
+        std::printf("1: All tests PASSED\n");
     return failures;
 }

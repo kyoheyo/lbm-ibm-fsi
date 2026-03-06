@@ -1,6 +1,6 @@
 # LBM-IBM-FSI MPI 并行详解
 
-本文档详细说明项目在 MPI（及 MPI + OpenMP 混合）模式下的完整求解流程，包括：域分解原理与两种方式（**一维 Y 切片**与**二维 XY 块分解**）、**多网格独立模式**、**OpenMP 线程数便捷设置**、幽灵层交换实现、边界条件约定、Rust / C API 使用示例以及跨平台构建和运行指南。
+本文档详细说明项目在 MPI（及 MPI + OpenMP 混合）模式下的完整求解流程，包括：**三种并行模式**（XY 块分解、多进程独立、嵌套多重网格）、一维切片作为二维块分解的特例、三维扩展预留接口、幽灵层交换实现、OpenMP 线程数便捷设置、以及 Rust / C API 使用示例。
 
 ---
 
@@ -8,64 +8,63 @@
 
 1. [整体架构与并行模式选择](#1-整体架构与并行模式选择)
 2. [TOML 配置快速参考](#2-toml-配置快速参考)
-   - 2.1 OpenMP 线程数设置
-   - 2.2 一维 Y 切片模式
-   - 2.3 二维 XY 块分解模式
-   - 2.4 多网格独立模式
-3. [模式一：一维 Y 方向切片（1D_Y）](#3-模式一一维-y-方向切片1d_y)
-   - 3.1 域分解原理
-   - 3.2 幽灵行布局与 Halo Exchange
-   - 3.3 边界条件约定
-   - 3.4 时序图
-   - 3.5 C++ 实现：`MpiDecomp::create()`
-   - 3.6 幽灵行交换：`halo_exchange_d2q9()`
-4. [模式二：二维 XY 块分解（2D_XY）](#4-模式二二维-xy-块分解2d_xy)
-   - 4.1 域分解原理
-   - 4.2 进程布局与坐标
-   - 4.3 幽灵层布局与 Halo Exchange
-   - 4.4 边界条件约定
-   - 4.5 C++ 实现：`MpiDecomp2D::create()`
-   - 4.6 幽灵层交换：`halo_exchange_d2q9_2d()`
-5. [模式三：多网格独立模式（Multi-Grid）](#5-模式三多网格独立模式multi-grid)
-   - 5.1 使用场景
-   - 5.2 输出目录隔离
+3. [模式一：XY 块分解（`"block"`）](#3-模式一xy-块分解block)
+   - 3.1 统一视角：一维切片是二维块分解的特例
+   - 3.2 进程布局与坐标
+   - 3.3 幽灵层布局与 Halo Exchange
+   - 3.4 边界条件约定
+   - 3.5 时序图
+   - 3.6 C++ 实现：`MpiDecomp2D::create()`
+   - 3.7 幽灵层交换：`halo_exchange_d2q9_2d()`
+   - 3.8 三维预留：`MpiDecomp3D`
+4. [模式二：多进程独立（`"independent"`）](#4-模式二多进程独立independent)
+   - 4.1 使用场景
+   - 4.2 输出目录隔离
+5. [模式三：嵌套式多重网格（`"multigrid"`）](#5-模式三嵌套式多重网格multigrid)
+   - 5.1 概述与适用场景
+   - 5.2 多重网格树数据结构（`MgTree` / `MgNode`）
+   - 5.3 树节点的空间范围（`MgExtent`）
+   - 5.4 N 叉树结构与任意嵌套
+   - 5.5 三维支持（`MgDim::D3`）
+   - 5.6 与 MPI 域分解的关联
+   - 5.7 遍历接口
+   - 5.8 当前实现状态与扩展路线
 6. [MPI + OpenMP 混合并行](#6-mpi--openmp-混合并行)
-   - 6.1 线程/进程分配策略
-   - 6.2 TOML 配置示例
+   - 6.1 OpenMP 线程数设置
+   - 6.2 线程/进程分配策略
 7. [Rust / C API 使用示例](#7-rust--c-api-使用示例)
-   - 7.1 一维切片示例（Rust）
-   - 7.2 二维块分解示例（Rust）
-   - 7.3 多网格独立模式示例（Rust）
-   - 7.4 C ABI 函数速查表
+   - 7.1 XY 块分解示例（1D Y 切片 ≡ nx_blocks=1）
+   - 7.2 二维块分解示例
+   - 7.3 多进程独立模式示例
+   - 7.4 多重网格树创建示例
+   - 7.5 C ABI 函数速查表
 8. [构建与运行](#8-构建与运行)
    - 8.1 编译开关
    - 8.2 跨平台构建命令
    - 8.3 运行命令
    - 8.4 SLURM 集群脚本示例
 9. [正确性保证与常见陷阱](#9-正确性保证与常见陷阱)
-   - 9.1 不要对幽灵层执行二次碰撞
-   - 9.2 边界条件只在拥有该物理壁的 rank 注册
-   - 9.3 px × py 必须等于 MPI 进程总数
 10. [性能分析与调优建议](#10-性能分析与调优建议)
 
 ---
 
 ## 1. 整体架构与并行模式选择
 
-本项目支持以下四种并行模式，均通过 **编译时环境变量** 和 **TOML 配置文件** 控制，无需修改算法代码：
+本项目支持三种 MPI 并行模式，全部通过编译时环境变量和 TOML 配置控制：
 
-| 模式 | 编译开关 | TOML `[mpi].mode` | 适用场景 |
-|------|---------|-------------------|---------|
-| 单进程 OpenMP | `LBM_ENABLE_OPENMP=ON` | — | 单节点多核工作站，共享内存并行 |
-| MPI 一维 Y 切片 | `LBM_ENABLE_MPI=ON` | `"1d_y"`（默认）| 集群多节点，网格 ny 远大于 nx |
-| MPI 二维 XY 块 | `LBM_ENABLE_MPI=ON` | `"2d_xy"` | 集群多节点，网格接近方形或 nx 较大 |
-| MPI 多网格独立 | `LBM_ENABLE_MPI=ON` | `"multi_grid"` | 参数扫描、集成测试、无需通信的批处理 |
-| MPI + OpenMP | 两者均 ON | 任意 | HPC 集群，每节点多卡或多核 |
+| 模式 | TOML `[mpi].mode` | 旧名称（向后兼容）| 适用场景 |
+|------|-------------------|-----------------|---------|
+| **XY 块分解** | `"block"`（默认）| `"1d_y"`、`"1d_x"`、`"2d_xy"` | 集群多节点并行求解同一网格 |
+| **多进程独立** | `"independent"` | `"multi_grid"` | 参数扫描、无通信批处理 |
+| **嵌套多重网格** | `"multigrid"` | — | AMR 风格细化（框架就绪，算子待实现）|
 
-**选择建议：**
-- 网格为 256×1024 → 选 `"1d_y"`（Y 方向更长，切片更均匀）
-- 网格为 1024×1024 → 选 `"2d_xy"`（接近方形，2D 切分通信面积更小）
-- 需同时扫描 Re = 100/500/1000/5000 → 选 `"multi_grid"`（4 进程完全独立）
+**XY 块分解的统一视角**：
+
+```
+一维 Y 切片 = block（nx_blocks=1, ny_blocks=nprocs）
+一维 X 切片 = block（nx_blocks=nprocs, ny_blocks=1）
+二维 XY 块  = block（nx_blocks=px, ny_blocks=py, px*py=nprocs）
+```
 
 ---
 
@@ -78,254 +77,117 @@
 omp_num_threads = 8   # 强制使用 8 个 OpenMP 线程（0 = 使用系统默认值）
 ```
 
-`omp_num_threads` 通过 `omp_set_num_threads()` 在进程内即时生效，**优先级高于** `OMP_NUM_THREADS` 环境变量。设为 `0`（默认）则由 OpenMP 运行时自动选择（通常为全部物理核心数）。
-
-### 2.2 一维 Y 切片模式
+### 2.2 一维 Y 切片（nx_blocks=1，ny_blocks=nprocs）
 
 ```toml
 [mpi]
-mode = "1d_y"   # 可省略，此为默认值
+mode      = "block"   # 新名称（旧 "1d_y" 仍可用但会提示弃用）
+nx_blocks = 1         # X 方向 1 块（不分割 X）
+ny_blocks = 0         # 0 = 自动：ny_blocks = nprocs（Y 方向均匀切片）
+# mpirun -n 4 → ny_blocks 自动为 4
 ```
 
-运行：`mpirun -n 4 ./lbm-orchestrator configs/my.toml`（4 个进程各分配 ny/4 行）
-
-### 2.3 二维 XY 块分解模式
+### 2.3 一维 X 切片（nx_blocks=nprocs，ny_blocks=1）
 
 ```toml
 [mpi]
-mode      = "2d_xy"
-nx_blocks = 4     # X 方向切 4 块（每块 nx/4 列）
-ny_blocks = 2     # Y 方向切 2 块（每块 ny/2 行）
-# nx_blocks * ny_blocks == 8 → 必须 mpirun -n 8
+mode      = "block"
+nx_blocks = 4   # 需 mpirun -n 4
+ny_blocks = 1
 ```
 
-运行：`mpirun -n 8 ./lbm-orchestrator configs/my.toml`（须满足 `nx_blocks * ny_blocks == 8`）
-
-### 2.4 多网格独立模式
+### 2.4 二维 XY 块分解（4×2 = 8 进程）
 
 ```toml
 [mpi]
-mode = "multi_grid"
-# 每个 rank 各自运行完整的 nx × ny 网格，互不通信
-# 输出写入 <output.directory>/rank_<N>/
+mode      = "block"
+nx_blocks = 4   # X 方向切 4 块
+ny_blocks = 2   # Y 方向切 2 块（须满足 4×2==8 == mpirun -n 8）
 ```
 
-运行：`mpirun -n 4 ./lbm-orchestrator configs/my.toml`（4 套独立仿真并行执行）
+### 2.5 多进程独立模式
 
----
-
-## 3. 模式一：一维 Y 方向切片（1D_Y）
-
-### 3.1 域分解原理
-
-将 `ny` 行均匀切分到 `nprocs` 个进程，前 `ny % nprocs` 个进程各多分配一行（处理 ny 不整除的情况）：
-
-```
-全局网格 nx × ny:
-
-   ny-1  ┌────────────────────────┐
-         │   rank nprocs-1        │  ← 持有全局北壁（注册 Face::North BC）
-         │   y_start_r..ny-1      │
-         ├────────────────────────┤
-         │        ...             │  ← 内部 rank（不注册 South/North BC）
-         ├────────────────────────┤
-         │   rank 1               │
-         ├────────────────────────┤
-     0   │   rank 0               │  ← 持有全局南壁（注册 Face::South BC）
-         └────────────────────────┘
-                  nx
+```toml
+[mpi]
+mode = "independent"  # 旧 "multi_grid" 仍可用
 ```
 
-**负载均衡公式**（`core/src/lbm/mpi_decomp.cpp`，`MpiDecomp::create()`）：
+### 2.6 嵌套多重网格模式
 
-```cpp
-const int base = gny / nprocs;
-const int rem  = gny % nprocs;
-local_ny = base + (rank < rem ? 1 : 0);
-y_start  = rank * base + std::min(rank, rem);
-y_end    = y_start + local_ny - 1;
+```toml
+[mpi]
+mode = "multigrid"
+# 嵌套关系通过代码（LbmMgTree API）配置
+# 当前版本：退化为独立模式；MgTree 框架可单独使用
 ```
 
-### 3.2 幽灵行布局与 Halo Exchange
+### 2.7 三维预留（nz_blocks）
 
-每个进程分配 `grid_ny = local_ny + 2` 行的本地网格（两侧各一行幽灵行）：
-
-```
-   ny_local+1  ┌────────────────┐  ← 北幽灵行 j=local_ny+1（接收 rank+1 的 j=1 行）
-               │ j=local_ny     │  物理行（对应全局 y_end）
-               │ ...            │
-               │ j=1            │  物理行（对应全局 y_start）
-   0           └────────────────┘  ← 南幽灵行 j=0（接收 rank-1 的 j=local_ny 行）
-               ←    nx      →
-```
-
-**幽灵行交换实现**（`core/src/lbm/mpi_decomp.cpp`，`halo_exchange_d2q9()`）：
-
-```cpp
-// 交换 1：向北邻发送本进程顶物理行，从南邻接收南幽灵行
-MPI_Sendrecv(
-    top_phys,    nx*Q, MPI_DOUBLE, rank_north, 0,
-    south_ghost, nx*Q, MPI_DOUBLE, rank_south, 0,
-    MPI_COMM_WORLD, &st
-);
-
-// 交换 2：向南邻发送本进程底物理行，从北邻接收北幽灵行
-MPI_Sendrecv(
-    bot_phys,    nx*Q, MPI_DOUBLE, rank_south, 1,
-    north_ghost, nx*Q, MPI_DOUBLE, rank_north, 1,
-    MPI_COMM_WORLD, &st
-);
-```
-
-使用 `MPI_Sendrecv` 而非 `MPI_Send` + `MPI_Recv` 避免死锁（所有进程同时收发）。`MPI_PROC_NULL`（由 `rank_south=-1` / `rank_north=-1` 传入）在最边缘 rank 上使 Sendrecv 退化为无操作，无需额外 `if` 分支。
-
-### 3.3 边界条件约定
-
-| 方向 | 注册 BC 的条件 | 说明 |
-|------|---------------|------|
-| South | `rank == 0` | 只有 rank 0 拥有全局南壁（j=0 是物理壁而非幽灵行） |
-| North | `rank == nprocs-1` | 只有最后一个 rank 拥有全局北壁 |
-| West | 所有 rank | 每个 rank 的本地网格均涵盖全部 nx 列，西壁存在于所有 rank |
-| East | 所有 rank | 同 West |
-
-**重要**：内部 rank（rank ∈ [1, nprocs-2]）不注册 South/North BC；其幽灵行由 `halo_exchange_d2q9()` 维护，边界层的 f 值由相邻 rank 的物理层通过 halo 交换填入，无需额外 BC 处理。
-
-### 3.4 时序图
-
-每个 `Solver::step()` 内部的执行顺序：
-
-```
-collide()                ← BGK/MRT 碰撞（本地，无通信，跳过幽灵行）
-  ↓
-stream()                 ← 流式迁移（本地，周期取模；ghost 行被"污染"）
-  ↓
-halo_exchange_d2q9()     ← MPI_Sendrecv：填充正确的 ghost 行（南北方向）
-  │  rank r → rank r+1: j=local_ny（顶物理行）→ 对方 j=0（南幽灵）
-  │  rank r → rank r-1: j=1（底物理行）       → 对方 j=local_ny+1（北幽灵）
-  ↓
-apply_BC()               ← rank 0 执行 South BC，最后 rank 执行 North BC
-                           所有 rank 执行 West/East BC
-  ↓
-compute_macroscopic()    ← 更新 ρ/u（本地，含幽灵节点）
-```
-
-### 3.5 C++ 实现：`MpiDecomp::create()`
-
-**源文件**：`core/src/lbm/mpi_decomp.cpp`，`core/include/lbm/mpi_decomp.hpp`
-
-```cpp
-// 创建一维 Y 方向域分解描述符
-MpiDecomp MpiDecomp::create(int gnx, int gny)
-{
-    MpiDecomp d;
-    d.global_nx = gnx;
-    d.global_ny = gny;
-
-    MPI_Comm_rank(MPI_COMM_WORLD, &d.rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &d.nprocs);
-
-    const int base = gny / d.nprocs;
-    const int rem  = gny % d.nprocs;
-    d.local_ny = base + (d.rank < rem ? 1 : 0);
-    d.y_start  = d.rank * base + std::min(d.rank, rem);
-    d.y_end    = d.y_start + d.local_ny - 1;
-
-    d.rank_south = (d.rank > 0)            ? d.rank - 1 : MPI_PROC_NULL;
-    d.rank_north = (d.rank < d.nprocs - 1) ? d.rank + 1 : MPI_PROC_NULL;
-    return d;
-}
-
-// 本地网格含幽灵行的 ny（供 LatticeGrid 构造使用）
-int grid_ny() const { return (nprocs > 1) ? local_ny + 2 : local_ny; }
-```
-
-### 3.6 幽灵行不执行二次碰撞
-
-**源文件**：`core/src/lbm/solver.cpp`，`Solver::collide_bgk()`
-
-幽灵行持有的是相邻进程已完成碰撞的物理行数据。若再次对其碰撞会引入 "二次碰撞" 错误（过度松弛）。通过 `n_start` / `n_end` 跳过幽灵行：
-
-```cpp
-int n_start = 0, n_end = n;
-#ifdef LBM_ENABLE_MPI
-if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-    if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;  // 跳过南幽灵行
-    if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx; // 跳过北幽灵行
-}
-#endif
-
-for (int i = n_start; i < n_end; ++i) {
-    // BGK 碰撞
-}
+```toml
+[mpi]
+mode      = "block"
+nx_blocks = 2
+ny_blocks = 2
+nz_blocks = 2   # 3D 扩展预留，需配合 3D 求解器（D3Q19/D3Q27）
 ```
 
 ---
 
-## 4. 模式二：二维 XY 块分解（2D_XY）
+## 3. 模式一：XY 块分解（`"block"`）
 
-### 4.1 域分解原理
+### 3.1 统一视角：一维切片是二维块分解的特例
 
-将全局网格 `global_nx × global_ny` 切分为 `px × py` 个矩形块，总进程数 `nprocs = px × py`：
+```
+px=1, py=nprocs → 1D Y 切片（列不分割，行均匀切分）
+px=nprocs, py=1 → 1D X 切片（行不分割，列均匀切分）
+px*py=nprocs     → 2D XY 块分解（两方向均切分）
+```
+
+底层统一使用 `MpiDecomp2D` 实现。`px=1` 时，无西/东幽灵列，行交换等价于旧的一维 `MpiDecomp` 模式。
+
+### 3.2 进程布局与坐标
 
 ```
 进程布局（rank = row_rank * px + col_rank）：
 
-   row=py-1  ┌───────┬───────┬───────┐  ← 全局北壁（row_rank==py-1 注册 North BC）
-             │ r=6   │ r=7   │ r=8   │    （nx_blocks=3, ny_blocks=3 示例）
-   row=1     ├───────┼───────┼───────┤
-             │ r=3   │ r=4   │ r=5   │  ← 内部行（不注册 South/North BC）
-   row=0     └───────┴───────┴───────┘  ← 全局南壁（row_rank==0 注册 South BC）
-             col=0   col=1   col=2
-             ↑                       ↑
-          西壁BC                   东壁BC
+  row=py-1  ┌─────┬─────┬─────┐  ← 全局北壁（row_rank==py-1 注册 North BC）
+            │ r=6 │ r=7 │ r=8 │    示例：px=3, py=3
+  row=1     ├─────┼─────┼─────┤
+            │ r=3 │ r=4 │ r=5 │
+  row=0     └─────┴─────┴─────┘  ← 全局南壁（row_rank==0 注册 South BC）
+            col=0  col=1  col=2
+            ↑                 ↑
+          西壁BC             东壁BC
 ```
 
-### 4.2 进程布局与坐标
-
-| 字段 | 含义 | 计算公式 |
-|------|------|---------|
-| `col_rank` | X 方向进程坐标 | `rank % px` |
-| `row_rank` | Y 方向进程坐标 | `rank / px` |
-| `local_nx` | X 方向物理列数 | 均匀分配：`base_x + (col_rank < rem_x ? 1 : 0)` |
-| `local_ny` | Y 方向物理行数 | 均匀分配：`base_y + (row_rank < rem_y ? 1 : 0)` |
-| `x_start`  | 全局 X 起始坐标 | `col_rank * base_x + min(col_rank, rem_x)` |
-| `y_start`  | 全局 Y 起始坐标 | `row_rank * base_y + min(row_rank, rem_y)` |
-
-四邻 rank（用于 MPI_Sendrecv）：
-
-```cpp
-rank_south = (row_rank > 0)        ? (row_rank-1)*px + col_rank : MPI_PROC_NULL;
-rank_north = (row_rank < py-1)     ? (row_rank+1)*px + col_rank : MPI_PROC_NULL;
-rank_west  = (col_rank > 0)        ? row_rank*px + col_rank - 1 : MPI_PROC_NULL;
-rank_east  = (col_rank < px-1)     ? row_rank*px + col_rank + 1 : MPI_PROC_NULL;
-```
-
-### 4.3 幽灵层布局
-
-每个进程分配 `grid_nx() × grid_ny()` 的本地网格，含最多 4 个幽灵层（各 1 格）：
+均匀分配策略（`uniform_partition()`）：
 
 ```
-含幽灵层的本地网格（col_rank=1, row_rank=1，即四面均有邻居）：
-
-  ┌───────────────────────────────────┐
-  │ 北幽灵列（j=phys_y0+local_ny）   │  ← 来自 rank_north 的 j=phys_y0 行
-  ├──┬─────────────────────────────┬──┤
-  │西│ 物理区域                    │东│
-  │幽│ i=phys_x0..phys_x0+local_nx│幽│
-  │灵│ j=phys_y0..phys_y0+local_ny│灵│
-  │列│                             │列│
-  ├──┴─────────────────────────────┴──┤
-  │ 南幽灵行（j=0）                   │  ← 来自 rank_south 的 j=phys_y0+local_ny-1 行
-  └───────────────────────────────────┘
-     ↑                                ↑
-   i=0（西幽灵）          i=phys_x0+local_nx（东幽灵）
+local_n = total/nprocs + (r < total%nprocs ? 1 : 0)
+start   = r * (total/nprocs) + min(r, total%nprocs)
 ```
 
-其中：
-- `phys_x0 = has_west_ghost()  ? 1 : 0`（西幽灵列存在时物理区域从 i=1 开始）
-- `phys_y0 = has_south_ghost() ? 1 : 0`（南幽灵行存在时物理区域从 j=1 开始）
+### 3.3 幽灵层布局
 
-### 4.4 边界条件约定
+含幽灵层的本地网格（col_rank=1, row_rank=1，四面均有邻居）：
+
+```
+  ┌─────────────────────────────────────────┐
+  │ 北幽灵行 j=local_ny+phys_y0             │ ← 来自 rank_north 的 j=phys_y0 行
+  ├──┬───────────────────────────────────┬──┤
+  │西│ 物理区域                          │东│
+  │幽│ i=phys_x0 .. phys_x0+local_nx-1  │幽│
+  │灵│ j=phys_y0 .. phys_y0+local_ny-1  │灵│
+  │列│                                   │列│
+  ├──┴───────────────────────────────────┴──┤
+  │ 南幽灵行 j=0                            │ ← 来自 rank_south 的 j=local_ny 行
+  └─────────────────────────────────────────┘
+```
+
+- `phys_x0 = has_west_ghost() ? 1 : 0`（1D Y 切片时 phys_x0=0，无西幽灵）
+- `phys_y0 = has_south_ghost() ? 1 : 0`
+
+### 3.4 边界条件约定
 
 | 方向 | 注册 BC 的条件 | 检查方法 |
 |------|---------------|---------|
@@ -334,17 +196,36 @@ rank_east  = (col_rank < px-1)     ? row_rank*px + col_rank + 1 : MPI_PROC_NULL;
 | West | `col_rank == 0` | `decomp.has_west_wall()` |
 | East | `col_rank == px-1` | `decomp.has_east_wall()` |
 
-### 4.5 C++ 实现：`MpiDecomp2D::create()`
+1D Y 切片特例（px=1）：col_rank=0 ≡ 有西壁且有东壁（所有 rank 均注册 West/East BC）。
 
-**源文件**：`core/src/lbm/mpi_decomp.cpp`，`core/include/lbm/mpi_decomp.hpp`
+### 3.5 时序图
+
+每个 `Solver::step()` 内部的执行顺序：
+
+```
+collide()                ← BGK/MRT 碰撞（跳过所有幽灵节点）
+  ↓
+stream()                 ← 流式迁移（本地，周期取模）
+  ↓
+halo_exchange_d2q9_2d()  ← MPI_Sendrecv：先南北后东西
+  │  px=1 时跳过东西方向 Sendrecv（无幽灵列）
+  ↓
+apply_BC()               ← 各 rank 只施加自己持有的物理壁面 BC
+  ↓
+compute_macroscopic()    ← 更新 ρ/u
+```
+
+### 3.6 C++ 实现：`MpiDecomp2D::create()`
+
+**文件**：`core/src/lbm/mpi_decomp.cpp`
 
 ```cpp
+// 二维块分解（px=1 → 1D Y；py=1 → 1D X；px*py=nprocs → 2D）
 MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
 {
     MpiDecomp2D d;
     d.global_nx = gnx; d.global_ny = gny;
     d.px = in_px;      d.py = in_py;
-
     MPI_Comm_rank(MPI_COMM_WORLD, &d.rank);
     MPI_Comm_size(MPI_COMM_WORLD, &d.nprocs);
 
@@ -354,230 +235,293 @@ MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
     d.col_rank = d.rank % d.px;
     d.row_rank = d.rank / d.px;
 
-    // 均匀分配 X 和 Y 方向节点数
     uniform_partition(gnx, d.px, d.col_rank, d.local_nx, d.x_start);
     uniform_partition(gny, d.py, d.row_rank, d.local_ny, d.y_start);
+    d.x_end = d.x_start + d.local_nx - 1;
+    d.y_end = d.y_start + d.local_ny - 1;
 
-    // 计算四邻 rank（MPI_PROC_NULL 对 MPI_Sendrecv 是合法的"空邻居"）
+    // 四邻进程（MPI_PROC_NULL 对边界 rank 合法）
     d.rank_south = (d.row_rank > 0)        ? (d.row_rank-1)*d.px + d.col_rank : MPI_PROC_NULL;
     d.rank_north = (d.row_rank < d.py-1)   ? (d.row_rank+1)*d.px + d.col_rank : MPI_PROC_NULL;
-    d.rank_west  = (d.col_rank > 0)        ? d.row_rank*d.px + d.col_rank - 1 : MPI_PROC_NULL;
-    d.rank_east  = (d.col_rank < d.px-1)   ? d.row_rank*d.px + d.col_rank + 1 : MPI_PROC_NULL;
+    d.rank_west  = (d.col_rank > 0)        ? d.row_rank*d.px + d.col_rank-1   : MPI_PROC_NULL;
+    d.rank_east  = (d.col_rank < d.px-1)   ? d.row_rank*d.px + d.col_rank+1   : MPI_PROC_NULL;
     return d;
 }
 ```
 
-### 4.6 幽灵层交换：`halo_exchange_d2q9_2d()`
+### 3.7 幽灵层交换：`halo_exchange_d2q9_2d()`
 
-**源文件**：`core/src/lbm/mpi_decomp.cpp`
+交换分两步：
 
-交换分两步：先交换**南北整行**（数据连续，无需打包），再交换**东西整列**（需先打包到临时 `vector<double>`，因列在行主序中不连续）：
-
+**步骤 1（南北，行数据连续）**：
 ```cpp
-void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp)
-{
-    const int Q = d2q9::Q;
-    const int row_size = g.nx * Q;  // 一整行（含幽灵列）的 f 数据量
-
-    // --- 步骤 1：南北方向（行数据连续，直接 Sendrecv）---
-    MPI_Sendrecv(top_phys,    row_size, MPI_DOUBLE, decomp.rank_north, 10,
-                 south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 10,
-                 MPI_COMM_WORLD, &st);
-    MPI_Sendrecv(bot_phys,    row_size, MPI_DOUBLE, decomp.rank_south, 11,
-                 north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 11,
-                 MPI_COMM_WORLD, &st);
-
-    // --- 步骤 2：东西方向（列数据不连续，需先打包）---
-    // 打包最西/东物理列到 send_west / send_east
-    for (int j = 0; j < g.ny; ++j) {
-        for (int a = 0; a < Q; ++a) {
-            send_west[j*Q+a] = g.f[g.idx(px0, j) * Q + a];
-            send_east[j*Q+a] = g.f[g.idx(px0+local_nx-1, j) * Q + a];
-        }
-    }
-    // 向西邻发最西列，从东邻收东幽灵列
-    MPI_Sendrecv(send_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 20,
-                 recv_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 20,
-                 MPI_COMM_WORLD, &st);
-    // 向东邻发最东列，从西邻收西幽灵列
-    MPI_Sendrecv(send_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 21,
-                 recv_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 21,
-                 MPI_COMM_WORLD, &st);
-    // 解包到幽灵列
-    if (decomp.has_west_ghost()) { /* 解包 recv_west → i=0 列 */ }
-    if (decomp.has_east_ghost()) { /* 解包 recv_east → i=px0+local_nx 列 */ }
-}
+// 向北邻发送顶物理行，从南邻接收南幽灵行
+MPI_Sendrecv(top_phys, row_size, MPI_DOUBLE, decomp.rank_north, 10,
+             south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 10, ...);
+// 向南邻发送底物理行，从北邻接收北幽灵行
+MPI_Sendrecv(bot_phys, row_size, MPI_DOUBLE, decomp.rank_south, 11,
+             north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 11, ...);
 ```
 
-**幽灵节点不执行二次碰撞**（`solver.cpp`，`Solver::collide_bgk()`）：
+**步骤 2（东西，列数据不连续，需打包）**：
+```cpp
+// 打包最西/东物理列到 send_west / send_east（for j 循环）
+// 向西邻发最西列，从东邻收东幽灵列
+MPI_Sendrecv(send_west, col_size, MPI_DOUBLE, decomp.rank_west, 20,
+             recv_east,  col_size, MPI_DOUBLE, decomp.rank_east, 20, ...);
+// 向东邻发最东列，从西邻收西幽灵列
+MPI_Sendrecv(send_east, col_size, MPI_DOUBLE, decomp.rank_east, 21,
+             recv_west,  col_size, MPI_DOUBLE, decomp.rank_west, 21, ...);
+// 解包 recv_west/recv_east 到幽灵列
+```
+
+**1D Y 切片优化**：`px=1` 时 `has_west_ghost()=false` 且 `has_east_ghost()=false`，步骤 2 中所有打包循环为空（gny × Q × 8B 额外内存带宽为零），等价于原有 1D 实现的性能。
+
+### 3.8 三维预留：`MpiDecomp3D`
+
+`MpiDecomp3D` 是为未来三维 LBM（D3Q19/D3Q27）预留的域分解框架：
 
 ```cpp
-const bool use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
-// ...
-for (int i = n_start; i < n_end; ++i) {
-    if (use_mpi2d) {
-        const int ix = i % gnx2d, iy = i / gnx2d;
-        if ((sg2d && iy==0) || (ng2d && iy==gny2d-1)) continue;  // 跳过南/北幽灵行
-        if ((wg2d && ix==0) || (eg2d && ix==gnx2d-1)) continue;  // 跳过西/东幽灵列
-    }
-    // BGK 碰撞
-}
+// 进程布局：rank = pz_rank*(px*py) + row_rank*px + col_rank
+// 六邻进程：rank_west/east/south/north/bottom/top
+// 六方向幽灵层：has_west/east/south/north/bottom/top_ghost()
+// 退化关系：
+//   pz=1       → 等价于 MpiDecomp2D
+//   pz=1,py=1  → 等价于 1D X 切片
+//   pz=1,px=1  → 等价于 1D Y 切片
+static MpiDecomp3D create(int gnx, int gny, int gnz, int px, int py, int pz);
 ```
+
+**当前状态**：创建/空间范围查询 API 就绪；幽灵层交换（6 方向）和对应的三维 LBM 求解器待未来实现。
 
 ---
 
-## 5. 模式三：多网格独立模式（Multi-Grid）
+## 4. 模式二：多进程独立（`"independent"`）
 
-### 5.1 使用场景
+### 4.1 使用场景
 
 每个 MPI 进程运行**完全独立**的仿真（无任何 MPI 通信），适用于：
 
-- **参数扫描**：同时运行 Re=100/500/1000/5000 四种工况
-- **集成测试**：用多个独立进程并行验证不同边界条件组合
-- **重启点生成**：每进程从不同初始条件出发，快速生成多组数据
+- **参数扫描**：同时运行 Re = 100/500/1000/5000 四种工况
+- **集成测试**：并行验证不同边界条件组合
+- **重启点生成**：各进程从不同初始条件出发，快速生成多组数据
 
 ```toml
 [mpi]
-mode = "multi_grid"
+mode = "independent"   # 旧名 "multi_grid" 仍可用
 ```
 
 此模式下：
-- 每个进程分配 **完整** 的 `nx × ny` 全局网格，无需幽灵层
-- **无** `attach_mpi()` / `attach_mpi2d()` 绑定，`step()` 内无 MPI 通信
-- 所有进程执行**相同**的边界条件和配置（若需区分，可通过 `mpi_rank()` 动态调整参数）
+- 每个进程分配**完整**的 `nx × ny` 全局网格，无幽灵层
+- `step()` 内无 MPI 通信
+- 所有进程执行相同配置（若需区分，可通过 `mpi_rank()` 动态调整参数）
 
-### 5.2 输出目录隔离
+### 4.2 输出目录隔离
 
-多网格模式下，`main.rs` 自动将每进程的输出写入独立子目录：
+多进程独立模式下，每进程的输出写入独立子目录：
 
 ```
 output/
-├── rank_0/       ← rank 0 的 fluid_*.npz 等快照
+├── rank_0/       ← rank 0 的快照
 │   ├── fluid_000001.npz
 │   └── monitor.csv
-├── rank_1/       ← rank 1 的快照
+├── rank_1/
 ├── rank_2/
 └── rank_3/
 ```
 
-实现（`orchestrator/src/main.rs`）：
+---
 
-```rust
-let output_dir = if cfg.mpi.mode == "multi_grid" && nprocs > 1 {
-    format!("{}/rank_{}", cfg.output.directory, rank)
-} else {
-    cfg.output.directory.clone()
-};
-std::fs::create_dir_all(&output_dir)?;
+## 5. 模式三：嵌套式多重网格（`"multigrid"`）
+
+### 5.1 概述与适用场景
+
+"多重网格"（multigrid/AMR 风格）指细网格**嵌套**在粗网格上，可实现任意嵌套层数：
+
 ```
+全局粗网格（level=0，256×256）
+  └── 细化区域 A（level=1，中心 64×64，加密比 2）
+        └── 更细区域 A1（level=2，中心 16×16，加密比 2）
+  └── 细化区域 B（level=1，右下角 32×32，加密比 2）
+```
+
+**适用场景**：
+- 在流场中的高梯度区域（如边界层、激波、涡）使用细网格
+- 其他区域使用粗网格，降低全局计算量
+- AMR（自适应网格细化）前处理/框架搭建
+
+### 5.2 多重网格树数据结构（`MgTree` / `MgNode`）
+
+**文件**：`core/include/lbm/mg_tree.hpp`，`core/src/lbm/mg_tree.cpp`
+
+```
+MgTree（N 叉树，管理所有节点的所有权）
+│
+├── root（MgNode，level=0，粗网格）
+│   ├── extent: {0,255, 0,255, 0,0}  ← 全局范围
+│   ├── grid:   *LatticeGrid          ← 绑定粗网格实例（可空）
+│   └── children:
+│       ├── MgNode（level=1，细化区域 A）
+│       │   ├── extent: {96,159, 96,159, 0,0}
+│       │   ├── refine_ratio: 2
+│       │   └── children:
+│       │       └── MgNode（level=2）
+│       └── MgNode（level=1，细化区域 B）
+│           ├── extent: {192,255, 0,63, 0,0}
+│           └── refine_ratio: 2
+```
+
+### 5.3 树节点的空间范围（`MgExtent`）
+
+```cpp
+struct MgExtent {
+    int x_start, x_end;   // 全局 X 格子坐标（0-based，含端点）
+    int y_start, y_end;   // 全局 Y 格子坐标
+    int z_start, z_end;   // 全局 Z 格子坐标（2D 时设 0，nz()=1）
+
+    int nx() const { return x_end - x_start + 1; }
+    int ny() const { return y_end - y_start + 1; }
+    int nz() const { return (z_end > z_start) ? z_end - z_start + 1 : 1; }
+    bool is_3d() const { return z_end > z_start; }
+    bool contains(const MgExtent& other) const;  // 包含关系（验证子节点合法性）
+    bool overlaps(const MgExtent& other) const;  // 重叠检测
+};
+```
+
+`add_level()` 会在 `child_extent` 不在 `parent->extent` 内时抛出 `std::invalid_argument`，防止越界嵌套。
+
+### 5.4 N 叉树结构与任意嵌套
+
+**树的增长**（`add_level()`）：
+
+```cpp
+MgTree tree({0,255, 0,255, 0,0});           // 根节点（256×256 粗网格）
+
+// 第一层：嵌套两个细化区域（中心+角落）
+auto* c1a = tree.add_level(root, {96,159, 96,159, 0,0}, 2);   // 加密比 2
+auto* c1b = tree.add_level(root, {192,255, 0,63, 0,0},  2);
+
+// 第二层：在 c1a 内再嵌套
+auto* c2  = tree.add_level(c1a, {112,143, 112,143, 0,0}, 2);
+
+// 深度任意：
+auto* c3  = tree.add_level(c2, {120,135, 120,135, 0,0}, 4);  // 加密比 4
+```
+
+**等价数据结构**：
+- 2D 各向同性加密（refine_ratio=2）→ **四叉树**（quadtree）
+- 3D 各向同性加密（refine_ratio=2）→ **八叉树**（octree）
+- 一维方向加密 → **二叉树**（binary tree）
+- 非均匀加密（不同方向不同 ratio）→ **N 叉树**
+
+### 5.5 三维支持（`MgDim::D3`）
+
+```cpp
+MgTree tree_3d({0,63, 0,63, 0,63}, MgDim::D3);  // 64×64×64 粗网格
+
+// 在粗网格中嵌套细化区域（z 方向有非零范围）
+auto* fine_3d = tree_3d.add_level(root,
+    {16,47, 16,47, 16,47},  // 三维嵌套区域
+    2                        // 加密比（3D: 每格→2×2×2=8 个细格）
+);
+
+// volume_ratio() = refine_ratio^3 = 8（D3 模式）
+```
+
+### 5.6 与 MPI 域分解的关联
+
+每个 `MgNode` 持有可选的 `decomp` 指针，支持**并行多重网格**：
+
+```cpp
+MgNode {
+    // ...
+    void* decomp = nullptr;  // 可绑定 MpiDecomp2D* 或 MpiDecomp3D*（按层独立分解）
+};
+```
+
+**块分解与多重网格树的统一**：
+
+```
+全局粗网格（level=0）
+  │ decomp = MpiDecomp2D::create(256, 256, 2, 2)  ← 粗层用 4 进程 2×2 分解
+  └── 细化区域（level=1）
+        │ decomp = MpiDecomp2D::create(64, 64, 2, 2)  ← 细层也用 4 进程（独立分解）
+        └── 更细区域（level=2）
+              │ decomp = nullptr  ← 最细层单进程运行
+```
+
+### 5.7 遍历接口
+
+```cpp
+// 粗→细（BFS）：先推进粗网格，再推进细网格
+tree.traverse_coarse_to_fine([](MgNode* node) {
+    if (node->has_grid()) {
+        // 在该层执行 LBM 步骤
+        // node->grid->solver->step();  // 待 LBM-MG 算子实现后启用
+    }
+});
+
+// 细→粗（BFS 逆序）：残差传递（restriction）
+tree.traverse_fine_to_coarse([](MgNode* node) {
+    // 将细层残差传递到粗层（待实现）
+});
+
+// 查询
+int max_lv  = tree.max_level();    // 最大层级（根=0）
+int n_nodes = tree.node_count();   // 总节点数
+auto lvl1   = tree.nodes_at_level(1);  // 所有 level=1 节点
+```
+
+### 5.8 当前实现状态与扩展路线
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| `MgTree` / `MgNode` 数据结构 | ✅ 就绪 | N 叉树，支持 2D/3D，任意嵌套 |
+| `add_level()` / `traverse_*()` | ✅ 就绪 | 含边界检查和 BFS 遍历 |
+| `LbmMgTree` Rust 封装 | ✅ 就绪 | 完整 FFI + RAII |
+| C ABI（`lbm_mg_tree_*`） | ✅ 就绪 | 创建/释放/节点查询 |
+| `decomp` 字段绑定 | ✅ 接口就绪 | 调用方负责传入 `MpiDecomp2D*` |
+| LBM 层间插值算子（prolongation） | 🔲 待实现 | 细→粗速度/分布函数插值 |
+| LBM 层间限制算子（restriction） | 🔲 待实现 | 粗→细残差传递 |
+| 时间步同步（粗/细层时间步之比） | 🔲 待实现 | 加密比 r 时细层时间步 = 1/r |
+| 自动 AMR 细化判断（误差估计）| 🔲 待实现 | 基于局部梯度/涡量的自适应 |
 
 ---
 
 ## 6. MPI + OpenMP 混合并行
 
-### 6.1 线程/进程分配策略
-
-混合并行模式下，每个 MPI 进程内部使用多个 OpenMP 线程加速局部计算：
-
-```
-节点 A (rank 0..3)                    节点 B (rank 4..7)
-┌────────────────────────┐            ┌────────────────────────┐
-│ rank 0 (8 OMP threads) │ ←Halo→    │ rank 4 (8 OMP threads) │
-│ rank 1 (8 OMP threads) │ ←Halo→    │ rank 5 (8 OMP threads) │
-│ rank 2 (8 OMP threads) │ ←Halo→    │ rank 6 (8 OMP threads) │
-│ rank 3 (8 OMP threads) │            │ rank 7 (8 OMP threads) │
-└────────────────────────┘            └────────────────────────┘
-```
-
-**建议**：
-
-- MPI 进程数 × OMP 线程数 ≤ 总物理核心数
-- 每节点 1 个 MPI 进程 + N 个 OMP 线程，`N` = 节点物理核心数（NUMA 感知最佳）
-- 或每 NUMA 域 1 个 MPI 进程 + 域内核心数个 OMP 线程
-
-### 6.2 TOML 配置示例
+### 6.1 OpenMP 线程数设置
 
 ```toml
 [parallel]
 omp_num_threads = 8   # 每个 MPI 进程使用 8 个 OpenMP 线程
-
-[mpi]
-mode      = "2d_xy"
-nx_blocks = 4
-ny_blocks = 2
-# 总并行度 = 8 进程 × 8 线程 = 64 核
 ```
 
-运行（SLURM HPC）：
+等价于 `omp_set_num_threads(8)`，优先级高于 `OMP_NUM_THREADS` 环境变量。
 
-```bash
-mpirun --bind-to socket --map-by socket -n 8 \
-    ./target/release/lbm-orchestrator configs/hybrid.toml
+Rust API：`lbm_bindings::set_omp_num_threads(8)`
+C API：`lbm_omp_set_num_threads(8)`
+
+### 6.2 线程/进程分配策略
+
 ```
+节点 A（rank 0..3）                节点 B（rank 4..7）
+┌──────────────────────────┐       ┌──────────────────────────┐
+│ rank 0 (8 OMP threads)  │←Halo→ │ rank 4 (8 OMP threads)  │
+│ rank 1 (8 OMP threads)  │←Halo→ │ rank 5 (8 OMP threads)  │
+│ rank 2 (8 OMP threads)  │←Halo→ │ rank 6 (8 OMP threads)  │
+│ rank 3 (8 OMP threads)  │       │ rank 7 (8 OMP threads)  │
+└──────────────────────────┘       └──────────────────────────┘
+总并行度 = 8 进程 × 8 线程 = 64 核
+```
+
+**建议**：MPI 进程数 × OMP 线程数 ≤ 总物理核心数；每 NUMA 域分配 1 个 MPI 进程 + 域内核心数个 OMP 线程以最大化 NUMA 亲和性。
 
 ---
 
 ## 7. Rust / C API 使用示例
 
-### 7.1 一维切片示例（Rust）
-
-```rust
-use lbm_bindings::{
-    mpi_init, mpi_finalize, mpi_rank, mpi_size, mpi_local_ny,
-    LbmGrid, LbmSolver, LbmMpiDecomp,
-    LatticeModel, CollisionModel, BcType, Face,
-    set_omp_num_threads,
-};
-
-fn main() {
-    // 1. 初始化 MPI
-    mpi_init();
-    let rank   = mpi_rank();
-    let nprocs = mpi_size();
-
-    // 2. 可选：设置 OpenMP 线程数
-    set_omp_num_threads(4);
-
-    // 3. 计算本进程的本地网格尺寸
-    let global_nx = 256i32;
-    let global_ny = 256i32;
-    let (grid_ny, _y_start, _local_ny) = mpi_local_ny(global_ny);
-    // grid_ny = local_ny + 2（nprocs>1 时含幽灵行）
-
-    // 4. 创建本地网格
-    let mut grid = LbmGrid::new(global_nx, grid_ny, 1, LatticeModel::D2Q9);
-
-    // 5. 创建求解器并绑定一维 MPI 分解
-    let omega = 1.0 / (3.0 * 0.01 + 0.5);
-    let mut solver = LbmSolver::new(&mut grid, omega, CollisionModel::Bgk);
-
-    let mut decomp = LbmMpiDecomp::new(global_nx, global_ny)
-        .expect("MPI not initialized or MPI not enabled");
-    solver.attach_mpi(Some(&mut decomp));
-
-    // 6. 注册边界条件（各 rank 只注册自己持有的物理壁面）
-    if rank == 0 {
-        // rank 0 持有全局南壁
-        solver.add_boundary_condition(BcType::BounceBack, Face::South, 0.0, 0.0, 0.0, 1.0);
-    }
-    if rank == nprocs - 1 {
-        // 最后 rank 持有全局北壁（顶盖速度）
-        solver.add_boundary_condition(BcType::ZouHeVelocity, Face::North, 0.1, 0.0, 0.0, 0.0);
-    }
-    // 所有 rank 注册东西壁
-    solver.add_boundary_condition(BcType::BounceBack, Face::West, 0.0, 0.0, 0.0, 1.0);
-    solver.add_boundary_condition(BcType::BounceBack, Face::East, 0.0, 0.0, 0.0, 1.0);
-
-    // 7. 主循环（step() 内部自动执行幽灵行交换）
-    for _step in 0..5000 {
-        solver.step(&mut grid);
-    }
-
-    mpi_finalize();
-}
-```
-
-### 7.2 二维块分解示例（Rust）
+### 7.1 XY 块分解示例（1D Y 切片 ≡ nx_blocks=1）
 
 ```rust
 use lbm_bindings::{
@@ -591,96 +535,151 @@ fn main() {
     let rank   = mpi_rank();
     let nprocs = mpi_size();
 
-    // 2D 块分解：px=4, py=2 → 需要 mpirun -n 8
-    let global_nx = 512i32;
-    let global_ny = 512i32;
-    let px = 4i32;
-    let py = 2i32;
-    assert_eq!(px * py, nprocs, "px*py must equal nprocs");
+    let global_nx = 256i32;
+    let global_ny = 256i32;
 
-    // 创建 2D 分解描述符
-    let mut decomp2d = LbmMpiDecomp2D::new(global_nx, global_ny, px, py)
-        .expect("2D decomp creation failed");
+    // 1D Y 切片 = 2D 块分解（px=1, py=nprocs）
+    let mut decomp2d = LbmMpiDecomp2D::new(global_nx, global_ny, 1, nprocs)
+        .expect("分解创建失败");
 
-    // 创建本地网格（尺寸由 decomp2d 决定，含幽灵列）
-    let local_nx = decomp2d.grid_nx();
-    let local_ny = decomp2d.grid_ny();
-    let x_start  = decomp2d.x_start();
+    let local_nx = decomp2d.grid_nx();  // = global_nx（px=1 时无西/东幽灵）
+    let local_ny = decomp2d.grid_ny();  // = local_ny + 南/北幽灵
     let y_start  = decomp2d.y_start();
 
-    println!("rank={rank}: local={local_nx}×{local_ny}, x_start={x_start}, y_start={y_start}");
+    println!("rank={rank}: y_start={y_start}, local grid={local_nx}×{local_ny}");
 
-    let mut grid = LbmGrid::new(local_nx, local_ny, 1, LatticeModel::D2Q9);
+    let mut grid   = LbmGrid::new(local_nx, local_ny, 1, LatticeModel::D2Q9);
     let mut solver = LbmSolver::new(&mut grid, 1.6, CollisionModel::Bgk);
 
-    // 绑定二维分解（之后 step() 自动执行 2D 幽灵层交换）
+    // 绑定 2D 分解（px=1 时 halo_exchange_d2q9_2d 自动跳过东西方向）
     solver.attach_mpi2d(Some(&mut decomp2d));
 
-    // 注册各 rank 拥有的物理壁面
-    // 以顶盖驱动方腔为例：
+    // 注册边界条件（只注册本进程持有的物理壁面）
     if decomp2d.y_start() == 0 {
         solver.add_boundary_condition(BcType::BounceBack, Face::South, 0.0, 0.0, 0.0, 1.0);
     }
-    // ... (类似地注册 North、West、East)
-
-    for _step in 0..5000 {
-        solver.step(&mut grid);
+    if decomp2d.y_start() + local_ny == global_ny {
+        solver.add_boundary_condition(BcType::ZouHeVelocity, Face::North, 0.1, 0.0, 0.0, 0.0);
     }
+    // px=1：所有 rank 拥有西/东壁
+    solver.add_boundary_condition(BcType::BounceBack, Face::West, 0.0, 0.0, 0.0, 1.0);
+    solver.add_boundary_condition(BcType::BounceBack, Face::East, 0.0, 0.0, 0.0, 1.0);
 
+    for _ in 0..5000 { solver.step(&mut grid); }
     mpi_finalize();
 }
 ```
 
-> **注意**：`decomp2d.y_start() == 0` 等价于 `decomp2d.has_south_wall()`（即 `row_rank == 0`）。在 Rust 中若需直接访问 `col_rank` / `row_rank`，可通过 C ABI 的 `lbm_mpi_decomp2d_x_start()` / `lbm_mpi_decomp2d_y_start()` 推算。
-
-### 7.3 多网格独立模式示例（Rust）
+### 7.2 二维块分解示例
 
 ```rust
-use lbm_bindings::{mpi_init, mpi_finalize, mpi_rank, mpi_size, LbmGrid, LbmSolver, ...};
+// 2D 块分解：px=4, py=2 → 需要 mpirun -n 8
+let (global_nx, global_ny, px, py) = (512i32, 512i32, 4i32, 2i32);
+assert_eq!(px * py, nprocs, "px*py must equal nprocs");
 
-fn main() {
-    mpi_init();
-    let rank = mpi_rank();
+let mut decomp2d = LbmMpiDecomp2D::new(global_nx, global_ny, px, py)
+    .expect("分解创建失败");
 
-    // 每个进程持有完整网格，无幽灵层，无通信
-    let nx = 256i32; let ny = 256i32;
-    let mut grid = LbmGrid::new(nx, ny, 1, LatticeModel::D2Q9);
-    let mut solver = LbmSolver::new(&mut grid, 1.6, CollisionModel::Bgk);
-    // 注册完整边界条件（所有进程相同）
-    // ...
+let local_nx = decomp2d.grid_nx();
+let local_ny = decomp2d.grid_ny();
+let x_start  = decomp2d.x_start();
+let y_start  = decomp2d.y_start();
 
-    // 也可以根据 rank 设置不同参数（如不同 Re 数）：
-    // let nu = [0.01, 0.005, 0.002, 0.001][rank as usize % 4];
-    // let mut solver = LbmSolver::new(&mut grid, 1.0/(3.0*nu+0.5), CollisionModel::Bgk);
-
-    for _step in 0..5000 {
-        solver.step(&mut grid);
-    }
-    // 输出写入 output/rank_<N>/（由 orchestrator 自动处理）
-
-    mpi_finalize();
+// 注册各 rank 拥有的物理壁面
+if y_start == 0 {
+    solver.add_boundary_condition(BcType::BounceBack, Face::South, ...);
 }
+if x_start == 0 {
+    solver.add_boundary_condition(BcType::BounceBack, Face::West, ...);
+}
+// ... East, North 类似
 ```
 
-### 7.4 C ABI 函数速查表
+### 7.3 多进程独立模式示例
+
+```rust
+mpi_init();
+let rank = mpi_rank();
+
+// 每个进程持有完整网格，无幽灵层，无通信
+let mut grid   = LbmGrid::new(256, 256, 1, LatticeModel::D2Q9);
+let mut solver = LbmSolver::new(&mut grid, 1.6, CollisionModel::Bgk);
+// 也可通过 rank 设置不同 omega（不同 Re）：
+// let omega = [1.0/(3.0*0.01+0.5), 1.0/(3.0*0.005+0.5), ...][rank as usize];
+for _ in 0..5000 { solver.step(&mut grid); }
+// 输出写入 output/rank_<rank>/（由 orchestrator 自动处理）
+mpi_finalize();
+```
+
+### 7.4 多重网格树创建示例
+
+```rust
+use lbm_bindings::LbmMgTree;
+
+// 创建 2D 双层嵌套（256×256 粗网格 + 中心 64×64 细网格）
+let mut tree = LbmMgTree::new(0, 255, 0, 255, 0, 0, false)
+    .expect("MgTree creation failed");
+
+// 在粗网格中嵌套细网格（中心区域，加密比 2）
+let fine_node = tree.add_level_from_root(96, 159, 96, 159, 0, 0, 2)
+    .expect("add_level failed");
+
+println!("最大层级: {}", tree.max_level());   // 1
+println!("节点总数: {}", tree.node_count());  // 2
+
+// 再嵌套第二层（加密比 4）
+let finer_node = tree.add_level(fine_node, 112, 143, 112, 143, 0, 0, 4)
+    .expect("add_level failed");
+println!("最大层级: {}", tree.max_level());   // 2
+println!("节点总数: {}", tree.node_count());  // 3
+
+// 3D 示例：
+let mut tree_3d = LbmMgTree::new(0, 63, 0, 63, 0, 63, true)
+    .expect("3D MgTree creation failed");
+let fine_3d = tree_3d.add_level_from_root(16, 47, 16, 47, 16, 47, 2)
+    .expect("add_level failed");
+```
+
+### 7.5 C ABI 函数速查表
+
+**MPI 块分解接口**
 
 | C 函数 | 对应 Rust 函数 | 说明 |
 |--------|---------------|------|
-| `lbm_mpi_init()` | `mpi_init()` | 初始化 MPI（幂等） |
+| `lbm_mpi_init()` | `mpi_init()` | 初始化 MPI |
 | `lbm_mpi_finalize()` | `mpi_finalize()` | 结束 MPI |
 | `lbm_mpi_rank()` | `mpi_rank()` | 当前进程编号 |
 | `lbm_mpi_size()` | `mpi_size()` | 进程总数 |
-| `lbm_mpi_local_ny(gny, &yst, &lny)` | `mpi_local_ny(gny)` → `(grid_ny, y_start, local_ny)` | 一维切片本地 ny |
-| `lbm_mpi_decomp_new(gnx, gny)` | `LbmMpiDecomp::new(gnx, gny)` | 创建一维分解 |
-| `lbm_mpi_decomp_free(h)` | `Drop for LbmMpiDecomp` | 释放一维分解 |
-| `lbm_solver_attach_mpi(s, h)` | `LbmSolver::attach_mpi(d)` | 绑定一维分解 |
-| `lbm_mpi_decomp2d_new(gnx, gny, px, py)` | `LbmMpiDecomp2D::new(gnx, gny, px, py)` | 创建二维分解 |
-| `lbm_mpi_decomp2d_free(h)` | `Drop for LbmMpiDecomp2D` | 释放二维分解 |
-| `lbm_solver_attach_mpi2d(s, h)` | `LbmSolver::attach_mpi2d(d)` | 绑定二维分解 |
-| `lbm_mpi_decomp2d_grid_nx(h)` | `LbmMpiDecomp2D::grid_nx()` | 本地含幽灵列 nx |
-| `lbm_mpi_decomp2d_grid_ny(h)` | `LbmMpiDecomp2D::grid_ny()` | 本地含幽灵行 ny |
-| `lbm_mpi_decomp2d_x_start(h)` | `LbmMpiDecomp2D::x_start()` | 全局 X 起始坐标 |
-| `lbm_mpi_decomp2d_y_start(h)` | `LbmMpiDecomp2D::y_start()` | 全局 Y 起始坐标 |
+| `lbm_mpi_decomp2d_new(gnx,gny,px,py)` | `LbmMpiDecomp2D::new(...)` | 创建 2D 块分解（1D 用 px=1 或 py=1）|
+| `lbm_mpi_decomp2d_free(h)` | `Drop for LbmMpiDecomp2D` | 释放 |
+| `lbm_solver_attach_mpi2d(s,h)` | `solver.attach_mpi2d(d)` | 绑定 2D 分解 |
+| `lbm_mpi_decomp2d_grid_nx(h)` | `d.grid_nx()` | 含幽灵层 nx |
+| `lbm_mpi_decomp2d_grid_ny(h)` | `d.grid_ny()` | 含幽灵层 ny |
+| `lbm_mpi_decomp2d_x_start(h)` | `d.x_start()` | 全局 X 起始 |
+| `lbm_mpi_decomp2d_y_start(h)` | `d.y_start()` | 全局 Y 起始 |
+| `lbm_mpi_decomp3d_new(gnx,gny,gnz,px,py,pz)` | `LbmMpiDecomp3D::new(...)` | 创建 3D 块分解（预留）|
+| `lbm_mpi_decomp3d_grid_nz(h)` | `d.grid_nz()` | 含幽灵层 nz（3D）|
+| `lbm_mpi_decomp3d_z_start(h)` | `d.z_start()` | 全局 Z 起始（3D）|
+
+**多重网格树接口**
+
+| C 函数 | 对应 Rust 函数 | 说明 |
+|--------|---------------|------|
+| `lbm_mg_tree_new(x0,x1,y0,y1,z0,z1,is_3d)` | `LbmMgTree::new(...)` | 创建树（2D/3D）|
+| `lbm_mg_tree_free(h)` | `Drop for LbmMgTree` | 释放树及所有节点 |
+| `lbm_mg_tree_add_level(tree,parent,x0,x1,y0,y1,z0,z1,r)` | `tree.add_level(parent,...)` | 添加细化子区域 |
+| `lbm_mg_tree_root(h)` | `tree.root()` | 获取根节点 |
+| `lbm_mg_tree_max_level(h)` | `tree.max_level()` | 最大层级 |
+| `lbm_mg_tree_node_count(h)` | `tree.node_count()` | 节点总数 |
+| `lbm_mg_node_set_grid(node,grid)` | — | 绑定 LatticeGrid |
+| `lbm_mg_node_level(node)` | — | 节点层级 |
+| `lbm_mg_node_refine_ratio(node)` | — | 加密比 |
+| `lbm_mg_node_child_count(node)` | — | 子节点数 |
+
+**OpenMP 接口**
+
+| C 函数 | 对应 Rust 函数 | 说明 |
+|--------|---------------|------|
 | `lbm_omp_set_num_threads(n)` | `set_omp_num_threads(n)` | 设置 OMP 线程数 |
 
 ---
@@ -695,145 +694,55 @@ fn main() {
 | `LBM_ENABLE_OPENMP=ON` | `-DENABLE_OPENMP=ON` | 启用 OpenMP（默认 OFF） |
 | `LBM_ENABLE_CUDA=ON` | `-DENABLE_CUDA=ON` | 启用 CUDA GPU 后端 |
 
-> **Windows**：需预装 [Microsoft MPI (MS-MPI)](https://learn.microsoft.com/en-us/message-passing-interface/microsoft-mpi) 或 Intel MPI；运行时使用 `mpiexec -n N` 而非 `mpirun -n N`。
-
 ### 8.2 跨平台构建命令
 
-#### Linux / macOS（Bash / Zsh）
-
+**Linux / macOS**：
 ```bash
-# 仅 OpenMP
-LBM_ENABLE_OPENMP=ON cargo build --release
-
-# 仅 MPI
-LBM_ENABLE_MPI=ON cargo build --release
-
 # MPI + OpenMP 混合
 LBM_ENABLE_MPI=ON LBM_ENABLE_OPENMP=ON cargo build --release
-
-# 持久化（当前 shell 会话）
-export LBM_ENABLE_MPI=ON
-export LBM_ENABLE_OPENMP=ON
-cargo build --release
 ```
 
-#### Windows PowerShell
-
+**Windows PowerShell**：
 ```powershell
-$env:LBM_ENABLE_MPI    = "ON"
-$env:LBM_ENABLE_OPENMP = "ON"
+$env:LBM_ENABLE_MPI = "ON"; $env:LBM_ENABLE_OPENMP = "ON"
 cargo build --release
-```
-
-#### Windows cmd
-
-```bat
-set LBM_ENABLE_MPI=ON
-set LBM_ENABLE_OPENMP=ON
-cargo build --release
-```
-
-#### 纯 CMake 构建（不依赖 Cargo，适合 HPC 集成测试）
-
-```bash
-cmake -B build \
-      -DENABLE_MPI=ON \
-      -DENABLE_OPENMP=ON \
-      -DENABLE_CUDA=OFF \
-      -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
 ```
 
 ### 8.3 运行命令
 
-#### 一维 Y 切片（4 进程）
-
+**一维 Y 切片（4 进程，nx_blocks=1 自动）**：
 ```bash
-# 在 TOML 中设置 [mpi] mode = "1d_y"（或省略，默认值）
-mpirun -n 4 ./target/release/lbm-orchestrator configs/lid_driven_cavity.toml
+# configs/my.toml: [mpi] mode="block" nx_blocks=1 ny_blocks=0
+mpirun -n 4 ./target/release/lbm-orchestrator configs/my.toml
 ```
 
-#### 二维 XY 块分解（4×2 = 8 进程）
-
-```toml
-# configs/mpi2d.toml
-[mpi]
-mode      = "2d_xy"
-nx_blocks = 4
-ny_blocks = 2
-```
-
+**二维 XY 块（4×2 = 8 进程）**：
 ```bash
-mpirun -n 8 ./target/release/lbm-orchestrator configs/mpi2d.toml
+# [mpi] mode="block" nx_blocks=4 ny_blocks=2
+mpirun -n 8 ./target/release/lbm-orchestrator configs/my.toml
 ```
 
-#### 多网格独立模式（4 套独立仿真）
-
-```toml
-# configs/multi_grid.toml
-[mpi]
-mode = "multi_grid"
-```
-
+**多进程独立（4 套独立仿真）**：
 ```bash
-mpirun -n 4 ./target/release/lbm-orchestrator configs/multi_grid.toml
-# 输出：output/rank_0/ output/rank_1/ output/rank_2/ output/rank_3/
+# [mpi] mode="independent"
+mpirun -n 4 ./target/release/lbm-orchestrator configs/my.toml
+# 输出: output/rank_0/ output/rank_1/ output/rank_2/ output/rank_3/
 ```
 
-#### MPI + OpenMP 混合
-
-```toml
-# configs/hybrid.toml
-[parallel]
-omp_num_threads = 4
-
-[mpi]
-mode      = "2d_xy"
-nx_blocks = 2
-ny_blocks = 2
-```
-
-```bash
-# 每节点 4 进程，每进程 4 OMP 线程 = 16 核
-mpirun -n 4 ./target/release/lbm-orchestrator configs/hybrid.toml
-```
-
-#### Windows（MS-MPI）
-
+**Windows（MS-MPI）**：
 ```powershell
-mpiexec -n 4 .\target\release\lbm-orchestrator.exe configs\lid_driven_cavity.toml
+mpiexec -n 4 .\target\release\lbm-orchestrator.exe configs\my.toml
 ```
 
 ### 8.4 SLURM 集群脚本示例
 
-#### 一维切片（单节点 16 进程）
-
+**2D 块分解 + OpenMP 混合（2 节点，每节点 4 进程 × 4 线程）**：
 ```bash
 #!/bin/bash
-#SBATCH --job-name=lbm_mpi1d
-#SBATCH --nodes=1
-#SBATCH --ntasks=16
-#SBATCH --cpus-per-task=1
-
-module load openmpi/4.1
-
-mpirun -n 16 ./target/release/lbm-orchestrator configs/lid_driven_cavity.toml
-```
-
-#### 二维块分解（2 节点，每节点 4 进程 × 4 线程）
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=lbm_mpi2d_hybrid
-#SBATCH --nodes=2
-#SBATCH --ntasks=8
-#SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=4
-
-export OMP_PROC_BIND=close
-export OMP_PLACES=cores
-
-# 通过 TOML [parallel].omp_num_threads = 4 设置（或环境变量）
+#SBATCH --nodes=2 --ntasks=8 --ntasks-per-node=4 --cpus-per-task=4
+export OMP_PROC_BIND=close; export OMP_PLACES=cores
+# TOML: [mpi] mode="block" nx_blocks=4 ny_blocks=2
+#        [parallel] omp_num_threads=4
 mpirun -n 8 ./target/release/lbm-orchestrator configs/hybrid.toml
 ```
 
@@ -841,68 +750,56 @@ mpirun -n 8 ./target/release/lbm-orchestrator configs/hybrid.toml
 
 ## 9. 正确性保证与常见陷阱
 
-### 9.1 不要对幽灵层执行二次碰撞
+### 9.1 幽灵节点不执行二次碰撞
 
-**问题**：幽灵层节点中的 f 值已由相邻进程完成了一次碰撞。若本进程再次对其执行碰撞（"二次碰撞"），分布函数被过度松弛，边界附近密度/速度出现错误。
+幽灵节点持有相邻进程已完成碰撞的数据；若再次碰撞会引入"二次松弛"误差。`collide_bgk()` / `collide_mrt()` 通过 ix/iy 检查跳过所有幽灵节点。
 
-**修复**（已实现）：
-- 一维模式：`collide_bgk()` / `collide_mrt()` 用 `n_start` / `n_end` 跳过幽灵行
-- 二维模式：`collide_bgk()` / `collide_mrt()` 用 `ix/iy` 检查逐节点跳过幽灵层节点
+### 9.2 边界条件只在拥有物理壁的 rank 注册
 
-### 9.2 边界条件只在拥有该物理壁的 rank 注册
-
-**问题**：若所有 rank 都注册了 South BC，内部 rank 的 j=0 行是幽灵行而非物理南壁，错误地施加 BC 会破坏 halo 数据。
-
-**检查方法**（C++）：
-```cpp
-if (decomp.has_south_wall()) {  // rank==0（1D）或 row_rank==0（2D）
-    solver.add_boundary_condition(bc_south);
-}
-```
-
-**检查方法**（Rust，二维分解）：
 ```rust
-if decomp2d.y_start() == 0 {  // row_rank == 0
+if decomp2d.y_start() == 0 {              // row_rank==0 → 南壁
     solver.add_boundary_condition(BcType::BounceBack, Face::South, ...);
 }
+if decomp2d.x_start() == 0 {              // col_rank==0 → 西壁
+    solver.add_boundary_condition(BcType::BounceBack, Face::West, ...);
+}
+// 类似地检查 North、East
 ```
 
-### 9.3 px × py 必须等于 MPI 进程总数
+### 9.3 nx_blocks × ny_blocks 必须等于进程数
 
-`lbm_mpi_decomp2d_new(gnx, gny, px, py)` 在 `px * py != nprocs` 时返回 `nullptr`（Rust 侧返回 `None`）。`Solver::attach_mpi2d(nullptr)` 退化为解除绑定，不会崩溃，但会静默回退到无 MPI 模式。
-
-**orchestrator 自动检测**（`main.rs`）：若检测到 `nx_blocks * ny_blocks != nprocs`，打印警告并退化为 1D Y 切片模式：
-
+若检测到不匹配，orchestrator 会打印警告并自动退化为 1D Y 切片（nx_blocks=1, ny_blocks=nprocs）：
 ```
-[warn] mpi.nx_blocks(4) * mpi.ny_blocks(2) = 8 ≠ nprocs(4). Falling back to 1d_y decomposition.
+[warn] mpi.nx_blocks(4) * mpi.ny_blocks(2) = 8 ≠ nprocs(4).
+       Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).
 ```
+
+### 9.4 MgTree 子节点范围必须在父节点内
+
+`add_level()` 在 `child_extent` 不是 `parent->extent` 子集时抛出 `std::invalid_argument`。确保坐标正确，2D 时 `z_start=z_end=0`。
 
 ---
 
 ## 10. 性能分析与调优建议
 
-### 通信量分析
+### 通信量对比
 
-| 模式 | 每步通信量（D2Q9，n=N²）| 备注 |
-|------|------------------------|------|
-| 一维 Y（P 进程）| 2 × nx × 9 × 8 B × P | 只有南北方向 2 次 |
-| 二维 XY（px×py）| 2 × (lnx + lny) × 9 × 8 B × P | 南北+东西 4 次；东西需打包列 |
+| 模式 | 每步通信量（D2Q9，N² 节点，P 进程）| 说明 |
+|------|-----------------------------------|------|
+| 1D Y（px=1, py=P）| 2 × nx × 9 × 8 B × P | 仅南北 2 次 Sendrecv |
+| 1D X（px=P, py=1）| 2 × ny × 9 × 8 B × P | 仅东西 2 次（含打包开销）|
+| 2D XY（px×py=P）| 2 × (lnx+lny) × 9 × 8 B × P | 4 次 Sendrecv，东西需打包 |
 
-**二维优势**：当网格接近方形（nx ≈ ny）且进程数多时，每进程本地面积 O(N²/P) 而通信周长 O(N/√P)，二维分解的通信计算比更优（O(1/√P)）。一维分解通信周长为 O(N)，计算比 O(1/√P) 仅当 py≈1 时与二维持平。
+**2D 优势**：方形网格（nx≈ny）下，每进程本地面积 O(N²/P)，通信周长 O(N/√P)，通信计算比 O(1/√P) 远优于 1D 的 O(1/P^{1/2})。
 
-### OpenMP 与 MPI 的协同
+### 选择建议
 
-- **OpenMP 粒度**：碰撞、流式迁移和宏观量计算均用 `#pragma omp parallel for schedule(static)` 并行，各节点完全独立，效率极高
-- **MPI 粒度**：每进程分配的 `local_ny × local_nx` 越大，碰撞/流式迁移的 OpenMP 效率越高；幽灵层占比（`2/local_ny` 或 `2/(local_nx+local_ny)`）越小
-- **最佳比例**：经验上每进程 `local_ny ≥ 32`（或 `local_nx ≥ 32`），避免幽灵层比例过高
-
-### 内存访问模式
-
-行主序存储（`idx(i, j) = i + nx * j`）下：
-- 流式迁移内层循环沿 `i`（X 方向）连续，缓存友好
-- 幽灵行（j 方向）交换为连续内存（`row_size = nx * Q` 个 double），MPI 直接传指针
-- 幽灵列（i 方向）交换需手动打包（`halo_exchange_d2q9_2d()` 中的 `for j` 循环），每次约 `gny × Q × 8` 字节额外内存带宽
+- **nx << ny**：选 1D Y（py=P, px=1）
+- **ny << nx**：选 1D X（px=P, py=1）
+- **nx ≈ ny**：选 2D XY（px≈py≈√P）
+- **无需通信，参数扫描**：选 independent
+- **局部高精度需求**：使用 MgTree 搭建多层嵌套框架
 
 ---
 
-*本文档对应代码版本：`core/include/lbm/mpi_decomp.hpp`，`core/src/lbm/mpi_decomp.cpp`，`core/src/lbm/solver.cpp`，`bindings/src/lib.rs`，`orchestrator/src/config.rs`，`orchestrator/src/main.rs`。*
+*对应代码版本：`core/include/lbm/mpi_decomp.hpp`，`core/include/lbm/mg_tree.hpp`，`core/src/lbm/mpi_decomp.cpp`，`core/src/lbm/mg_tree.cpp`，`core/src/capi/lbm_capi.cpp`，`bindings/src/lib.rs`，`orchestrator/src/config.rs`，`orchestrator/src/main.rs`。*

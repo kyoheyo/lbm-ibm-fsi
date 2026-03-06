@@ -273,6 +273,64 @@ void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp)
     }
 }
 
+// ---------------------------------------------------------------------------
+// MpiDecomp3D（MPI 启用时的实现）
+//
+// 注意：幽灵层交换函数（halo_exchange_d3q19_3d 等）尚未实现。
+// 本结构用于预留三维并行框架，支持 D3Q19/D3Q27 格子未来扩展。
+// ---------------------------------------------------------------------------
+MpiDecomp3D MpiDecomp3D::create(int gnx, int gny, int gnz,
+                                  int in_px, int in_py, int in_pz)
+{
+    MpiDecomp3D d;
+    d.global_nx = gnx;
+    d.global_ny = gny;
+    d.global_nz = gnz;
+    d.px = in_px; d.py = in_py; d.pz = in_pz;
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &d.rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &d.nprocs);
+
+    if (d.px * d.py * d.pz != d.nprocs) {
+        throw std::invalid_argument(
+            "MpiDecomp3D: px*py*pz must equal MPI process count");
+    }
+
+    d.col_rank = d.rank % d.px;
+    d.row_rank = (d.rank / d.px) % d.py;
+    d.pz_rank  = d.rank / (d.px * d.py);
+
+    // 均匀分配三个方向的节点数
+    {
+        const int bx = gnx / d.px, rx = gnx % d.px;
+        d.local_nx = bx + (d.col_rank < rx ? 1 : 0);
+        d.x_start  = d.col_rank * bx + std::min(d.col_rank, rx);
+        d.x_end    = d.x_start + d.local_nx - 1;
+    }
+    {
+        const int by = gny / d.py, ry = gny % d.py;
+        d.local_ny = by + (d.row_rank < ry ? 1 : 0);
+        d.y_start  = d.row_rank * by + std::min(d.row_rank, ry);
+        d.y_end    = d.y_start + d.local_ny - 1;
+    }
+    {
+        const int bz = gnz / d.pz, rz = gnz % d.pz;
+        d.local_nz = bz + (d.pz_rank < rz ? 1 : 0);
+        d.z_start  = d.pz_rank * bz + std::min(d.pz_rank, rz);
+        d.z_end    = d.z_start + d.local_nz - 1;
+    }
+
+    // 六邻进程 rank
+    d.rank_west   = (d.col_rank > 0)        ? d.pz_rank*(d.px*d.py)+d.row_rank*d.px+d.col_rank-1 : MPI_PROC_NULL;
+    d.rank_east   = (d.col_rank < d.px-1)   ? d.pz_rank*(d.px*d.py)+d.row_rank*d.px+d.col_rank+1 : MPI_PROC_NULL;
+    d.rank_south  = (d.row_rank > 0)        ? d.pz_rank*(d.px*d.py)+(d.row_rank-1)*d.px+d.col_rank : MPI_PROC_NULL;
+    d.rank_north  = (d.row_rank < d.py-1)   ? d.pz_rank*(d.px*d.py)+(d.row_rank+1)*d.px+d.col_rank : MPI_PROC_NULL;
+    d.rank_bottom = (d.pz_rank > 0)         ? (d.pz_rank-1)*(d.px*d.py)+d.row_rank*d.px+d.col_rank : MPI_PROC_NULL;
+    d.rank_top    = (d.pz_rank < d.pz-1)    ? (d.pz_rank+1)*(d.px*d.py)+d.row_rank*d.px+d.col_rank : MPI_PROC_NULL;
+
+    return d;
+}
+
 } // namespace lbm
 
 #else
@@ -307,6 +365,29 @@ MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
     d.y_end     = gny - 1;
     if (in_px * in_py != 1) {
         throw std::invalid_argument("MpiDecomp2D: MPI not enabled, px*py must be 1");
+    }
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// MpiDecomp3D（无 MPI 构建：px*py*pz 必须为 1）
+// ---------------------------------------------------------------------------
+MpiDecomp3D MpiDecomp3D::create(int gnx, int gny, int gnz,
+                                  int in_px, int in_py, int in_pz)
+{
+    MpiDecomp3D d;
+    d.global_nx = gnx;
+    d.global_ny = gny;
+    d.global_nz = gnz;
+    d.px = in_px; d.py = in_py; d.pz = in_pz;
+    d.local_nx  = gnx;
+    d.local_ny  = gny;
+    d.local_nz  = gnz;
+    d.x_start = 0; d.x_end = gnx - 1;
+    d.y_start = 0; d.y_end = gny - 1;
+    d.z_start = 0; d.z_end = gnz - 1;
+    if (in_px * in_py * in_pz != 1) {
+        throw std::invalid_argument("MpiDecomp3D: MPI not enabled, px*py*pz must be 1");
     }
     return d;
 }

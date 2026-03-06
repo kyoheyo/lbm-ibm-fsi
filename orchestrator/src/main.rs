@@ -99,11 +99,21 @@ fn main() -> Result<()> {
 
     // 打印 MPI 模式信息
     {
-        let mpi_mode = cfg.mpi.mode.as_str();
-        match mpi_mode {
-            "2d_xy" => println!("MPI模式  : 二维块分解 {}×{}", cfg.mpi.nx_blocks, cfg.mpi.ny_blocks),
-            "multi_grid" => println!("MPI模式  : 多网格独立（每进程独立仿真）"),
-            _ => println!("MPI模式  : 一维 Y 方向切片"),
+        let (norm_mode, _) = cfg.mpi.normalized_mode();
+        match norm_mode {
+            "block" => {
+                let (px, py) = cfg.mpi.effective_blocks(lbm_bindings::mpi_size());
+                if px == 1 {
+                    println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
+                } else if py == 1 {
+                    println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
+                } else {
+                    println!("MPI模式  : 二维块分解 {}×{}", px, py);
+                }
+            }
+            "multigrid"   => println!("MPI模式  : 嵌套多重网格（框架模式，当前退化为独立）"),
+            "independent" => println!("MPI模式  : 多进程独立（每进程独立仿真，无通信）"),
+            _             => println!("MPI模式  : {}", cfg.mpi.mode),
         }
     }
 
@@ -191,73 +201,80 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // MPI 域分解：根据 [mpi] 配置计算本进程的本地网格尺寸
     //
-    // 三种模式：
-    //   "1d_y"       : 一维 Y 切片（默认）
-    //   "2d_xy"      : 二维 XY 块分解（需要 nx_blocks * ny_blocks == nprocs）
-    //   "multi_grid" : 每进程独立仿真，无通信
+    // 三种模式（均通过 MpiDecomp2D 实现，1D 是 2D 的特例）：
+    //   "block"       : XY 块分解（nx_blocks=1 → 1D Y；ny_blocks=1 → 1D X）
+    //   "independent" : 每进程独立仿真，无通信（旧名 "multi_grid"）
+    //   "multigrid"   : 嵌套多重网格框架（当前版本退化为独立模式）
+    //
+    // 旧名称兼容：
+    //   "1d_y"  → "block" (nx_blocks=1, ny_blocks=nprocs)
+    //   "2d_xy" → "block"
+    //   "multi_grid" → "independent"
     // -----------------------------------------------------------------------
     let rank   = lbm_bindings::mpi_rank();
     let nprocs = lbm_bindings::mpi_size();
+
+    // 归一化模式名称（旧名 → 新名）
+    let (effective_mode, mode_was_renamed) = cfg.mpi.normalized_mode();
+    if mode_was_renamed && nprocs > 1 {
+        eprintln!(
+            "[info] mpi.mode {:?} is deprecated; using {:?}. \
+             See docs/MPI并行详解.md for the new mode names.",
+            cfg.mpi.mode, effective_mode
+        );
+    }
 
     // -----------------------------------------------------------------------
     // 提前创建 MPI 分解对象（同时用于确定本地网格尺寸和绑定到求解器），
     // 声明持有者以延长生命周期到仿真循环结束
     // -----------------------------------------------------------------------
-    let mut _decomp1d: Option<lbm_bindings::LbmMpiDecomp>   = None;
     let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
 
-    // 标记：若 2d_xy 验证失败，降级到 1d_y
-    let effective_mode: &str = {
-        let px = cfg.mpi.nx_blocks as i32;
-        let py = cfg.mpi.ny_blocks as i32;
-        if cfg.mpi.mode == "2d_xy" && px * py != nprocs {
-            eprintln!(
-                "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
-                 Falling back to 1d_y decomposition.",
-                px, py, px * py, nprocs
-            );
-            "1d_y"
-        } else {
-            cfg.mpi.mode.as_str()
-        }
-    };
-
     match effective_mode {
-        "2d_xy" => {
-            let px = cfg.mpi.nx_blocks as i32;
-            let py = cfg.mpi.ny_blocks as i32;
-            _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py);
+        "block" => {
+            // 旧模式 "1d_y" → nx_blocks=1, ny_blocks=nprocs（1D Y 切片）
+            let (px, py): (u32, u32) = if cfg.mpi.mode == "1d_y" {
+                (1, nprocs as u32)
+            } else {
+                cfg.mpi.effective_blocks(nprocs)
+            };
+            if px as i32 * py as i32 != nprocs {
+                eprintln!(
+                    "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
+                     Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).",
+                    px, py, px as i32 * py as i32, nprocs
+                );
+                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+            } else {
+                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32);
+            }
         }
-        "multi_grid" => {
+        "independent" | "multigrid" => {
             // 无 MPI 通信，不创建任何分解对象
+            // "multigrid" 当前版本退化为独立模式
+            if effective_mode == "multigrid" && nprocs > 1 {
+                eprintln!(
+                    "[info] mode=\"multigrid\": MgTree 框架已就绪 \
+                     (LbmMgTree/MgNode)；本版本退化为独立模式（每进程运行完整网格）。\
+                     请通过 lbm_bindings::LbmMgTree API 配置嵌套关系。"
+                );
+            }
         }
         _ => {
-            // "1d_y"（默认）
-            _decomp1d = lbm_bindings::LbmMpiDecomp::new(
-                cfg.fluid.nx as i32, cfg.fluid.ny as i32);
+            eprintln!("[warn] unknown mpi.mode {:?}; defaulting to 1D Y slice.", effective_mode);
+            _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
         }
     }
 
-    // 确定本进程实际使用的网格尺寸（从已创建的分解对象中读取，或计算 1D 值）
-    let (grid_nx, grid_ny, grid_nz) = match effective_mode {
-        "2d_xy" => {
-            if let Some(ref d) = _decomp2d {
-                (d.grid_nx(), d.grid_ny(), cfg.fluid.nz as i32)
-            } else {
-                // MPI 未启用时退化为全局网格
-                (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
-            }
-        }
-        "multi_grid" => {
-            // 多网格独立模式：每进程使用完整的全局网格，无幽灵层
-            (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
-        }
-        _ => {
-            // "1d_y"（默认）
-            let (gny, _, _) = lbm_bindings::mpi_local_ny(cfg.fluid.ny as i32);
-            (cfg.fluid.nx as i32, gny, cfg.fluid.nz as i32)
-        }
+    // 确定本进程实际使用的网格尺寸（从已创建的分解对象中读取）
+    let (grid_nx, grid_ny, grid_nz) = if let Some(ref d) = _decomp2d {
+        (d.grid_nx(), d.grid_ny(), cfg.fluid.nz as i32)
+    } else {
+        // "independent" / "multigrid" / 未启用 MPI：使用完整全局网格
+        (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
     };
 
     if nprocs > 1 {
@@ -273,21 +290,8 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // MPI 域分解绑定：将已创建的分解对象绑定到求解器
     // -----------------------------------------------------------------------
-    match effective_mode {
-        "2d_xy" => {
-            if let Some(ref mut d) = _decomp2d {
-                solver.attach_mpi2d(Some(d));
-            }
-        }
-        "multi_grid" => {
-            // 无 MPI 通信，不绑定任何分解
-        }
-        _ => {
-            // "1d_y"（默认）
-            if let Some(ref mut d) = _decomp1d {
-                solver.attach_mpi(Some(d));
-            }
-        }
+    if let Some(ref mut d) = _decomp2d {
+        solver.attach_mpi2d(Some(d));
     }
 
     // -----------------------------------------------------------------------
@@ -346,8 +350,9 @@ fn main() -> Result<()> {
     }
 
     // 创建输出目录
-    // 多网格独立模式下，每进程的输出写入各自的子目录 <output.directory>/rank_<N>/
-    let output_dir = if cfg.mpi.mode == "multi_grid" && nprocs > 1 {
+    // 多进程独立模式或多重网格模式下，每进程的输出写入各自的子目录 <output.directory>/rank_<N>/
+    let (eff_mode, _) = cfg.mpi.normalized_mode();
+    let output_dir = if (eff_mode == "independent" || eff_mode == "multigrid") && nprocs > 1 {
         format!("{}/rank_{}", cfg.output.directory, rank)
     } else {
         cfg.output.directory.clone()

@@ -33,6 +33,18 @@ mod ffi {
     pub enum LatticeGridHandle {}
     /// 指向堆上 `lbm::Solver` 的不透明句柄（原理同 `LatticeGridHandle`）。
     pub enum SolverHandle {}
+    /// 指向堆上 `lbm::MpiDecomp` 的不透明句柄（一维 Y 切片，向后兼容）。
+    pub enum MpiDecompHandle {}
+    /// 指向堆上 `lbm::MpiDecomp2D` 的不透明句柄（二维 XY 块分解，1D 为特例）。
+    pub enum MpiDecomp2DHandle {}
+    /// 指向堆上 `lbm::MpiDecomp3D` 的不透明句柄（三维 XYZ 块分解，预留接口）。
+    pub enum MpiDecomp3DHandle {}
+    /// 指向堆上 `lbm::GpuSolver` 的不透明句柄（CUDA 加速）。
+    pub enum GpuSolverHandle {}
+    /// 指向堆上 `lbm::MgTree` 的不透明句柄（多重网格嵌套关系树）。
+    pub enum MgTreeHandle {}
+    /// 指向 `lbm::MgNode` 的不透明句柄（由树管理所有权，不由 Rust 释放）。
+    pub enum MgNodeHandle {}
 
     /// 插件 ABI 使用的 C 兼容函数指针类型。
     /// 对应 lbm_capi.cpp / plugin_registry.cpp 中的同名 typedef（lbm_boundary_fn 等）。
@@ -109,6 +121,42 @@ mod ffi {
         /// 返回本进程物理区域在全局坐标系中的 y 起始坐标。
         pub fn lbm_mpi_decomp2d_y_start(h: *const MpiDecomp2DHandle) -> c_int;
 
+        // --- MPI 三维块分解接口（预留，幽灵交换暂未实现）---
+        pub fn lbm_mpi_decomp3d_new(gnx: c_int, gny: c_int, gnz: c_int,
+                                    px: c_int, py: c_int, pz: c_int) -> *mut MpiDecomp3DHandle;
+        pub fn lbm_mpi_decomp3d_free(h: *mut MpiDecomp3DHandle);
+        pub fn lbm_mpi_decomp3d_grid_nx(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_grid_ny(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_grid_nz(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_x_start(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_y_start(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_z_start(h: *const MpiDecomp3DHandle) -> c_int;
+
+        // --- 多重网格树接口 — 实现于 core/src/capi/lbm_capi.cpp ---
+        /// 创建多重网格树。x0..x1 × y0..y1 × z0..z1 为根节点（最粗网格）空间范围。
+        /// 2D 时令 z0=z1=0, is_3d=0；3D 时令 is_3d=1。
+        pub fn lbm_mg_tree_new(x0: c_int, x1: c_int, y0: c_int, y1: c_int,
+                               z0: c_int, z1: c_int, is_3d: c_int) -> *mut MgTreeHandle;
+        pub fn lbm_mg_tree_free(h: *mut MgTreeHandle);
+        /// 在父节点内添加细化子区域。refine_ratio=2 表示每格加密为 2×2（2D）或 2×2×2（3D）。
+        pub fn lbm_mg_tree_add_level(tree: *mut MgTreeHandle, parent: *mut MgNodeHandle,
+                                     x0: c_int, x1: c_int, y0: c_int, y1: c_int,
+                                     z0: c_int, z1: c_int,
+                                     refine_ratio: c_int) -> *mut MgNodeHandle;
+        pub fn lbm_mg_tree_root(h: *mut MgTreeHandle) -> *mut MgNodeHandle;
+        pub fn lbm_mg_tree_max_level(h: *const MgTreeHandle) -> c_int;
+        pub fn lbm_mg_tree_node_count(h: *const MgTreeHandle) -> c_int;
+        pub fn lbm_mg_node_set_grid(node: *mut MgNodeHandle, grid: *mut LatticeGridHandle);
+        pub fn lbm_mg_node_x_start(h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_x_end  (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_y_start(h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_y_end  (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_z_start(h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_z_end  (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_level  (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_refine_ratio(h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_child_count (h: *const MgNodeHandle) -> c_int;
+
         // --- OpenMP 线程数设置 — 实现于 core/src/capi/lbm_capi.cpp ---
         /// 设置 OpenMP 线程数（等价于 omp_set_num_threads()）。
         pub fn lbm_omp_set_num_threads(n: c_int);
@@ -149,13 +197,6 @@ mod ffi {
             flexible_fn:   Option<FlexibleFn>,  flexible_data:  *mut std::ffi::c_void,
         );
     }
-
-    /// MPI 域分解描述符的不透明句柄（仅持有指针，不可实例化）
-    pub enum MpiDecompHandle {}
-    /// MPI 二维块分解描述符的不透明句柄
-    pub enum MpiDecomp2DHandle {}
-    /// GPU 求解器的不透明句柄
-    pub enum GpuSolverHandle {}
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +595,157 @@ impl Drop for LbmMpiDecomp2D {
         unsafe { ffi::lbm_mpi_decomp2d_free(self.ptr) };
     }
 }
+
+// ---------------------------------------------------------------------------
+/// 三维（XYZ 方向）MPI 块分解描述符（预留接口，幽灵交换暂未实现）
+///
+/// 当 `pz=1` 时等价于 [`LbmMpiDecomp2D`]；当 `pz=1, py=1` 时等价于 1D X 切片。
+///
+/// # 用途
+/// - 记录三维并行分解的空间范围和进程坐标
+/// - 可绑定到 [`MgNode::decomp`] 作为三维层次分解的并行描述
+/// - 幽灵层交换（6 方向）待 3D LBM 求解器实现后启用
+///
+/// # 示例（框架，无 MPI 时 px*py*pz 须为 1）
+/// ```no_run
+/// let decomp3d = LbmMpiDecomp3D::new(256, 256, 128, 2, 2, 2)
+///     .expect("需要 8 个 MPI 进程且已启用 MPI");
+/// println!("local grid: {}×{}×{}",
+///          decomp3d.grid_nx(), decomp3d.grid_ny(), decomp3d.grid_nz());
+/// ```
+pub struct LbmMpiDecomp3D {
+    ptr: *mut ffi::MpiDecomp3DHandle,
+}
+
+impl LbmMpiDecomp3D {
+    /// 创建三维 XYZ 块分解（需先调用 [`mpi_init()`]，且 `px*py*pz == nprocs`）。
+    ///
+    /// 若 MPI 未启用、`px*py*pz != nprocs` 或创建失败，返回 `None`。
+    pub fn new(global_nx: i32, global_ny: i32, global_nz: i32,
+               px: i32, py: i32, pz: i32) -> Option<Self> {
+        let ptr = unsafe {
+            ffi::lbm_mpi_decomp3d_new(global_nx, global_ny, global_nz, px, py, pz)
+        };
+        if ptr.is_null() { None } else { Some(LbmMpiDecomp3D { ptr }) }
+    }
+
+    /// 本地网格含幽灵层的 nx
+    pub fn grid_nx(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_grid_nx(self.ptr) } }
+    /// 本地网格含幽灵层的 ny
+    pub fn grid_ny(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_grid_ny(self.ptr) } }
+    /// 本地网格含幽灵层的 nz
+    pub fn grid_nz(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_grid_nz(self.ptr) } }
+    /// 本进程物理区域在全局坐标中的 X 起始坐标
+    pub fn x_start(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_x_start(self.ptr) } }
+    /// 本进程物理区域在全局坐标中的 Y 起始坐标
+    pub fn y_start(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_y_start(self.ptr) } }
+    /// 本进程物理区域在全局坐标中的 Z 起始坐标
+    pub fn z_start(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_z_start(self.ptr) } }
+
+    #[doc(hidden)]
+    pub fn as_mut_ptr(&mut self) -> *mut ffi::MpiDecomp3DHandle { self.ptr }
+}
+
+impl Drop for LbmMpiDecomp3D {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_mpi_decomp3d_free(self.ptr) };
+    }
+}
+
+unsafe impl Send for LbmMpiDecomp3D {}
+
+// ---------------------------------------------------------------------------
+/// 多重网格嵌套关系树（`lbm::MgTree` 的安全封装）
+///
+/// 管理 AMR（Adaptive Mesh Refinement）风格的网格层次结构：
+/// 粗网格（level=0）作为根节点，细化网格块（patches）作为子节点，
+/// 支持任意嵌套深度和数量，以及 2D/3D 两种维度。
+///
+/// # 三种遍历模式（在 C++ 端实现）
+/// - `traverse_coarse_to_fine`：从粗到细（BFS），适合逐层 LBM 步进
+/// - `traverse_fine_to_coarse`：从细到粗（BFS 逆序），适合残差传递
+///
+/// # 示例（2D 双层嵌套）
+/// ```no_run
+/// use lbm_bindings::{LbmMgTree, LbmGrid, LatticeModel};
+///
+/// // 创建粗网格（256×256，2D）
+/// let mut tree = LbmMgTree::new(0, 255, 0, 255, 0, 0, false)
+///     .expect("MgTree creation failed");
+///
+/// // 在粗网格中嵌套一个细网格（中心 64×64 区域，加密比 2）
+/// let fine = tree.add_level_from_root(96, 159, 96, 159, 0, 0, 2)
+///     .expect("add_level failed");
+///
+/// println!("树深度: {}", tree.max_level());   // 1
+/// println!("节点数: {}", tree.node_count()); // 2
+/// ```
+pub struct LbmMgTree {
+    ptr: *mut ffi::MgTreeHandle,
+}
+
+impl LbmMgTree {
+    /// 创建多重网格树，根节点（最粗网格）的空间范围为
+    /// `[x0, x1] × [y0, y1] × [z0, z1]`（全局格子坐标，含端点）。
+    ///
+    /// - 2D 仿真：令 `z0=z1=0`, `is_3d=false`
+    /// - 3D 仿真：令 `is_3d=true`，`z0..z1` 给出 Z 方向范围
+    pub fn new(x0: i32, x1: i32, y0: i32, y1: i32,
+               z0: i32, z1: i32, is_3d: bool) -> Option<Self> {
+        let ptr = unsafe {
+            ffi::lbm_mg_tree_new(x0, x1, y0, y1, z0, z1, if is_3d { 1 } else { 0 })
+        };
+        if ptr.is_null() { None } else { Some(LbmMgTree { ptr }) }
+    }
+
+    /// 在**根节点**内添加一个细化子区域（第一层细网格）。
+    /// 等价于 `add_level(root, child_extent, refine_ratio)`。
+    /// 返回新节点的裸指针（由树管理，调用方不得释放）。
+    pub fn add_level_from_root(&mut self,
+                               x0: i32, x1: i32, y0: i32, y1: i32,
+                               z0: i32, z1: i32,
+                               refine_ratio: i32) -> Option<*mut ffi::MgNodeHandle> {
+        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
+        let node = unsafe {
+            ffi::lbm_mg_tree_add_level(self.ptr, root, x0, x1, y0, y1, z0, z1, refine_ratio)
+        };
+        if node.is_null() { None } else { Some(node) }
+    }
+
+    /// 在指定父节点内添加细化子区域（支持任意深度嵌套）。
+    pub fn add_level(&mut self, parent: *mut ffi::MgNodeHandle,
+                     x0: i32, x1: i32, y0: i32, y1: i32,
+                     z0: i32, z1: i32,
+                     refine_ratio: i32) -> Option<*mut ffi::MgNodeHandle> {
+        let node = unsafe {
+            ffi::lbm_mg_tree_add_level(self.ptr, parent, x0, x1, y0, y1, z0, z1, refine_ratio)
+        };
+        if node.is_null() { None } else { Some(node) }
+    }
+
+    /// 获取根节点（最粗网格）句柄
+    pub fn root(&mut self) -> *mut ffi::MgNodeHandle {
+        unsafe { ffi::lbm_mg_tree_root(self.ptr) }
+    }
+
+    /// 返回树中最深的层级（根节点为 0）
+    pub fn max_level(&self) -> i32 {
+        unsafe { ffi::lbm_mg_tree_max_level(self.ptr) }
+    }
+
+    /// 返回树中所有节点数（包括根节点）
+    pub fn node_count(&self) -> i32 {
+        unsafe { ffi::lbm_mg_tree_node_count(self.ptr) }
+    }
+}
+
+impl Drop for LbmMgTree {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_mg_tree_free(self.ptr) };
+    }
+}
+
+unsafe impl Send for LbmMgTree {}
 
 // ---------------------------------------------------------------------------
 /// 设置 OpenMP 线程数（等价于 `OMP_NUM_THREADS` 环境变量，但在进程内即时生效）。

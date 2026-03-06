@@ -7,7 +7,8 @@ set(CORE_SOURCES
     src/lbm/lattice.cpp       # 格子模型初始化（D2Q9/D3Q19）与宏观量（ρ、u）计算
     src/lbm/solver.cpp        # BGK/MRT 碰撞 + 流式迁移 + Guo 体力修正
     src/lbm/boundary.cpp      # 反弹边界、Zou-He 速度/压力边界条件
-    src/lbm/mpi_decomp.cpp    # MPI 一维域分解与幽灵行交换（始终编译；MPI 未启用时为空实现）
+    src/lbm/mpi_decomp.cpp    # MPI 一/二维域分解与幽灵层交换（始终编译；MPI 未启用时为空实现）
+    src/lbm/mg_tree.cpp       # ★ 多重网格嵌套关系树（MgTree/MgNode，支持 2D/3D AMR）
     # IBM — 浸入边界法
     src/ibm/marker.cpp        # 拉格朗日标记点集创建（圆形截面、柔性丝状体）
     src/ibm/interpolation.cpp # 速度插值（欧拉→拉格朗日）与力展布（拉格朗日→欧拉）

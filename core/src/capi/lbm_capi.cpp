@@ -450,6 +450,151 @@ void lbm_omp_set_num_threads(int n)
 } // extern "C"
 
 // ===========================================================================
+// 多重网格树（MgTree）接口
+// ===========================================================================
+#include "lbm/mg_tree.hpp"
+extern "C" {
+
+/// 不透明句柄类型（前向声明）
+struct MgTreeHandle;
+struct MgNodeHandle;
+
+/// 创建多重网格树，根节点（最粗网格）的空间范围为 [x0,x1] × [y0,y1] × [z0,z1]。
+/// 2D 仿真时令 z0=z1=0。
+/// Rust 封装: LbmMgTree::new() — bindings/src/lib.rs
+MgTreeHandle* lbm_mg_tree_new(int x0, int x1, int y0, int y1, int z0, int z1, int is_3d)
+{
+    try {
+        lbm::MgExtent root_extent{x0, x1, y0, y1, z0, z1};
+        lbm::MgDim dim = (is_3d != 0) ? lbm::MgDim::D3 : lbm::MgDim::D2;
+        auto* tree = new lbm::MgTree(root_extent, dim);
+        return reinterpret_cast<MgTreeHandle*>(tree);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+/// 释放多重网格树（含树中所有节点）。
+void lbm_mg_tree_free(MgTreeHandle* h)
+{
+    delete reinterpret_cast<lbm::MgTree*>(h);
+}
+
+/// 在父节点内添加一个细化子区域节点。
+/// 返回新创建的子节点句柄（由树管理，调用方不得释放）。
+/// 若父节点为 nullptr 或 child_extent 不在父节点范围内，返回 nullptr。
+/// Rust 封装: LbmMgTree::add_level() — bindings/src/lib.rs
+MgNodeHandle* lbm_mg_tree_add_level(MgTreeHandle* tree, MgNodeHandle* parent,
+                                     int x0, int x1, int y0, int y1, int z0, int z1,
+                                     int refine_ratio)
+{
+    if (!tree || !parent) return nullptr;
+    try {
+        lbm::MgExtent child_extent{x0, x1, y0, y1, z0, z1};
+        auto* node = reinterpret_cast<lbm::MgTree*>(tree)->add_level(
+            reinterpret_cast<lbm::MgNode*>(parent), child_extent, refine_ratio);
+        return reinterpret_cast<MgNodeHandle*>(node);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+/// 获取根节点（最粗网格）句柄。
+MgNodeHandle* lbm_mg_tree_root(MgTreeHandle* h)
+{
+    if (!h) return nullptr;
+    return reinterpret_cast<MgNodeHandle*>(
+        reinterpret_cast<lbm::MgTree*>(h)->root());
+}
+
+/// 返回树中最深的层级（根节点为 0）。
+int lbm_mg_tree_max_level(const MgTreeHandle* h)
+{
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MgTree*>(h)->max_level();
+}
+
+/// 返回树中所有节点数（包括根节点）。
+int lbm_mg_tree_node_count(const MgTreeHandle* h)
+{
+    if (!h) return 0;
+    return static_cast<int>(reinterpret_cast<const lbm::MgTree*>(h)->node_count());
+}
+
+/// 将 LatticeGrid 绑定到多重网格节点（供该层 LBM 求解使用）。
+void lbm_mg_node_set_grid(MgNodeHandle* node, lbm::LatticeGrid* grid)
+{
+    if (!node) return;
+    reinterpret_cast<lbm::MgNode*>(node)->grid = grid;
+}
+
+/// 查询节点的空间范围
+int lbm_mg_node_x_start(const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.x_start : 0; }
+int lbm_mg_node_x_end  (const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.x_end   : 0; }
+int lbm_mg_node_y_start(const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.y_start : 0; }
+int lbm_mg_node_y_end  (const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.y_end   : 0; }
+int lbm_mg_node_z_start(const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.z_start : 0; }
+int lbm_mg_node_z_end  (const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.z_end   : 0; }
+int lbm_mg_node_level  (const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->level          : 0; }
+int lbm_mg_node_refine_ratio(const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->refine_ratio : 1; }
+int lbm_mg_node_child_count (const MgNodeHandle* h) {
+    return h ? static_cast<int>(reinterpret_cast<const lbm::MgNode*>(h)->children.size()) : 0;
+}
+
+} // extern "C"
+
+// ===========================================================================
+// MpiDecomp3D（三维域分解预留接口）
+// ===========================================================================
+extern "C" {
+
+/// 不透明句柄（前向声明）
+struct MpiDecomp3DHandle;
+
+/// 创建三维 MPI 域分解（需先调用 MPI_Init，且 px*py*pz == nprocs）。
+/// 幽灵层交换暂未实现；可用于记录三维分解信息（空间范围查询等）。
+/// Rust 封装: LbmMpiDecomp3D::new() — bindings/src/lib.rs
+MpiDecomp3DHandle* lbm_mpi_decomp3d_new(int gnx, int gny, int gnz,
+                                          int px, int py, int pz)
+{
+    try {
+        auto* d = new lbm::MpiDecomp3D(
+            lbm::MpiDecomp3D::create(gnx, gny, gnz, px, py, pz));
+        return reinterpret_cast<MpiDecomp3DHandle*>(d);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+/// 释放三维域分解对象。
+void lbm_mpi_decomp3d_free(MpiDecomp3DHandle* h)
+{
+    delete reinterpret_cast<lbm::MpiDecomp3D*>(h);
+}
+
+/// 查询字段
+int lbm_mpi_decomp3d_grid_nx(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->grid_nx() : 0;
+}
+int lbm_mpi_decomp3d_grid_ny(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->grid_ny() : 0;
+}
+int lbm_mpi_decomp3d_grid_nz(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->grid_nz() : 0;
+}
+int lbm_mpi_decomp3d_x_start(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->x_start : 0;
+}
+int lbm_mpi_decomp3d_y_start(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->y_start : 0;
+}
+int lbm_mpi_decomp3d_z_start(const MpiDecomp3DHandle* h) {
+    return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->z_start : 0;
+}
+
+} // extern "C"
+
+// ===========================================================================
 // GPU（CUDA）接口
 // ===========================================================================
 extern "C" {

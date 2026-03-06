@@ -264,7 +264,7 @@ fn default_delta_kernel()       -> String { "four_point".to_string() }
 fn default_output_dir()         -> String { "output".to_string() }
 fn default_output_format()      -> String { "npz".to_string() }
 fn default_python_interpreter() -> String { "python3".to_string() }
-fn default_mpi_mode()           -> String { "1d_y".to_string() }
+fn default_mpi_mode()           -> String { "block".to_string() }
 
 // ---------------------------------------------------------------------------
 /// 并行计算配置（OpenMP 线程数等运行期设置）
@@ -291,60 +291,139 @@ pub struct ParallelConfig {
 // ---------------------------------------------------------------------------
 /// MPI 并行运行配置
 ///
-/// 控制域分解模式和块数。有三种模式：
+/// 控制域分解模式和块数。支持三种模式：
 ///
-/// | `mode` | 说明 |
-/// |--------|------|
-/// | `"1d_y"` | 一维 Y 方向切片（默认）：进程沿 Y 方向均匀分配行 |
-/// | `"2d_xy"` | 二维 XY 块分解：进程按 `nx_blocks × ny_blocks` 排列 |
-/// | `"multi_grid"` | 多网格独立模式：每个 MPI 进程运行完全独立的仿真，无通信开销 |
+/// | `mode` | 别名 | 说明 |
+/// |--------|------|------|
+/// | `"block"` | `"2d_xy"`、`"1d_y"`、`"1d_x"` | XY 块分解（1D 为特例） |
+/// | `"independent"` | `"multi_grid"` | 每进程独立仿真，无通信 |
+/// | `"multigrid"` | — | 嵌套式多重网格（框架预留，AMR 风格） |
 ///
-/// ## TOML 示例
+/// ## 模式一：XY 块分解（`"block"`，默认）
 ///
-/// ### 一维 Y 方向切片（默认）
+/// 将网格切分为 `nx_blocks × ny_blocks` 块（须满足 `nx_blocks * ny_blocks == nprocs`）。
+///
+/// - **一维 Y 切片**（`nx_blocks=1, ny_blocks=nprocs`）：沿 Y 方向均匀切片，
+///   通信仅在南北方向，适合 nx << ny 的细长网格。
+///   ```toml
+///   [mpi]
+///   mode = "block"
+///   nx_blocks = 1    # 省略时默认 1
+///   ny_blocks = 4    # Y 方向切 4 块（需 mpirun -n 4）
+///   ```
+/// - **一维 X 切片**（`nx_blocks=nprocs, ny_blocks=1`）：沿 X 方向切片，
+///   通信仅在东西方向，适合 ny << nx 的扁平网格。
+///   ```toml
+///   [mpi]
+///   mode = "block"
+///   nx_blocks = 4    # X 方向切 4 块
+///   ny_blocks = 1
+///   ```
+/// - **二维 XY 块**（`nx_blocks=px, ny_blocks=py`，px*py==nprocs）：
+///   均匀切分两个方向，适合接近方形的网格（通信面积最小）。
+///   ```toml
+///   [mpi]
+///   mode      = "block"
+///   nx_blocks = 4
+///   ny_blocks = 2    # 需 mpirun -n 8
+///   ```
+///
+/// **旧名称兼容**：`mode = "1d_y"` / `mode = "2d_xy"` 均等价于 `mode = "block"`
+/// 并会打印弃用提示。
+///
+/// ## 模式二：多进程独立仿真（`"independent"`）
+///
+/// 每个 MPI 进程运行**完全独立**的仿真，无任何进程间通信。
+/// 适用于参数扫描（多套 Re、多套网格尺寸）。
+/// 输出写入 `<output.directory>/rank_<N>/`。
 /// ```toml
 /// [mpi]
-/// mode = "1d_y"   # 可省略，此为默认值
+/// mode = "independent"   # 或旧名 "multi_grid"
 /// ```
 ///
-/// ### 二维 XY 块分解（4×2 = 8 进程）
+/// ## 模式三：嵌套式多重网格（`"multigrid"`，框架预留）
+///
+/// 细网格嵌套在粗网格上，支持任意嵌套层数（N 叉树数据结构 `MgTree`）。
+/// 可与块分解组合（每层细化区域可独立并行分解）。
+/// 当前状态：框架已就绪（`lbm::MgTree` / `lbm::MgNode` / `LbmMgTree` Rust 封装），
+/// 实际 LBM 插值/限制算子（restriction/prolongation）待未来实现。
 /// ```toml
 /// [mpi]
-/// mode      = "2d_xy"
-/// nx_blocks = 4     # X 方向切 4 块
-/// ny_blocks = 2     # Y 方向切 2 块
-/// # nx_blocks * ny_blocks 必须等于 mpirun -n N 指定的进程数
+/// mode = "multigrid"
+/// # 嵌套关系通过代码（lbm_bindings::LbmMgTree）配置
 /// ```
 ///
-/// ### 多网格独立模式（每进程独立仿真）
+/// ## 三维预留（`nz_blocks`）
+///
 /// ```toml
 /// [mpi]
-/// mode = "multi_grid"
-/// # 每个 rank 运行完全相同的配置，互不通信
-/// # 适合参数扫描：各 rank 通过不同的输出目录区分结果
+/// mode      = "block"
+/// nx_blocks = 2
+/// ny_blocks = 2
+/// nz_blocks = 2    # 3D 扩展预留（D3Q19/D3Q27），需配合 3D 求解器
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct MpiRunConfig {
-    /// MPI 域分解模式：`"1d_y"`、`"2d_xy"` 或 `"multi_grid"`。
+    /// MPI 域分解模式：
+    /// - `"block"`（默认）：XY 块分解（1D X/Y 切片是 nx_blocks=1 或 ny_blocks=1 的特例）
+    /// - `"independent"`：每进程独立仿真，无通信
+    /// - `"multigrid"`：嵌套式多重网格（框架预留）
+    /// - `"1d_y"` / `"2d_xy"` / `"multi_grid"`：旧名称，向后兼容
     #[serde(default = "default_mpi_mode")]
     pub mode: String,
-    /// X 方向进程块数（仅 `mode = "2d_xy"` 时有效）。
+    /// X 方向进程块数（mode="block" 时有效；0=自动（ny_blocks=nprocs，1D Y 切片）；默认 1）
     #[serde(default = "default_one")]
     pub nx_blocks: u32,
-    /// Y 方向进程块数（仅 `mode = "2d_xy"` 时有效）。
-    #[serde(default = "default_one")]
+    /// Y 方向进程块数（mode="block" 时有效；nx_blocks*ny_blocks 须等于 mpirun -n N；默认 nprocs）
+    #[serde(default = "default_zero")]
     pub ny_blocks: u32,
+    /// Z 方向进程块数（3D 扩展预留；当前 2D 仿真时设 0 或 1；默认 1）
+    #[serde(default = "default_one")]
+    pub nz_blocks: u32,
 }
 
-fn default_one() -> u32 { 1 }
+fn default_one()  -> u32 { 1 }
+fn default_zero() -> u32 { 0 }
 
 impl Default for MpiRunConfig {
     fn default() -> Self {
         MpiRunConfig {
-            mode: default_mpi_mode(),
+            mode:      default_mpi_mode(),
             nx_blocks: 1,
-            ny_blocks: 1,
+            ny_blocks: 0,   // 0 = 自动：由 nprocs 决定
+            nz_blocks: 1,
         }
+    }
+}
+
+impl MpiRunConfig {
+    /// 将旧模式名称归一化为新名称，并返回是否进行了降级（用于打印警告）。
+    ///
+    /// | 输入 | 输出 |
+    /// |------|------|
+    /// | `"1d_y"` | `"block"` |
+    /// | `"1d_x"` | `"block"` |
+    /// | `"2d_xy"` | `"block"` |
+    /// | `"multi_grid"` | `"independent"` |
+    /// | 其他 | 原值 |
+    pub fn normalized_mode(&self) -> (&str, bool) {
+        match self.mode.as_str() {
+            "1d_y" | "1d_x" | "2d_xy" => ("block", true),
+            "multi_grid"               => ("independent", true),
+            m                          => (m, false),
+        }
+    }
+
+    /// 计算有效的 (nx_blocks, ny_blocks)：
+    /// - `ny_blocks == 0` 表示自动：nx_blocks=1, ny_blocks=nprocs（1D Y 切片）
+    pub fn effective_blocks(&self, nprocs: i32) -> (u32, u32) {
+        let px = self.nx_blocks.max(1);
+        let py = if self.ny_blocks == 0 {
+            (nprocs as u32).max(1) / px
+        } else {
+            self.ny_blocks.max(1)
+        };
+        (px, py)
     }
 }
 
