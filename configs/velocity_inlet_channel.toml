@@ -1,125 +1,45 @@
 # 速度入口通道流（均匀入口 + 充分发展出口）
-# 西壁规定均匀速度 ux = U_inlet，东壁施加充分发展出口（零法向梯度），
-# 上下两壁为无滑移固壁。流场将从均匀入口逐渐发展为 Poiseuille 抛物线剖面。
-# 雷诺数：Re = U_inlet · H / ν
+# 物理模型：矩形通道，西壁规定均匀速度入口，东壁施加充分发展（零法向梯度）出口，
+# 上下两壁无滑移固壁。流场从均匀入口逐渐发展为 Poiseuille 抛物线剖面。
+# Re = U_inlet·H / ν = 0.05 × 60 / 0.1 = 30
+# 参考配置说明：configs/template.toml
 
 [simulation]
-n_steps        = 30000
-dt             = 1.0
-lattice_model  = "D2Q9"
+n_steps         = 30000
+dt              = 1.0
+lattice_model   = "D2Q9"
 collision_model = "MRT"
 
 [fluid]
-nx   = 300                     # 通道长度（格点）；足够长以充分发展
-ny   = 60                      # 通道高度 H（格点）
-nz   = 1
-nu   = 0.1                     # 运动粘度（格子单位）
+nx   = 300
+ny   = 60
+nu   = 0.1
 rho0 = 1.0
 
-  # 西壁（速度入口）：Zou-He 速度边界条件，均匀入口速度
-  [[fluid.boundary_conditions]]
-  bc_type = "zou_he_velocity"
-  face    = "west"
-  ux      = 0.05               # 入口速度（格子单位）；Re = 0.05 × 60 / 0.1 = 30
-  uy      = 0.0
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
 
-  # 东壁（充分发展出口）：零法向梯度，拷贝上游一层分布函数
-  [[fluid.boundary_conditions]]
-  bc_type = "fully_developed"
-  face    = "east"
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
 
-  # 南壁（底部固壁）：半步长反弹，无滑移
-  [[fluid.boundary_conditions]]
-  bc_type = "bounce_back"
-  face    = "south"
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
 
-  # 北壁（顶部固壁）：半步长反弹，无滑移
-  [[fluid.boundary_conditions]]
-  bc_type = "bounce_back"
-  face    = "north"
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
 
 [output]
-# 每隔 write_interval 步写出一个完整的流场快照文件（密度场 ρ、速度场 ux/uy）。
 write_interval = 1000
-
-# 快照输出目录。
 directory      = "output/velocity_inlet_channel"
-
-# 输出格式：
-#   "tecplot_asc" → fluid_NNNNNN.dat  ASCII Tecplot POINT 格式，可用 ParaView/Tecplot 打开。
-#                   适合输出顶盖驱动方腔流中心涡、环流结构的流场细节。（★ 本配置已启用）
-#   "npz"         → NumPy .npz 压缩归档，Python lbm_post 后处理首选。
-#   "tecplot_bin" → 二进制 Tecplot TDV112，文件体积最小。
 format         = "tecplot_asc"
 
-# Python FFI 进程内实时绘图（每隔 plot_interval 步生成速度幅值和涡量云图）。
-#
-# 使用前提：以 --features python-ffi 特性编译：
-#   cargo build --release --features python-ffi
-# 图像保存至 <directory>/vel_NNNNNN.png 和 vor_NNNNNN.png。
-# 未启用 python-ffi 特性时本行被忽略，.dat 快照仍正常输出。
-plot_interval  = 5000   # 每 5000 步（5 次 .dat 快照之后）绘制一次云图
-
-# 每步向 CSV 文件追加监控量，用于判断速度剖面是否已收敛至 Poiseuille 形状。
-# enable_csv_monitor = true
-
-# MPI 块分解时合并各分区为全局场（rank-0 写出），单进程模式下无效。
-# combine_blocks = true
-
 [python]
-# Python 解释器（Windows 通常为 "python"，Linux/macOS 通常为 "python3"）。
 interpreter = "python"
-
-# 仿真开始前自动执行的预处理脚本（可选）。
-# 脚本接收配置文件路径作为第一个位置参数。
-# pre_script  = "python/examples/pre_process.py"
-
-# 仿真结束后自动执行的后处理脚本。
-# 脚本以 <directory> 为第一个位置参数，读取 .dat 文件并绘制速度发展云图与剖面曲线。
 post_script = "python/examples/plot_solver_output.py"
-
-# 无需 pip install 即可导入 lbm_post 的 sys.path 追加目录。
 pythonpath  = "python"
-
-# ---------------------------------------------------------------------------
-# [structure] 弹性结构参数（仅含柔性丝状体的 IBM-FSI 算例才需要，此处注释供参考）
-# ---------------------------------------------------------------------------
-# [structure]
-# young_modulus = 1.0e3    # 杨氏模量
-# second_moment = 1.0e-6   # 截面惯性矩
-# density       = 1.5      # 结构密度
-# area          = 0.01     # 截面面积
-# length        = 0.3      # 丝状体自然长度（格子单位）
-# n_elements    = 10       # 有限元单元数
-
-# ---------------------------------------------------------------------------
-# [ibm] 浸没边界法参数（仅含 IBM 固体/柔性体的算例才需要，此处注释供参考）
-# ---------------------------------------------------------------------------
-# [ibm]
-# geometry     = "filament"    # "filament"（丝状体）或 "circle"（刚性圆柱）
-# x0           = 50.0          # 起点/圆心 x（格子单位）
-# y0           = 30.0          # 起点/圆心 y（格子单位）
-# size         = 30.0          # 长度（丝状体）或半径（圆形），格子单位
-# n_markers    = 30            # 拉格朗日标记点数量
-# delta_kernel = "four_point"  # Delta 核函数："two_point" 或 "four_point"
-
-[plugins]
-# 自定义插件（空字符串 = 不启用）。名称仅作提示用途，实际插件逻辑在 Rust 代码中注册。
-# boundary = ""   # 自定义边界条件插件（对流出口、NRBC 等）
-# mesh     = ""   # 网格处理 / 自适应细化插件
-# motion   = ""   # 运动网格 / 运动固体插件（6 自由度刚体、ALE 等）
-# flexible = ""   # 替代柔性体求解器插件（Kirchhoff 板、协转梁等）
-
-[parallel]
-# OpenMP 线程数（0 = 使用全部 CPU 核心数；正整数 N = 强制使用 N 个线程）。
-# omp_num_threads = 0
-
-[mpi]
-# MPI 域分解模式：
-#   "block"       → XY 块分解（nx_blocks × ny_blocks，1D 切片为其特例）
-#   "independent" → 每进程独立仿真，无通信（适合参数扫描）
-#   "multigrid"   → 嵌套式多重网格（框架预留）
-# mode      = "block"
-# nx_blocks = 1    # X 方向进程块数（默认 1）
-# ny_blocks = 0    # Y 方向进程块数（0 = 自动，等于 nprocs；需与 mpirun -n N 匹配）
-# nz_blocks = 1    # Z 方向进程块数（3D 扩展预留，2D 仿真设 1）
