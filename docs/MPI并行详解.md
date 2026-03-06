@@ -554,8 +554,8 @@ auto lvl1   = tree.nodes_at_level(1);  // 所有 level=1 节点
 | `LbmMgTree` Rust 封装 | ✅ 就绪 | 完整 FFI + RAII |
 | C ABI（`lbm_mg_tree_*`） | ✅ 就绪 | 创建/释放/节点查询 |
 | `decomp` 字段绑定 | ✅ 接口就绪 | 调用方负责传入 `MpiDecomp2D*` |
-| LBM 层间插值算子（prolongation） | 🔲 待实现 | 细→粗速度/分布函数插值 |
-| LBM 层间限制算子（restriction） | 🔲 待实现 | 粗→细残差传递 |
+| LBM 层间延拓算子（`mg_prolong_rho_u`） | ✅ 就绪 | 粗→细双线性插值 ρ/u；C ABI `lbm_mg_prolong_rho_u(coarse, fine)` |
+| LBM 层间限制算子（`mg_restrict_rho_u`） | ✅ 就绪 | 细→粗 r×r 体积平均 ρ/u；C ABI `lbm_mg_restrict_rho_u(fine, coarse)` |
 | 时间步同步（粗/细层时间步之比） | 🔲 待实现 | 加密比 r 时细层时间步 = 1/r |
 | 自动 AMR 细化判断（误差估计）| 🔲 待实现 | 基于局部梯度/涡量的自适应 |
 

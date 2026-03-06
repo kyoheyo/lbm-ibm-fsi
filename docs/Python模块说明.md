@@ -11,7 +11,7 @@
    - 4.3 lbm_pre.mesh — Gmsh 网格生成
    - 4.4 lbm_pre.bridge — Rust FFI 接口
 5. [lbm_post — 后处理包](#五lbm_post--后处理包)
-   - 5.1 lbm_post.vtk_reader — 快照文件读取
+   - 5.1 lbm_post.vtk_reader — 快照文件读取（含 `combine_block_snapshots`）
    - 5.2 lbm_post.plot — 可视化绘图
    - 5.3 lbm_post.analysis — 定量后处理
    - 5.4 lbm_post.bridge — Rust FFI 接口
@@ -606,6 +606,52 @@ snap = load_snapshot("output/fluid_001000.plt")  # 自动识别为二进制 Tecp
 
 - `make_synthetic_lid_cavity(nx, ny, U_lid, step)` — 生成顶盖驱动方腔的合成流场快照
 - `save_snapshot_npz(snap, path)` — 将 `FieldSnapshot` 保存为 `.npz` 文件
+
+#### 5.1.8 `combine_block_snapshots` — MPI 分区快照合并
+
+将 MPI 块分解模式（`mpi.mode = "block"`）下各进程写出的分区快照拼合为全局完整流场文件。
+
+```python
+combine_block_snapshots(
+    output_dir: str | Path,
+    fmt: str = "npz",
+    out_dir: str | Path | None = None,
+) -> list[Path]
+```
+
+**参数**
+
+| 参数 | 说明 |
+|------|------|
+| `output_dir` | 包含 `rank_0/`、`rank_1/` … 子目录的基础输出目录 |
+| `fmt` | 输出格式：`"npz"`（默认）、`"dat"`（ASCII Tecplot）、`"plt"`（二进制 Tecplot TDV112） |
+| `out_dir` | 合并文件写出目录；缺省时写到 `<output_dir>/combined/` |
+
+**返回**：已写出的合并文件路径列表（按时间步升序排列）。
+
+**注意**：分区输入文件必须为 **NPZ 格式**（内嵌了 `x_start / y_start / global_nx / global_ny` 位置元数据）。若求解器使用 `format = "tecplot_asc"` 或 `format = "tecplot_bin"`，请同时开启 `combine_blocks = true`，由求解器在计算过程中直接写出全局合并文件。
+
+```python
+from lbm_post.vtk_reader import combine_block_snapshots
+
+# 合并 NPZ 分区快照（默认）
+written = combine_block_snapshots("output/my_run")
+print(written[0])   # output/my_run/combined/fluid_001000.npz
+
+# 合并为 ASCII Tecplot .dat
+written = combine_block_snapshots("output/my_run", fmt="dat")
+
+# 合并为二进制 Tecplot .plt，写到自定义目录
+written = combine_block_snapshots(
+    "output/my_run", fmt="plt", out_dir="output/my_run/global"
+)
+```
+
+本函数也从顶层包直接导出：
+
+```python
+from lbm_post import combine_block_snapshots  # 等价于从 lbm_post.vtk_reader 导入
+```
 
 ---
 

@@ -327,16 +327,21 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
 
 **GPU 求解器（`lbm_gpu_*`，需 `ENABLE_CUDA=ON` 编译）**
 
+> **注意**：C++ `GpuSolver` 的 `add_boundary_condition()` 和同步 `step()` 方法未通过 C ABI 暴露。
+> 同步单步执行请依次调用 `lbm_gpu_collide` + `lbm_gpu_stream` + `lbm_gpu_macroscopic`；
+> 推荐使用 `lbm_gpu_step_async` 异步管线（与磁盘 I/O 并行）。
+
 | C ABI 函数 | C++ 内部操作 | 返回 |
 |-----------|-------------|------|
-| `lbm_gpu_new(g, omega)` | `new GpuSolver(*g, omega)` | `GpuSolver*` |
-| `lbm_gpu_free(s)` | `delete s` | void |
-| `lbm_gpu_add_bc(s, type, face, ux, uy, rho)` | `s->add_boundary_condition(bc)` | void |
-| `lbm_gpu_step(s)` | `s->step()` 同步单步 | void |
+| `lbm_gpu_solver_new(g, omega)` | `new GpuSolver(*g, omega)` | `GpuSolver*` |
+| `lbm_gpu_solver_free(s)` | `delete s` | void |
+| `lbm_gpu_collide(s)` | `s->collide()`（BGK 碰撞，默认流） | void |
+| `lbm_gpu_stream(s)` | `s->stream()`（流式迁移，默认流） | void |
+| `lbm_gpu_macroscopic(s)` | `s->compute_macroscopic()`（更新 ρ/u，默认流） | void |
 | `lbm_gpu_download(s, g)` | `s->download(*g)`（f+rho+u 全量 D→H） | void |
 | `lbm_gpu_download_rho_u(s, g)` | `s->download_rho_u(*g)`（仅 rho+u，~6.3 MB） | void |
 | `lbm_gpu_upload(s, g)` | `s->upload(*g)`（f H→D） | void |
-| `lbm_gpu_step_async(s)` | `s->step_async()`（在 `compute_stream_` 上异步） | void |
+| `lbm_gpu_step_async(s)` | `s->step_async()`（在 `compute_stream_` 上异步，含 GPU-BC） | void |
 | `lbm_gpu_wait_compute(s)` | `s->wait_compute()`（等待 compute 流完成）| void |
 | `lbm_gpu_enqueue_async_download_rho_u(s, buf)` | `s->enqueue_async_download_rho_u(buf)`（在 io 流上排队 D→H） | void |
 | `lbm_gpu_sync_async_download(s)` | `s->sync_async_download()`（等待 io 流完成）| void |
