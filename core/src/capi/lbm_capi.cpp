@@ -428,6 +428,50 @@ int lbm_mpi_decomp2d_y_start(const MpiDecomp2DHandle* h)
 #endif
 }
 
+/// 返回二维分解中本进程的物理列数（不含幽灵列）
+int lbm_mpi_decomp2d_local_nx(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->local_nx;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回二维分解中本进程的物理行数（不含幽灵行）
+int lbm_mpi_decomp2d_local_ny(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->local_ny;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回物理区域在本地网格中的 X 偏移（0 或 1；存在西幽灵列时为 1）
+int lbm_mpi_decomp2d_phys_x0(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->phys_x0();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回物理区域在本地网格中的 Y 偏移（0 或 1；存在南幽灵行时为 1）
+int lbm_mpi_decomp2d_phys_y0(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->phys_y0();
+#else
+    (void)h; return 0;
+#endif
+}
+
 } // extern "C"
 
 // ===========================================================================

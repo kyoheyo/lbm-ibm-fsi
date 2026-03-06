@@ -33,6 +33,49 @@ use anyhow::{Context, Result};
 use lbm_bindings::LbmGrid;
 
 // ---------------------------------------------------------------------------
+// MPI 分区信息（用于多进程块分解模式输出）
+// ---------------------------------------------------------------------------
+
+/// MPI 块分解模式下本进程的物理分区信息。
+///
+/// 当使用 MPI 块分解（`mode = "block"`）时，每个进程持有全局域的一个分区，
+/// 本地网格含幽灵行/列。此结构体记录物理分区的精确范围，供写出器：
+/// - 跳过幽灵行/列（仅写出物理节点数据）
+/// - 在输出文件中嵌入分区元数据，便于后处理将各进程分区拼合为全局场
+///
+/// ## 字段说明
+///
+/// | 字段         | 含义                                           |
+/// |-------------|------------------------------------------------|
+/// | `phys_x0`   | 物理区域在本地网格中的 X 偏移（0 或 1）         |
+/// | `phys_y0`   | 物理区域在本地网格中的 Y 偏移（0 或 1）         |
+/// | `local_nx`  | 物理列数（不含幽灵列）                          |
+/// | `local_ny`  | 物理行数（不含幽灵行）                          |
+/// | `x_start`   | 物理区域在全局坐标系中的 X 起始坐标             |
+/// | `y_start`   | 物理区域在全局坐标系中的 Y 起始坐标             |
+/// | `global_nx` | 全局域 X 总节点数                              |
+/// | `global_ny` | 全局域 Y 总节点数                              |
+#[derive(Clone, Copy, Debug)]
+pub struct PartitionInfo {
+    /// 物理区域在本地网格中的 X 偏移（0 = 无西幽灵列；1 = 有西幽灵列）
+    pub phys_x0:   usize,
+    /// 物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；1 = 有南幽灵行）
+    pub phys_y0:   usize,
+    /// 物理列数（不含幽灵列）
+    pub local_nx:  usize,
+    /// 物理行数（不含幽灵行）
+    pub local_ny:  usize,
+    /// 物理区域在全局坐标系中的 X 起始坐标
+    pub x_start:   usize,
+    /// 物理区域在全局坐标系中的 Y 起始坐标
+    pub y_start:   usize,
+    /// 全局域 X 总节点数
+    pub global_nx: usize,
+    /// 全局域 Y 总节点数
+    pub global_ny: usize,
+}
+
+// ---------------------------------------------------------------------------
 // NPZ 快照写出器
 // ---------------------------------------------------------------------------
 
@@ -40,13 +83,20 @@ use lbm_bindings::LbmGrid;
 ///
 /// 归档中包含 `lbm_post.vtk_reader.NpzReader` 所期望的数组：
 ///
-/// | 键名     | 形状        | 数据类型  | 说明           |
-/// |----------|-------------|-----------|----------------|
-/// | `rho`    | `(ny, nx)`  | float64   | 密度           |
-/// | `ux`     | `(ny, nx)`  | float64   | x 方向速度     |
-/// | `uy`     | `(ny, nx)`  | float64   | y 方向速度     |
-/// | `step`   | 标量        | int64     | 时间步索引     |
-/// | `time`   | 标量        | float64   | 物理时间       |
+/// | 键名        | 形状           | 数据类型  | 说明                         |
+/// |------------|----------------|-----------|------------------------------|
+/// | `rho`      | `(ny, nx)`     | float64   | 密度（仅物理节点）             |
+/// | `ux`       | `(ny, nx)`     | float64   | x 方向速度（仅物理节点）       |
+/// | `uy`       | `(ny, nx)`     | float64   | y 方向速度（仅物理节点）       |
+/// | `step`     | 标量           | int64     | 时间步索引                    |
+/// | `time`     | 标量           | float64   | 物理时间                      |
+/// | `x_start`  | 标量（可选）   | int64     | 分区全局 X 起始（MPI 块模式） |
+/// | `y_start`  | 标量（可选）   | int64     | 分区全局 Y 起始（MPI 块模式） |
+/// | `global_nx`| 标量（可选）   | int64     | 全局域 X 节点数（MPI 块模式）|
+/// | `global_ny`| 标量（可选）   | int64     | 全局域 Y 节点数（MPI 块模式）|
+///
+/// 当 `part` 为 `Some(info)` 时，仅写出物理节点（跳过幽灵行/列），
+/// 并在归档中附加分区元数据，供后处理程序拼合全局场。
 ///
 /// 文件名格式：`<directory>/fluid_<NNNNNN>.npz`
 pub fn write_snapshot_npz(
@@ -54,19 +104,27 @@ pub fn write_snapshot_npz(
     step: u64,
     time: f64,
     directory: &str,
+    part: Option<PartitionInfo>,
 ) -> Result<()> {
-    let nx = grid.nx() as usize;
-    let ny = grid.ny() as usize;
-    let n  = nx * ny;
+    // 确定本次写出的物理节点范围
+    let (grid_nx, phys_x0, phys_y0, out_nx, out_ny) = if let Some(p) = part {
+        (grid.nx() as usize, p.phys_x0, p.phys_y0, p.local_nx, p.local_ny)
+    } else {
+        (grid.nx() as usize, 0, 0, grid.nx() as usize, grid.ny() as usize)
+    };
+    let n = out_nx * out_ny;
 
-    // 从 C++ 格子网格收集场数组（行主序：索引 = j*nx + i）
+    // 从 C++ 格子网格收集物理节点场数组（行主序：索引 = j*grid_nx + i）
     let mut rho = Vec::with_capacity(n);
     let mut ux  = Vec::with_capacity(n);
     let mut uy  = Vec::with_capacity(n);
-    for idx in 0..n {
-        rho.push(grid.rho(idx as i32));
-        ux .push(grid.ux (idx as i32));
-        uy .push(grid.uy (idx as i32));
+    for j in phys_y0..(phys_y0 + out_ny) {
+        for i in phys_x0..(phys_x0 + out_nx) {
+            let idx = (j * grid_nx + i) as i32;
+            rho.push(grid.rho(idx));
+            ux .push(grid.ux (idx));
+            uy .push(grid.uy (idx));
+        }
     }
 
     let path = format!("{}/fluid_{:06}.npz", directory, step);
@@ -77,19 +135,34 @@ pub fn write_snapshot_npz(
         .compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file("rho.npy", options)?;
-    zip.write_all(&npy_f64(&rho, &[ny, nx]))?;
+    zip.write_all(&npy_f64(&rho, &[out_ny, out_nx]))?;
 
     zip.start_file("ux.npy", options)?;
-    zip.write_all(&npy_f64(&ux, &[ny, nx]))?;
+    zip.write_all(&npy_f64(&ux, &[out_ny, out_nx]))?;
 
     zip.start_file("uy.npy", options)?;
-    zip.write_all(&npy_f64(&uy, &[ny, nx]))?;
+    zip.write_all(&npy_f64(&uy, &[out_ny, out_nx]))?;
 
     zip.start_file("step.npy", options)?;
     zip.write_all(&npy_i64(&[step as i64], &[]))?;
 
     zip.start_file("time.npy", options)?;
     zip.write_all(&npy_f64(&[time], &[]))?;
+
+    // MPI 块分解时嵌入分区元数据，便于后处理拼合全局场
+    if let Some(p) = part {
+        zip.start_file("x_start.npy", options)?;
+        zip.write_all(&npy_i64(&[p.x_start as i64], &[]))?;
+
+        zip.start_file("y_start.npy", options)?;
+        zip.write_all(&npy_i64(&[p.y_start as i64], &[]))?;
+
+        zip.start_file("global_nx.npy", options)?;
+        zip.write_all(&npy_i64(&[p.global_nx as i64], &[]))?;
+
+        zip.start_file("global_ny.npy", options)?;
+        zip.write_all(&npy_i64(&[p.global_ny as i64], &[]))?;
+    }
 
     zip.finish()?;
     Ok(())
@@ -121,9 +194,17 @@ pub fn write_snapshot_tecplot_asc(
     step: u64,
     time: f64,
     directory: &str,
+    part: Option<PartitionInfo>,
 ) -> Result<()> {
-    let nx = grid.nx() as usize;
-    let ny = grid.ny() as usize;
+    let (grid_nx, phys_x0, phys_y0, out_nx, out_ny, x0_global, y0_global) =
+        if let Some(p) = part {
+            (grid.nx() as usize, p.phys_x0, p.phys_y0,
+             p.local_nx, p.local_ny, p.x_start, p.y_start)
+        } else {
+            let nx = grid.nx() as usize;
+            let ny = grid.ny() as usize;
+            (nx, 0, 0, nx, ny, 0, 0)
+        };
 
     let path = format!("{}/fluid_{:06}.dat", directory, step);
     let mut file = std::fs::File::create(&path)
@@ -134,16 +215,18 @@ pub fn write_snapshot_tecplot_asc(
     writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
     writeln!(
         file,
-        "ZONE T=\"fluid\", I={nx}, J={ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}"
+        "ZONE T=\"fluid\", I={out_nx}, J={out_ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}"
     )?;
 
-    // 逐节点写出数据（行主序：j 为外循环，i 为内循环）
-    // 坐标采用格子中心点：x = i+0.5，y = j+0.5
-    for j in 0..ny {
-        for i in 0..nx {
-            let idx = (j * nx + i) as i32;
-            let x   = i as f64 + 0.5;
-            let y   = j as f64 + 0.5;
+    // 逐节点写出物理节点数据（行主序：j 为外循环，i 为内循环）
+    // 坐标为全局格子中心点：x = x_global + 0.5，y = y_global + 0.5
+    for j in phys_y0..(phys_y0 + out_ny) {
+        let local_j = j - phys_y0;   // 物理行偏移（loop 保证 j >= phys_y0）
+        for i in phys_x0..(phys_x0 + out_nx) {
+            let local_i = i - phys_x0; // 物理列偏移（loop 保证 i >= phys_x0）
+            let idx = (j * grid_nx + i) as i32;
+            let x   = (x0_global + local_i) as f64 + 0.5;
+            let y   = (y0_global + local_j) as f64 + 0.5;
             let rho = grid.rho(idx);
             let ux  = grid.ux(idx);
             let uy  = grid.uy(idx);
@@ -182,20 +265,28 @@ pub fn write_snapshot_tecplot_bin(
     step: u64,
     time: f64,
     directory: &str,
+    part: Option<PartitionInfo>,
 ) -> Result<()> {
     use std::io::Write as _;
 
-    let nx = grid.nx() as usize;
-    let ny = grid.ny() as usize;
-    let n  = nx * ny;
+    let (grid_nx, phys_x0, phys_y0, out_nx, out_ny, x0_global, y0_global) =
+        if let Some(p) = part {
+            (grid.nx() as usize, p.phys_x0, p.phys_y0,
+             p.local_nx, p.local_ny, p.x_start, p.y_start)
+        } else {
+            let nx = grid.nx() as usize;
+            let ny = grid.ny() as usize;
+            (nx, 0, 0, nx, ny, 0, 0)
+        };
+    let n = out_nx * out_ny;
 
-    // 从 C++ 格子网格收集场数组（行主序）
+    // 从 C++ 格子网格收集物理节点场数组（行主序）
     let mut rho_vec = Vec::with_capacity(n);
     let mut ux_vec  = Vec::with_capacity(n);
     let mut uy_vec  = Vec::with_capacity(n);
-    for j in 0..ny {
-        for i in 0..nx {
-            let idx = (j * nx + i) as i32;
+    for j in phys_y0..(phys_y0 + out_ny) {
+        for i in phys_x0..(phys_x0 + out_nx) {
+            let idx = (j * grid_nx + i) as i32;
             rho_vec.push(grid.rho(idx));
             ux_vec .push(grid.ux(idx));
             uy_vec .push(grid.uy(idx));
@@ -260,9 +351,9 @@ pub fn write_snapshot_tecplot_bin(
     file.write_all(&0_i32.to_le_bytes())?;
     // 用户定义面邻居连接数（0 = 无）
     file.write_all(&0_i32.to_le_bytes())?;
-    // I-max, J-max, K-max（有序网格尺寸）
-    file.write_all(&(nx as i32).to_le_bytes())?;
-    file.write_all(&(ny as i32).to_le_bytes())?;
+    // I-max, J-max, K-max（有序网格尺寸，仅物理节点）
+    file.write_all(&(out_nx as i32).to_le_bytes())?;
+    file.write_all(&(out_ny as i32).to_le_bytes())?;
     file.write_all(&1_i32.to_le_bytes())?;
     // 辅助数据对数（0 = 无）
     file.write_all(&0_i32.to_le_bytes())?;
@@ -290,19 +381,17 @@ pub fn write_snapshot_tecplot_bin(
     // 共享连接的 Zone 编号（-1 = 不共享）
     file.write_all(&(-1_i32).to_le_bytes())?;
 
-    // 变量 1：X 坐标（格子中心，i + 0.5）
-    // X 坐标只与 i 有关，遍历 ny 行只是为了写出 nx*ny 个值
-    for _j in 0..ny {
-        for i in 0..nx {
-            let x = i as f64 + 0.5;
+    // 变量 1：X 坐标（全局格子中心：x_global + 0.5）
+    for _j in 0..out_ny {
+        for i in 0..out_nx {
+            let x = (x0_global + i) as f64 + 0.5;
             file.write_all(&x.to_le_bytes())?;
         }
     }
-    // 变量 2：Y 坐标（格子中心，j + 0.5）
-    // Y 坐标只与 j 有关，每行 nx 个节点共享同一 y 值
-    for j in 0..ny {
-        let y = j as f64 + 0.5;
-        for _ in 0..nx {
+    // 变量 2：Y 坐标（全局格子中心：y_global + 0.5）
+    for j in 0..out_ny {
+        let y = (y0_global + j) as f64 + 0.5;
+        for _ in 0..out_nx {
             file.write_all(&y.to_le_bytes())?;
         }
     }

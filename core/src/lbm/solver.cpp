@@ -100,9 +100,15 @@ Solver::CollideGuard Solver::make_collide_guard() const
     g.n_end   = n;
 #ifdef LBM_ENABLE_MPI
     // 一维（Y 方向）幽灵行
+    // 1D MpiDecomp 的布局约定（nprocs>1 时 grid_ny = local_ny + 2）：
+    //   j=0          : 南幽灵行（所有 rank 均有，rank-0 对应 MPI_PROC_NULL）
+    //   j=1..local_ny: 物理行（rank-0 的 j=1 是全局南物理壁）
+    //   j=local_ny+1 : 北幽灵行（所有 rank 均有，rank-(N-1) 对应 MPI_PROC_NULL）
+    // 因此对所有 rank 均跳过 j=0（n_start = nx）和 j=local_ny+1（n_end = n-nx）。
+    // rank-0 的物理南壁在 j=1，已包含在 [n_start, n_end) 范围内。
     if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-        if (!mpi_decomp_->has_south_wall()) g.n_start = grid_.nx;
-        if (!mpi_decomp_->has_north_wall()) g.n_end   = n - grid_.nx;
+        g.n_start = grid_.nx;       // 跳过南幽灵行 j=0（所有 rank 均有）
+        g.n_end   = n - grid_.nx;   // 跳过北幽灵行 j=local_ny+1（所有 rank 均有）
     }
     // 二维（XY 方向）幽灵层
     g.use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
@@ -138,7 +144,6 @@ void Solver::collide_bgk()
         for (int i = guard.n_start; i < guard.n_end; ++i) {
 #ifdef LBM_ENABLE_MPI
             if (guard.is_ghost(i)) continue;
-            }
 #endif
             const double* ui = &grid_.u[i * d];
             const double  ri = grid_.rho[i];

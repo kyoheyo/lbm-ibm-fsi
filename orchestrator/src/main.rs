@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 use config::Config;
 use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face};
+use output::PartitionInfo;
 
 // ---------------------------------------------------------------------------
 /// LBM + IBM + FSI 求解器
@@ -299,6 +300,10 @@ fn main() -> Result<()> {
     //
     // 这是流场结果正确的关键步骤：若跳过此步骤，边界条件将不会被施加，
     // 所有节点保持初始平衡态（u=0），流场云图值均为零。
+    //
+    // MPI 块分解注意事项（mode = "block"）：
+    // 每个进程只持有全局域的一个分区。物理壁面边界条件（South/North/West/East）
+    // 只应注册到持有对应物理边界的进程，避免内部进程将边界条件误施加到幽灵行/列上。
     // -----------------------------------------------------------------------
     for bc_cfg in &cfg.fluid.boundary_conditions {
         let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
@@ -338,26 +343,89 @@ fn main() -> Result<()> {
                 Face::West
             }
         };
-        solver.add_boundary_condition(
-            bc_type, face,
-            bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
-            bc_cfg.rho,
-        );
-        println!(
-            "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
-            bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
-        );
+
+        // MPI 块分解：仅在本进程持有该物理壁面时注册边界条件。
+        // 判断依据：x_start/y_start + local_nx/local_ny 是否触及全局边界。
+        let apply_bc = if effective_mode == "block" && nprocs > 1 {
+            if let Some(ref d) = _decomp2d {
+                let x_start  = d.x_start()  as u64;
+                let y_start  = d.y_start()  as u64;
+                let local_nx = d.local_nx() as u64;
+                let local_ny = d.local_ny() as u64;
+                let gnx      = cfg.fluid.nx;
+                let gny      = cfg.fluid.ny;
+                match face {
+                    Face::South  => y_start == 0,
+                    Face::North  => y_start + local_ny == gny as u64,
+                    Face::West   => x_start == 0,
+                    Face::East   => x_start + local_nx == gnx as u64,
+                    // Bottom/Top 用于三维，非分解方向，所有进程均注册
+                    _            => true,
+                }
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        if apply_bc {
+            solver.add_boundary_condition(
+                bc_type, face,
+                bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
+                bc_cfg.rho,
+            );
+            println!(
+                "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
+                bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
+            );
+        } else {
+            println!(
+                "  BC skipped (not this rank's boundary): {:?} on {:?} face",
+                bc_type, face
+            );
+        }
     }
 
+    // -----------------------------------------------------------------------
+    // 构造 MPI 块分解分区信息（用于输出时剥离幽灵行/列并嵌入元数据）
+    // -----------------------------------------------------------------------
+    let partition: Option<PartitionInfo> = if effective_mode == "block" && nprocs > 1 {
+        _decomp2d.as_ref().map(|d| PartitionInfo {
+            phys_x0:   d.phys_x0()  as usize,
+            phys_y0:   d.phys_y0()  as usize,
+            local_nx:  d.local_nx() as usize,
+            local_ny:  d.local_ny() as usize,
+            x_start:   d.x_start()  as usize,
+            y_start:   d.y_start()  as usize,
+            global_nx: cfg.fluid.nx as usize,
+            global_ny: cfg.fluid.ny as usize,
+        })
+    } else {
+        None
+    };
+
     // 创建输出目录
-    // 多进程独立模式或多重网格模式下，每进程的输出写入各自的子目录 <output.directory>/rank_<N>/
+    // MPI 块分解模式（mode="block"）下，每进程的分区快照写入各自的子目录
+    // <output.directory>/rank_<N>/，避免多进程同时写同一文件引发竞态条件。
+    // 多进程独立模式（"independent"/"multigrid"）同样写入各自子目录。
     let (eff_mode, _) = cfg.mpi.normalized_mode();
-    let output_dir = if (eff_mode == "independent" || eff_mode == "multigrid") && nprocs > 1 {
+    let output_dir = if nprocs > 1
+        && (eff_mode == "block" || eff_mode == "independent" || eff_mode == "multigrid")
+    {
         format!("{}/rank_{}", cfg.output.directory, rank)
     } else {
         cfg.output.directory.clone()
     };
     std::fs::create_dir_all(&output_dir)?;
+
+    if nprocs > 1 && eff_mode == "block" {
+        println!(
+            "输出目录  : rank={} → {}/rank_{}/  \
+             (MPI 块分解，各进程独立写出物理分区数据，后处理可按 x_start/y_start 拼合全局场)",
+            rank, cfg.output.directory, rank
+        );
+    }
 
     let csv_path = format!("{}/monitor.csv", output_dir);
 
@@ -378,32 +446,40 @@ fn main() -> Result<()> {
             match cfg.output.format.as_str() {
                 "tecplot_asc" => {
                     // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
-                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &output_dir)
+                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &output_dir, partition)
                         .with_context(|| format!("写出 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
                 }
                 "tecplot_bin" => {
                     // 二进制 Tecplot .plt 格式（TDV112）：体积最小，Tecplot 软件可直接打开
-                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &output_dir)
+                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &output_dir, partition)
                         .with_context(|| format!("写出 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
                 }
                 _ => {
                     // 默认："npz"——NumPy .npz 压缩归档，Python 后处理首选格式
-                    output::write_snapshot_npz(&grid, step + 1, time, &output_dir)
+                    output::write_snapshot_npz(&grid, step + 1, time, &output_dir, partition)
                         .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
                 }
             }
         }
 
         // -- 逐步：轻量级 CSV 监控日志 -----------------------------------------
-        if cfg.output.enable_csv_monitor {            let n = (grid.nx() * grid.ny()) as usize;
-            let ke: f64 = (0..n)
-                .map(|i| {
-                    let u = grid.ux(i as i32);
-                    let v = grid.uy(i as i32);
+        if cfg.output.enable_csv_monitor {
+            // 仅统计物理节点的动能（排除幽灵行/列）
+            let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+                (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+            } else {
+                (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+            };
+            let n_phys = pnx * pny;
+            let ke: f64 = (0..pny).flat_map(|j| (0..pnx).map(move |i| (j, i)))
+                .map(|(j, i)| {
+                    let idx = ((py0 + j) * gnx + px0 + i) as i32;
+                    let u = grid.ux(idx);
+                    let v = grid.uy(idx);
                     u * u + v * v
                 })
                 .sum::<f64>()
-                / (n as f64)
+                / (n_phys as f64)
                 * 0.5;
             output::append_monitor_csv(&csv_path, step + 1, time, &[("ke", ke)])
                 .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))?;
@@ -413,16 +489,28 @@ fn main() -> Result<()> {
         #[cfg(feature = "python-ffi")]
         if let Some(pi) = cfg.output.plot_interval {
             if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
-                let nx = grid.nx() as usize;
-                let ny = grid.ny() as usize;
-                let n  = nx * ny;
-                let rho: Vec<f64> = (0..n).map(|i| grid.rho(i as i32)).collect();
-                let ux:  Vec<f64> = (0..n).map(|i| grid.ux (i as i32)).collect();
-                let uy:  Vec<f64> = (0..n).map(|i| grid.uy (i as i32)).collect();
+                // 仅使用物理节点（排除幽灵行/列）
+                let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+                    (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+                } else {
+                    (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+                };
+                let n_phys = pnx * pny;
+                let mut rho = Vec::with_capacity(n_phys);
+                let mut ux  = Vec::with_capacity(n_phys);
+                let mut uy  = Vec::with_capacity(n_phys);
+                for j in py0..(py0 + pny) {
+                    for i in px0..(px0 + pnx) {
+                        let idx = (j * gnx + i) as i32;
+                        rho.push(grid.rho(idx));
+                        ux .push(grid.ux (idx));
+                        uy .push(grid.uy (idx));
+                    }
+                }
 
                 for field_name in &["velocity_magnitude", "vorticity"] {
                     if let Err(e) = python_bridge::plot_field(
-                        &rho, &ux, &uy, nx, ny,
+                        &rho, &ux, &uy, pnx, pny,
                         step + 1, time,
                         &output_dir,
                         field_name,

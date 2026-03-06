@@ -120,6 +120,14 @@ mod ffi {
         pub fn lbm_mpi_decomp2d_x_start(h: *const MpiDecomp2DHandle) -> c_int;
         /// 返回本进程物理区域在全局坐标系中的 y 起始坐标。
         pub fn lbm_mpi_decomp2d_y_start(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回本进程物理列数（不含幽灵列）。
+        pub fn lbm_mpi_decomp2d_local_nx(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回本进程物理行数（不含幽灵行）。
+        pub fn lbm_mpi_decomp2d_local_ny(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回物理区域在本地网格中的 X 偏移（0 = 无西幽灵列；1 = 有西幽灵列）。
+        pub fn lbm_mpi_decomp2d_phys_x0(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；1 = 有南幽灵行）。
+        pub fn lbm_mpi_decomp2d_phys_y0(h: *const MpiDecomp2DHandle) -> c_int;
 
         // --- MPI 三维块分解接口（预留，幽灵交换暂未实现）---
         pub fn lbm_mpi_decomp3d_new(gnx: c_int, gny: c_int, gnz: c_int,
@@ -584,6 +592,26 @@ impl LbmMpiDecomp2D {
     /// 本进程物理区域在全局坐标系中的 y 起始坐标。
     pub fn y_start(&self) -> i32 {
         unsafe { ffi::lbm_mpi_decomp2d_y_start(self.ptr as *const _) }
+    }
+
+    /// 本进程物理列数（不含幽灵列）。
+    pub fn local_nx(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_local_nx(self.ptr as *const _) }
+    }
+
+    /// 本进程物理行数（不含幽灵行）。
+    pub fn local_ny(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_local_ny(self.ptr as *const _) }
+    }
+
+    /// 物理区域在本地网格中的 X 偏移（0 = 无西幽灵列；1 = 有西幽灵列）。
+    pub fn phys_x0(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_phys_x0(self.ptr as *const _) }
+    }
+
+    /// 物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；1 = 有南幽灵行）。
+    pub fn phys_y0(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_phys_y0(self.ptr as *const _) }
     }
 
     /// 原始可变指针（仅供 LbmSolver::attach_mpi2d 内部使用）
