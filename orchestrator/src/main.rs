@@ -65,7 +65,8 @@ fn run_python_subprocess(interpreter: &str, script: &str, args: &[&str]) -> Resu
 }
 
 // ---------------------------------------------------------------------------
-fn main() -> Result<()> {
+/// 真正的求解器入口（在 MPI init/finalize 包装内执行）。
+fn run() -> Result<()> {
     let args = Args::parse();
     let mut cfg = Config::from_file(&args.config)?;
 
@@ -73,72 +74,79 @@ fn main() -> Result<()> {
         cfg.simulation.n_steps = n;
     }
 
-    println!("=== LBM-IBM-FSI 求解器 ===");
-    println!("配置文件 : {}", args.config.display());
-    println!("网格     : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
-    println!("步数     : {}", cfg.simulation.n_steps);
-    println!("模型     : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
-    println!("松弛频率 : ω = {:.6}", cfg.omega());
-    println!("输出格式 : {} → {}", cfg.output.format, {
-        match cfg.output.format.as_str() {
-            "tecplot_asc" => "fluid_NNNNNN.dat（ASCII Tecplot）",
-            "tecplot_bin" => "fluid_NNNNNN.plt（二进制 Tecplot TDV112）",
-            _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
-        }
-    });
+    // 读取 rank 和进程数（mpi_init() 已在调用者 main() 中完成）。
+    // 在非 MPI 模式下 rank=0, nprocs=1，此处调用安全。
+    let rank   = lbm_bindings::mpi_rank();
+    let nprocs = lbm_bindings::mpi_size();
 
     // -----------------------------------------------------------------------
-    // 应用并行配置：OpenMP 线程数
+    // 应用并行配置：OpenMP 线程数（必须在所有进程上生效，不只 rank-0）
     // -----------------------------------------------------------------------
     if cfg.parallel.omp_num_threads > 0 {
         lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
-        println!("OpenMP   : 线程数 = {}（由 [parallel].omp_num_threads 设置）",
-                 cfg.parallel.omp_num_threads);
     }
 
-    lbm_bindings::print_parallel_status();
-
-    // 打印 MPI 模式信息
-    {
-        let (norm_mode, _) = cfg.mpi.normalized_mode();
-        match norm_mode {
-            "block" => {
-                let (px, py) = cfg.mpi.effective_blocks(lbm_bindings::mpi_size());
-                if px == 1 {
-                    println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
-                } else if py == 1 {
-                    println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
-                } else {
-                    println!("MPI模式  : 二维块分解 {}×{}", px, py);
-                }
+    // 进程头部信息：仅 rank-0 打印（避免 MPI 多进程重复输出）。
+    if rank == 0 {
+        println!("=== LBM-IBM-FSI 求解器 ===");
+        println!("配置文件 : {}", args.config.display());
+        println!("网格     : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
+        println!("步数     : {}", cfg.simulation.n_steps);
+        println!("模型     : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
+        println!("松弛频率 : ω = {:.6}", cfg.omega());
+        println!("输出格式 : {} → {}", cfg.output.format, {
+            match cfg.output.format.as_str() {
+                "tecplot_asc" => "fluid_NNNNNN.dat（ASCII Tecplot）",
+                "tecplot_bin" => "fluid_NNNNNN.plt（二进制 Tecplot TDV112）",
+                _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
             }
-            "multigrid"   => println!("MPI模式  : 嵌套多重网格（框架模式，当前退化为独立）"),
-            "independent" => println!("MPI模式  : 多进程独立（每进程独立仿真，无通信）"),
-            _             => println!("MPI模式  : {}", cfg.mpi.mode),
+        });
+        if cfg.parallel.omp_num_threads > 0 {
+            println!("OpenMP   : 线程数 = {}（由 [parallel].omp_num_threads 设置）",
+                     cfg.parallel.omp_num_threads);
         }
-    }
+        lbm_bindings::print_parallel_status();
 
-    // -----------------------------------------------------------------------
-    // 插件启动日志
-    // -----------------------------------------------------------------------
-    if cfg.plugins.any_active() {
-        println!("Plugins:");
-        if !cfg.plugins.boundary.is_empty() {
-            println!("  boundary  = \"{}\"  (IBoundaryPlugin)", cfg.plugins.boundary);
+        // 打印 MPI 模式信息
+        {
+            let (norm_mode, _) = cfg.mpi.normalized_mode();
+            match norm_mode {
+                "block" => {
+                    let (px, py) = cfg.mpi.effective_blocks(nprocs);
+                    if px == 1 {
+                        println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
+                    } else if py == 1 {
+                        println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
+                    } else {
+                        println!("MPI模式  : 二维块分解 {}×{}", px, py);
+                    }
+                }
+                "multigrid"   => println!("MPI模式  : 嵌套多重网格（框架模式，当前退化为独立）"),
+                "independent" => println!("MPI模式  : 多进程独立（每进程独立仿真，无通信）"),
+                _             => println!("MPI模式  : {}", cfg.mpi.mode),
+            }
         }
-        if !cfg.plugins.mesh.is_empty() {
-            println!("  mesh      = \"{}\"  (IMeshPlugin)", cfg.plugins.mesh);
+
+        // 插件启动日志
+        if cfg.plugins.any_active() {
+            println!("Plugins:");
+            if !cfg.plugins.boundary.is_empty() {
+                println!("  boundary  = \"{}\"  (IBoundaryPlugin)", cfg.plugins.boundary);
+            }
+            if !cfg.plugins.mesh.is_empty() {
+                println!("  mesh      = \"{}\"  (IMeshPlugin)", cfg.plugins.mesh);
+            }
+            if !cfg.plugins.motion.is_empty() {
+                println!("  motion    = \"{}\"  (IMotionPlugin)", cfg.plugins.motion);
+            }
+            if !cfg.plugins.flexible.is_empty() {
+                println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
+            }
+            // 注意：若要注册插件实现，请在仿真循环前调用：
+            //   lbm_bindings::register_plugins(PluginCallbacks { boundary_fn: Some(my_fn), .. })
+            // 上方的插件名称仅供提示，不自动加载共享库。
         }
-        if !cfg.plugins.motion.is_empty() {
-            println!("  motion    = \"{}\"  (IMotionPlugin)", cfg.plugins.motion);
-        }
-        if !cfg.plugins.flexible.is_empty() {
-            println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
-        }
-        // 注意：若要注册插件实现，请在仿真循环前调用：
-        //   lbm_bindings::register_plugins(PluginCallbacks { boundary_fn: Some(my_fn), .. })
-        // 上方的插件名称仅供提示，不自动加载共享库。
-    }
+    } // end rank-0 header output
 
     // -----------------------------------------------------------------------
     // Python FFI：扩展 sys.path 使 lbm_pre / lbm_post 可导入
@@ -151,12 +159,14 @@ fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // 预处理：Python 子进程脚本
+    // 预处理：Python 子进程脚本（仅 rank-0 运行，避免 MPI 多进程重复启动子进程）
     // -----------------------------------------------------------------------
-    if let Some(ref script) = cfg.python.pre_script.clone() {
-        println!("\n--- Pre-processing (Python subprocess) ---");
-        let config_str = args.config.to_string_lossy().into_owned();
-        run_python_subprocess(&cfg.python.interpreter, script, &[&config_str])?;
+    if rank == 0 {
+        if let Some(ref script) = cfg.python.pre_script.clone() {
+            println!("\n--- Pre-processing (Python subprocess) ---");
+            let config_str = args.config.to_string_lossy().into_owned();
+            run_python_subprocess(&cfg.python.interpreter, script, &[&config_str])?;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -211,10 +221,9 @@ fn main() -> Result<()> {
     //   "1d_y"  → "block" (nx_blocks=1, ny_blocks=nprocs)
     //   "2d_xy" → "block"
     //   "multi_grid" → "independent"
+    //
+    // rank 和 nprocs 已在函数顶部通过 mpi_rank()/mpi_size() 初始化。
     // -----------------------------------------------------------------------
-    let rank   = lbm_bindings::mpi_rank();
-    let nprocs = lbm_bindings::mpi_size();
-
     // 归一化模式名称（旧名 → 新名）
     let (effective_mode, mode_was_renamed) = cfg.mpi.normalized_mode();
     if mode_was_renamed && nprocs > 1 {
@@ -420,6 +429,7 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&output_dir)?;
 
     if nprocs > 1 && eff_mode == "block" {
+        // 每个进程输出自己的目录信息
         println!(
             "输出目录  : rank={} → {}/rank_{}/  \
              (MPI 块分解，各进程独立写出物理分区数据，后处理可按 x_start/y_start 拼合全局场)",
@@ -429,9 +439,13 @@ fn main() -> Result<()> {
 
     let csv_path = format!("{}/monitor.csv", output_dir);
 
-    println!("\nStarting time integration...");
+    if rank == 0 {
+        println!("\nStarting time integration...");
+    }
     if cfg.simulation.n_steps == 0 {
-        println!("n_steps is 0 — nothing to simulate.");
+        if rank == 0 {
+            println!("n_steps is 0 — nothing to simulate.");
+        }
         return Ok(());
     }
 
@@ -442,7 +456,9 @@ fn main() -> Result<()> {
 
         // -- 高频：原生 Rust 快照（格式由 output.format 决定）-------------------
         if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
-            println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
+            if rank == 0 {
+                println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
+            }
             match cfg.output.format.as_str() {
                 "tecplot_asc" => {
                     // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
@@ -522,15 +538,44 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("\nSimulation complete.");
+    if rank == 0 {
+        println!("\nSimulation complete.");
+    }
 
     // -----------------------------------------------------------------------
-    // 后处理：Python 子进程脚本
+    // 后处理：Python 子进程脚本（仅 rank-0 运行，避免 MPI 多进程重复启动）
     // -----------------------------------------------------------------------
-    if let Some(ref script) = cfg.python.post_script.clone() {
-        println!("\n--- Post-processing (Python subprocess) ---");
-        run_python_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
+    if rank == 0 {
+        if let Some(ref script) = cfg.python.post_script.clone() {
+            println!("\n--- Post-processing (Python subprocess) ---");
+            run_python_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
+        }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+/// 顶层入口：初始化 MPI → 运行求解器 → 终结 MPI。
+///
+/// 将仿真逻辑封装在 [`run()`] 中，确保无论 `run()` 成功还是出错，
+/// `mpi_finalize()` 总能被调用，避免 MPI 进程因未调用 `MPI_Finalize`
+/// 而引发警告或资源泄漏。
+///
+/// 在非 MPI 模式（`ENABLE_MPI=OFF`）下，`mpi_init`/`mpi_finalize` 均为空操作，
+/// 此函数仍正确地将错误码传递给操作系统。
+fn main() {
+    // mpi_init() 必须在所有 MPI 函数之前调用（包括 mpi_rank / mpi_size）。
+    // 若未启用 LBM_ENABLE_MPI，此函数为空操作，安全调用。
+    lbm_bindings::mpi_init();
+
+    let result = run();
+
+    // 确保 MPI 总能被正确终结（不论 run() 是否返回错误）
+    lbm_bindings::mpi_finalize();
+
+    if let Err(e) = result {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
 }
