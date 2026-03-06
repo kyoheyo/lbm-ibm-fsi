@@ -1,6 +1,7 @@
 #include "lbm/solver.hpp"
 #include "lbm/boundary.hpp"
 #include "lbm/mpi_decomp.hpp"
+#include "lbm/solid.hpp"
 #include <cmath>
 #include <stdexcept>
 
@@ -61,6 +62,15 @@ void Solver::step()
 {
     collide();
     stream();
+
+    // 施加固体节点反弹边界条件（BB 或 IBB）
+    // 固体 BC 在面 BC 之前施加，以确保面 BC（Zou-He 等）具有更高优先级（最后写入）。
+    if (solid_bc_type_ == SolidBCType::BounceBack) {
+        apply_solid_bounce_back(grid_);
+    } else if (solid_bc_type_ == SolidBCType::InterpolatedBounceBack) {
+        apply_solid_ibb(grid_);
+    }
+
     // 施加通过 add_boundary_condition() 注册的边界条件
     if (!bcs_.empty()) {
         // 计算物理边界在本地网格中的行/列范围。

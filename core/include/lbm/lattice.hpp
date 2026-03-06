@@ -114,6 +114,16 @@ struct LatticeGrid {
     /// 各节点处的体力密度，存储格式：[节点索引 * 维度]
     std::vector<double> force;
 
+    /// 固体标记：solid[node]=1 表示固体（浸入边界内部），0 表示流体。
+    /// 默认全零（全流体）。可通过 mark_solid_cylinder() 等工具设置。
+    std::vector<uint8_t> solid;
+
+    /// IBB（插值反弹）壁面距离分数 q ∈ (0,1]。
+    /// 存储格式：q_ibb[node * Q + a]，仅对流体节点相邻固体方向 a 有意义。
+    /// q = 0.5 表示标准半步长反弹（halfway BB）。
+    /// 由 mark_solid_cylinder() / compute_ibb_distances() 填充。
+    std::vector<float> q_ibb;
+
     LatticeGrid() = default;
     LatticeGrid(int nx, int ny, int nz, LatticeModel model);
 

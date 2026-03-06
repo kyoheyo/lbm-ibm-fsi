@@ -2,6 +2,7 @@
 #include "lattice.hpp"
 #include "boundary.hpp"
 #include "mpi_decomp.hpp"
+#include "solid.hpp"
 #include <vector>
 
 namespace lbm {
@@ -42,6 +43,15 @@ public:
         return bcs_;
     }
 
+    /// 设置固体节点边界条件类型。
+    /// 若设置为 BounceBack 或 InterpolatedBounceBack，则每次 step() 的 stream() 之后
+    /// 自动对 grid_.solid 中标记的固体节点施加相应反弹 BC。
+    /// 默认 SolidBCType::None（不施加，全流体模式）。
+    void set_solid_bc_type(SolidBCType t) { solid_bc_type_ = t; }
+
+    /// 返回当前固体 BC 类型。
+    [[nodiscard]] SolidBCType solid_bc_type() const { return solid_bc_type_; }
+
     /// 绑定 MPI 域分解描述符，之后每次 step() 的 stream() 末尾自动执行幽灵行交换。
     /// 传入 nullptr 可解除绑定。
     /// 仅在 LBM_ENABLE_MPI 编译宏定义时有实际效果；否则为空操作。
@@ -57,8 +67,9 @@ private:
     double         omega_;       ///< 松弛频率  ω = 1/τ
     CollisionModel cm_;
     std::vector<BoundaryCondition> bcs_;  ///< 每步自动施加的边界条件列表
-    const MpiDecomp* mpi_decomp_ = nullptr; ///< 可选 MPI 一维域分解（nullptr = 单进程模式）
-    const MpiDecomp2D* mpi_decomp2d_ = nullptr; ///< 可选 MPI 二维块分解（nullptr = 未使用）
+    const MpiDecomp*   mpi_decomp_    = nullptr;
+    const MpiDecomp2D* mpi_decomp2d_  = nullptr;
+    SolidBCType        solid_bc_type_ = SolidBCType::None;
 
     void collide_bgk();
     void collide_mrt();
