@@ -50,12 +50,11 @@ namespace lbm {
 //     西壁 i=0    ：f[1] ← f_tmp[3], f[5] ← f_tmp[7], f[8] ← f_tmp[6]
 //     东壁 i=nx-1 ：f[3] ← f_tmp[1], f[6] ← f_tmp[8], f[7] ← f_tmp[5]
 // ---------------------------------------------------------------------------
-static void apply_bounce_back(LatticeGrid& g, Face face)
+static void apply_bounce_back(LatticeGrid& g, Face face, const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
 
     switch (face) {
         case Face::South:
@@ -63,7 +62,7 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n = g.idx(i, 0);
+                const int n = g.idx(i, pb.j_s);
                 double*       f  = &g.f    [n * d2q9::Q];
                 const double* fp = &g.f_tmp[n * d2q9::Q];
                 f[2] = fp[4];   // N  ← f_tmp[S]
@@ -77,7 +76,7 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n = g.idx(i, ny - 1);
+                const int n = g.idx(i, pb.j_n);
                 double*       f  = &g.f    [n * d2q9::Q];
                 const double* fp = &g.f_tmp[n * d2q9::Q];
                 f[4] = fp[2];   // S  ← f_tmp[N]
@@ -90,8 +89,8 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n = g.idx(0, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n = g.idx(pb.i_w, j);
                 double*       f  = &g.f    [n * d2q9::Q];
                 const double* fp = &g.f_tmp[n * d2q9::Q];
                 f[1] = fp[3];   // E  ← f_tmp[W]
@@ -104,8 +103,8 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n = g.idx(nx - 1, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n = g.idx(pb.i_e, j);
                 double*       f  = &g.f    [n * d2q9::Q];
                 const double* fp = &g.f_tmp[n * d2q9::Q];
                 f[3] = fp[1];   // W  ← f_tmp[E]
@@ -139,12 +138,11 @@ static void apply_bounce_back(LatticeGrid& g, Face face)
 //     西壁 i=0    ：f[1] ← f[3], f[5] ← f[7], f[8] ← f[6]
 //     东壁 i=nx-1 ：f[3] ← f[1], f[6] ← f[8], f[7] ← f[5]
 // ---------------------------------------------------------------------------
-static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
+static void apply_bounce_back_fullway(LatticeGrid& g, Face face, const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
 
     switch (face) {
         case Face::South:
@@ -152,7 +150,7 @@ static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                double* f = &g.f[g.idx(i, 0) * d2q9::Q];
+                double* f = &g.f[g.idx(i, pb.j_s) * d2q9::Q];
                 const double s4 = f[4], s7 = f[7], s8 = f[8];  // 先暂存入射值
                 f[2] = s4;
                 f[5] = s7;
@@ -165,7 +163,7 @@ static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                double* f = &g.f[g.idx(i, ny - 1) * d2q9::Q];
+                double* f = &g.f[g.idx(i, pb.j_n) * d2q9::Q];
                 const double s2 = f[2], s5 = f[5], s6 = f[6];
                 f[4] = s2;
                 f[7] = s5;
@@ -177,8 +175,8 @@ static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                double* f = &g.f[g.idx(0, j) * d2q9::Q];
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                double* f = &g.f[g.idx(pb.i_w, j) * d2q9::Q];
                 const double s3 = f[3], s7 = f[7], s6 = f[6];
                 f[1] = s3;
                 f[5] = s7;
@@ -190,8 +188,8 @@ static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                double* f = &g.f[g.idx(nx - 1, j) * d2q9::Q];
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                double* f = &g.f[g.idx(pb.i_e, j) * d2q9::Q];
                 const double s1 = f[1], s8 = f[8], s5 = f[5];
                 f[3] = s1;
                 f[6] = s8;
@@ -233,29 +231,21 @@ static void apply_bounce_back_fullway(LatticeGrid& g, Face face)
 //
 //   其他三面（北/西/东）的推导完全类比，只需交换相应的已知/未知方向。
 // ---------------------------------------------------------------------------
-static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
+static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc,
+                                    const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
 
     if (bc.face == Face::North) {
-        // 北壁 j=ny-1，规定速度 (ux, uy)
-        // 已知：f[2](N), f[5](NE), f[6](NW) — 来自 j=ny-2
-        // 未知：f[4](S), f[7](SW),  f[8](SE)
-        //
-        //   ρ*(1+uy) = f[0]+f[1]+f[3] + 2*(f[2]+f[5]+f[6])
-        //   f[4] = f[2] - (2/3)*ρ*uy
-        //   f[7] = f[5] + (1/2)*(f[1]-f[3]) - (1/6)*ρ*uy - (1/2)*ρ*ux
-        //   f[8] = f[6] - (1/2)*(f[1]-f[3]) - (1/6)*ρ*uy + (1/2)*ρ*ux
         const double ux = bc.ux;
         const double uy = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < nx; ++i) {
-            const int n = g.idx(i, ny - 1);
+            const int n = g.idx(i, pb.j_n);
             double* f = &g.f[n * d2q9::Q];
             double rho_w = (f[0] + f[1] + f[3]
                           + 2.0 * (f[2] + f[5] + f[6]))
@@ -273,21 +263,13 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::South) {
-        // 南壁 j=0，规定速度 (ux, uy)
-        // 已知：f[4](S), f[7](SW), f[8](SE) — 来自 j=1
-        // 未知：f[2](N), f[5](NE), f[6](NW)
-        //
-        //   ρ*(1-uy) = f[0]+f[1]+f[3] + 2*(f[4]+f[7]+f[8])
-        //   f[2] = f[4] + (2/3)*ρ*uy
-        //   f[5] = f[7] - (1/2)*(f[1]-f[3]) + (1/6)*ρ*uy + (1/2)*ρ*ux
-        //   f[6] = f[8] + (1/2)*(f[1]-f[3]) + (1/6)*ρ*uy - (1/2)*ρ*ux
         const double ux = bc.ux;
         const double uy = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < nx; ++i) {
-            const int n = g.idx(i, 0);
+            const int n = g.idx(i, pb.j_s);
             double* f = &g.f[n * d2q9::Q];
             double rho_w = (f[0] + f[1] + f[3]
                           + 2.0 * (f[4] + f[7] + f[8]))
@@ -305,21 +287,13 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::West) {
-        // 西壁 i=0，规定速度 (ux, uy)
-        // 已知：f[3](W), f[6](NW), f[7](SW) — 来自 i=1
-        // 未知：f[1](E), f[5](NE), f[8](SE)
-        //
-        //   ρ*(1-ux) = f[0]+f[2]+f[4] + 2*(f[3]+f[6]+f[7])
-        //   f[1] = f[3] + (2/3)*ρ*ux
-        //   f[5] = f[7] - (1/2)*(f[2]-f[4]) + (1/6)*ρ*ux + (1/2)*ρ*uy
-        //   f[8] = f[6] + (1/2)*(f[2]-f[4]) + (1/6)*ρ*ux - (1/2)*ρ*uy
         const double ux = bc.ux;
         const double uy = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int j = 0; j < ny; ++j) {
-            const int n = g.idx(0, j);
+        for (int j = pb.j_s; j <= pb.j_n; ++j) {
+            const int n = g.idx(pb.i_w, j);
             double* f = &g.f[n * d2q9::Q];
             double rho_w = (f[0] + f[2] + f[4]
                           + 2.0 * (f[3] + f[6] + f[7]))
@@ -337,23 +311,13 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::East) {
-        // 东壁 i=nx-1，规定速度 (ux, uy)
-        // 已知：f[1](E), f[5](NE), f[8](SE) — 来自 i=nx-2
-        // 未知：f[3](W), f[6](NW), f[7](SW)
-        //
-        //   ρ*(1+ux) = f[0]+f[2]+f[4] + 2*(f[1]+f[5]+f[8])
-        //   f[3] = f[1] - (2/3)*ρ*ux
-        //   f[6] = f[8] - (1/2)*(f[2]-f[4]) - (1/6)*ρ*ux + (1/2)*ρ*uy
-        //   f[7] = f[5] + (1/2)*(f[2]-f[4]) - (1/6)*ρ*ux - (1/2)*ρ*uy
-        //
-        //   注意：(f[2]-f[4]) 前的符号与 West 面相反，源于 x 方向速度的方向相反。
         const double ux = bc.ux;
         const double uy = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int j = 0; j < ny; ++j) {
-            const int n = g.idx(nx - 1, j);
+        for (int j = pb.j_s; j <= pb.j_n; ++j) {
+            const int n = g.idx(pb.i_e, j);
             double* f = &g.f[n * d2q9::Q];
             double rho_w = (f[0] + f[2] + f[4]
                           + 2.0 * (f[1] + f[5] + f[8]))
@@ -395,25 +359,21 @@ static void apply_zou_he_velocity(LatticeGrid& g, const BoundaryCondition& bc)
 //     f[6] = f[8] + (1/2)*(f[2]-f[4]) - (1/6)*ρ_b*ux + (1/2)*ρ_b*uy
 //     f[7] = f[5] - (1/2)*(f[2]-f[4]) - (1/6)*ρ_b*ux - (1/2)*ρ_b*uy
 // ---------------------------------------------------------------------------
-static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc)
+static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc,
+                                    const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
     const double rho_b = bc.rho;
 
     if (bc.face == Face::North) {
-        // 北壁 j=ny-1，规定密度 ρ_b（切向速度 ux = bc.ux，默认 0）
-        // 已知：f[2](N), f[5](NE), f[6](NW) — 来自 j=ny-2
-        // 未知：f[4](S), f[7](SW), f[8](SE)
-        //   uy = -1 + (f[0]+f[1]+f[3] + 2*(f[2]+f[5]+f[6])) / ρ_b
         const double ux_t = bc.ux;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < nx; ++i) {
-            const int n = g.idx(i, ny - 1);
+            const int n = g.idx(i, pb.j_n);
             double* f = &g.f[n * d2q9::Q];
             const double uy = -1.0 + (f[0] + f[1] + f[3]
                                      + 2.0 * (f[2] + f[5] + f[6])) / rho_b;
@@ -430,16 +390,12 @@ static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::South) {
-        // 南壁 j=0，规定密度 ρ_b（切向速度 ux = bc.ux，默认 0）
-        // 已知：f[4](S), f[7](SW), f[8](SE) — 来自 j=1
-        // 未知：f[2](N), f[5](NE), f[6](NW)
-        //   uy = 1 - (f[0]+f[1]+f[3] + 2*(f[4]+f[7]+f[8])) / ρ_b
         const double ux_t = bc.ux;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < nx; ++i) {
-            const int n = g.idx(i, 0);
+            const int n = g.idx(i, pb.j_s);
             double* f = &g.f[n * d2q9::Q];
             const double uy = 1.0 - (f[0] + f[1] + f[3]
                                     + 2.0 * (f[4] + f[7] + f[8])) / rho_b;
@@ -456,16 +412,12 @@ static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::West) {
-        // 西壁 i=0，规定密度 ρ_b（切向速度 uy = bc.uy，默认 0）
-        // 已知：f[3](W), f[6](NW), f[7](SW) — 来自 i=1
-        // 未知：f[1](E), f[5](NE), f[8](SE)
-        //   ux = 1 - (f[0]+f[2]+f[4] + 2*(f[3]+f[6]+f[7])) / ρ_b
         const double uy_t = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int j = 0; j < ny; ++j) {
-            const int n = g.idx(0, j);
+        for (int j = pb.j_s; j <= pb.j_n; ++j) {
+            const int n = g.idx(pb.i_w, j);
             double* f = &g.f[n * d2q9::Q];
             const double ux = 1.0 - (f[0] + f[2] + f[4]
                                     + 2.0 * (f[3] + f[6] + f[7])) / rho_b;
@@ -482,19 +434,12 @@ static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc)
         }
     }
     else if (bc.face == Face::East) {
-        // 东壁 i=nx-1，规定密度 ρ_b（切向速度 uy = bc.uy，默认 0）
-        // 已知：f[1](E), f[5](NE), f[8](SE) — 来自 i=nx-2
-        // 未知：f[3](W), f[6](NW), f[7](SW)
-        //   ux = -1 + (f[0]+f[2]+f[4] + 2*(f[1]+f[5]+f[8])) / ρ_b
-        //   f[3] = f[1] - (2/3)*ρ_b*ux
-        //   f[6] = f[8] - (1/2)*(f[2]-f[4]) - (1/6)*ρ_b*ux + (1/2)*ρ_b*uy
-        //   f[7] = f[5] + (1/2)*(f[2]-f[4]) - (1/6)*ρ_b*ux - (1/2)*ρ_b*uy
         const double uy_t = bc.uy;
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int j = 0; j < ny; ++j) {
-            const int n = g.idx(nx - 1, j);
+        for (int j = pb.j_s; j <= pb.j_n; ++j) {
+            const int n = g.idx(pb.i_e, j);
             double* f = &g.f[n * d2q9::Q];
             const double ux = -1.0 + (f[0] + f[2] + f[4]
                                      + 2.0 * (f[1] + f[5] + f[8])) / rho_b;
@@ -515,25 +460,12 @@ static void apply_zou_he_pressure(LatticeGrid& g, const BoundaryCondition& bc)
 
 // ---------------------------------------------------------------------------
 // 5. 充分发展出口 / 自由出口边界（BCType::FullyDeveloped / FreeOutlet）
-//
-// 物理模型：在出口处假设流动沿法向充分发展，即法向梯度为零：
-//   ∂f[a]/∂n = 0  →  f[a](x_out) = f[a](x_out - e_n)
-//
-// 实现：流式迁移后，将出口节点的所有分布函数替换为上游相邻节点的值。
-//   对于 East 出口（i=nx-1）：f[a](nx-1, j) = f[a](nx-2, j)  for all a
-//   对于 West 出口（i=0）   ：f[a](0, j)    = f[a](1, j)     for all a
-//   对于 North 出口（j=ny-1）：f[a](i, ny-1) = f[a](i, ny-2)  for all a
-//   对于 South 出口（j=0）  ：f[a](i, 0)    = f[a](i, 1)     for all a
-//
-// 注意：此边界条件不施加特定速度或密度，宏观量由 compute_macroscopic() 自行计算。
-//       适用于出口远离障碍物、流动已充分发展的通道流问题。
 // ---------------------------------------------------------------------------
-static void apply_fully_developed(LatticeGrid& g, Face face)
+static void apply_fully_developed(LatticeGrid& g, Face face, const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
 
     switch (face) {
         case Face::South:
@@ -541,8 +473,8 @@ static void apply_fully_developed(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n_out = g.idx(i, 0);
-                const int n_in  = g.idx(i, 1);
+                const int n_out = g.idx(i, pb.j_s);
+                const int n_in  = g.idx(i, pb.j_s + 1);
                 for (int a = 0; a < d2q9::Q; ++a)
                     g.f[n_out * d2q9::Q + a] = g.f[n_in * d2q9::Q + a];
             }
@@ -553,8 +485,8 @@ static void apply_fully_developed(LatticeGrid& g, Face face)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n_out = g.idx(i, ny - 1);
-                const int n_in  = g.idx(i, ny - 2);
+                const int n_out = g.idx(i, pb.j_n);
+                const int n_in  = g.idx(i, pb.j_n - 1);
                 for (int a = 0; a < d2q9::Q; ++a)
                     g.f[n_out * d2q9::Q + a] = g.f[n_in * d2q9::Q + a];
             }
@@ -564,9 +496,9 @@ static void apply_fully_developed(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n_out = g.idx(0, j);
-                const int n_in  = g.idx(1, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n_out = g.idx(pb.i_w, j);
+                const int n_in  = g.idx(pb.i_w + 1, j);
                 for (int a = 0; a < d2q9::Q; ++a)
                     g.f[n_out * d2q9::Q + a] = g.f[n_in * d2q9::Q + a];
             }
@@ -576,9 +508,9 @@ static void apply_fully_developed(LatticeGrid& g, Face face)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n_out = g.idx(nx - 1, j);
-                const int n_in  = g.idx(nx - 2, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n_out = g.idx(pb.i_e, j);
+                const int n_in  = g.idx(pb.i_e - 1, j);
                 for (int a = 0; a < d2q9::Q; ++a)
                     g.f[n_out * d2q9::Q + a] = g.f[n_in * d2q9::Q + a];
             }
@@ -618,12 +550,12 @@ static void apply_fully_developed(LatticeGrid& g, Face face)
 //         bc.ux, bc.uy 指定的速度始终作为 u_b（速度 BC）；
 //         设为 (0,0) 时则用内部节点速度外推（压力 BC / 无滑移 BC）。
 // ---------------------------------------------------------------------------
-static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
+static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc,
+                                      const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
 
     const int nx = g.nx;
-    const int ny = g.ny;
 
     // 辅助 lambda：计算节点 n 处方向 a 的平衡分布（D2Q9）
     auto feq_node = [&](double rho, double ux, double uy, int a) -> double {
@@ -639,16 +571,13 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 
     switch (bc.face) {
         case Face::South: {
-            // 边界 j=0，相邻内部节点 j=1
-            // bc.rho > 0 → 压力模式（规定 ρ_b，速度从内部外推）
-            // bc.rho = 0 → 速度模式（规定 u_b = (bc.ux, bc.uy)，含 ux=uy=0 的无滑移，密度从内部外推）
             const bool pressure_mode = (bc.rho > 0.0);
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n_b = g.idx(i, 0);
-                const int n_f = g.idx(i, 1);
+                const int n_b = g.idx(i, pb.j_s);
+                const int n_f = g.idx(i, pb.j_s + 1);
                 const double rho_f = g.rho[n_f];
                 const double ux_f  = g.u[n_f * 2 + 0];
                 const double uy_f  = g.u[n_f * 2 + 1];
@@ -674,8 +603,8 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 #pragma omp parallel for schedule(static)
 #endif
             for (int i = 0; i < nx; ++i) {
-                const int n_b = g.idx(i, ny - 1);
-                const int n_f = g.idx(i, ny - 2);
+                const int n_b = g.idx(i, pb.j_n);
+                const int n_f = g.idx(i, pb.j_n - 1);
                 const double rho_f = g.rho[n_f];
                 const double ux_f  = g.u[n_f * 2 + 0];
                 const double uy_f  = g.u[n_f * 2 + 1];
@@ -700,9 +629,9 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n_b = g.idx(0, j);
-                const int n_f = g.idx(1, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n_b = g.idx(pb.i_w, j);
+                const int n_f = g.idx(pb.i_w + 1, j);
                 const double rho_f = g.rho[n_f];
                 const double ux_f  = g.u[n_f * 2 + 0];
                 const double uy_f  = g.u[n_f * 2 + 1];
@@ -727,9 +656,9 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int j = 0; j < ny; ++j) {
-                const int n_b = g.idx(nx - 1, j);
-                const int n_f = g.idx(nx - 2, j);
+            for (int j = pb.j_s; j <= pb.j_n; ++j) {
+                const int n_b = g.idx(pb.i_e, j);
+                const int n_f = g.idx(pb.i_e - 1, j);
                 const double rho_f = g.rho[n_f];
                 const double ux_f  = g.u[n_f * 2 + 0];
                 const double uy_f  = g.u[n_f * 2 + 1];
@@ -758,88 +687,71 @@ static void apply_guo_extrapolation(LatticeGrid& g, const BoundaryCondition& bc)
 // ---------------------------------------------------------------------------
 // 7. 边角点半步长反弹修正（内部辅助函数，自动在面 BC 后调用）
 //
-// 问题根源：
-//   push 流式迁移（以周期取模实现）后，4 个边角节点各有 5 个幽灵方向，
-//   这些方向的值来自对面边界的周期折叠，并非真实物理值。
-//   面 BC（如 ZouHe、Guo）的密度公式假设部分"已知"方向是来自流体内部的真值，
-//   但在角点处这些方向同样是幽灵值，导致密度计算偏差，进而产生错误的 f 值。
+// 修正方案：在所有面 BC 完成后，对满足条件的角节点的全部 5 个幽灵方向
+//   施加半步长反弹。使用 g.f_tmp（碰撞后、迁移前的值）覆盖面 BC 近似值。
 //
-//   具体地，对 4 个角点，幽灵方向为：
-//     SW (0, 0)       : f[1](E), f[2](N), f[5](NE), f[6](NW), f[8](SE)
-//     SE (nx-1, 0)    : f[2](N), f[3](W), f[5](NE), f[6](NW), f[7](SW)
-//     NW (0, ny-1)    : f[1](E), f[4](S), f[5](NE), f[7](SW), f[8](SE)
-//     NE (nx-1, ny-1) : f[3](W), f[4](S), f[6](NW), f[7](SW), f[8](SE)
+// MPI 兼容性：
+//   角节点使用物理坐标（pb.i_w/i_e, pb.j_s/j_n），确保 MPI 模式下不操作幽灵层。
+//   条件触发改为"两相邻面均被注册且至少一面为固壁 BC"，防止在无物理壁面的分区
+//   边界上错误施加反弹（如 MPI 分块中某 rank 没有 South/North 物理壁）。
 //
-// 修正方案：
-//   在所有面 BC 完成后，对满足条件的角节点的全部 5 个幽灵方向施加**半步长反弹**，
-//   使用 g.f_tmp（碰撞后、迁移前的值，不受任何面 BC 修改）覆盖由面 BC
-//   设置的近似值。公式为：f[a] = f_tmp[opp(a)]（见对立方向表）。
-//
-//   对于纯 BounceBack 面 BC 的配置，此步骤与面 BC 的结果完全一致（幂等）；
-//   对于 ZouHe、Guo 等面 BC，此步骤修正角点的幽灵方向为精确的无滑移反弹值。
-//
-// 物理意义：
-//   角点为两固壁的交汇奇点，在无滑移 Navier-Stokes 方程中速度为零。
-//   半步长反弹在角点处等价于强制施加 u = 0 边界条件。
-//
-// 选择性修正（wall_face_bits 参数）：
-//   仅对两相邻面中**至少有一面是固壁 BC**（BounceBack 或 BounceBackFullWay）的
-//   角节点施加修正。两相邻面均为非固壁 BC（如 FD/FO 出口）时跳过，避免对
-//   流体出口角点强制施加物理上不正确的 u = 0。
-//
-//   wall_face_bits 位掩码（由调用方 apply_boundary_conditions 计算并传入）：
-//     bit 0（0x1）: South 面为固壁 BC
-//     bit 1（0x2）: North 面为固壁 BC
-//     bit 2（0x4）: West  面为固壁 BC
-//     bit 3（0x8）: East  面为固壁 BC
+// 参数：
+//   wall_face_bits  — 固壁（BounceBack/BounceBackFullWay）面掩码
+//   all_face_bits   — 所有已注册 BC 的面掩码（含 ZouHe/Guo 等非固壁 BC）
+//   pb              — 物理边界行/列索引（MPI 模式下须跳过幽灵层）
 // ---------------------------------------------------------------------------
-static void apply_corner_bounce_back(LatticeGrid& g, unsigned wall_face_bits)
+static void apply_corner_bounce_back(LatticeGrid& g,
+                                      unsigned wall_face_bits,
+                                      unsigned all_face_bits,
+                                      const PhysicalBounds& pb)
 {
     if (g.model != LatticeModel::D2Q9) return;
-
-    const int nx = g.nx;
-    const int ny = g.ny;
 
     // 对立方向查找表（D2Q9）
     // 0↔0, 1↔3, 2↔4, 3↔1, 4↔2, 5↔7, 6↔8, 7↔5, 8↔6
     static const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
 
-    const bool south = (wall_face_bits & 0x1u) != 0u;
-    const bool north = (wall_face_bits & 0x2u) != 0u;
-    const bool west  = (wall_face_bits & 0x4u) != 0u;
-    const bool east  = (wall_face_bits & 0x8u) != 0u;
+    const bool s_wall  = (wall_face_bits & 0x1u) != 0u;
+    const bool n_wall  = (wall_face_bits & 0x2u) != 0u;
+    const bool w_wall  = (wall_face_bits & 0x4u) != 0u;
+    const bool e_wall  = (wall_face_bits & 0x8u) != 0u;
 
-    // --- SW 角 (0, 0)：幽灵方向 1,2,5,6,8 ---
-    // 相邻面：South 和 West
-    if (south || west) {
-        const int n = g.idx(0, 0);
+    // 角点仅在两相邻面均已注册 BC（此 rank 拥有该物理面）且
+    // 其中至少一面是固壁 BC 时才施加修正，以避免：
+    //   a) 在 MPI 分区边界（无物理壁）处错误施加反弹；
+    //   b) 两面均为非固壁 BC 的流体出口角点被强制置 u=0。
+    const bool s_owned = (all_face_bits & 0x1u) != 0u;
+    const bool n_owned = (all_face_bits & 0x2u) != 0u;
+    const bool w_owned = (all_face_bits & 0x4u) != 0u;
+    const bool e_owned = (all_face_bits & 0x8u) != 0u;
+
+    // --- SW 角：South + West 均已注册，且至少一面为固壁 ---
+    if (s_owned && w_owned && (s_wall || w_wall)) {
+        const int n = g.idx(pb.i_w, pb.j_s);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
         for (int a : {1, 2, 5, 6, 8}) f[a] = fp[OPP[a]];
     }
 
-    // --- SE 角 (nx-1, 0)：幽灵方向 2,3,5,6,7 ---
-    // 相邻面：South 和 East
-    if (south || east) {
-        const int n = g.idx(nx - 1, 0);
+    // --- SE 角：South + East 均已注册，且至少一面为固壁 ---
+    if (s_owned && e_owned && (s_wall || e_wall)) {
+        const int n = g.idx(pb.i_e, pb.j_s);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
         for (int a : {2, 3, 5, 6, 7}) f[a] = fp[OPP[a]];
     }
 
-    // --- NW 角 (0, ny-1)：幽灵方向 1,4,5,7,8 ---
-    // 相邻面：North 和 West
-    if (north || west) {
-        const int n = g.idx(0, ny - 1);
+    // --- NW 角：North + West 均已注册，且至少一面为固壁 ---
+    if (n_owned && w_owned && (n_wall || w_wall)) {
+        const int n = g.idx(pb.i_w, pb.j_n);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
         for (int a : {1, 4, 5, 7, 8}) f[a] = fp[OPP[a]];
     }
 
-    // --- NE 角 (nx-1, ny-1)：幽灵方向 3,4,6,7,8 ---
-    // 相邻面：North 和 East
-    if (north || east) {
-        const int n = g.idx(nx - 1, ny - 1);
+    // --- NE 角：North + East 均已注册，且至少一面为固壁 ---
+    if (n_owned && e_owned && (n_wall || e_wall)) {
+        const int n = g.idx(pb.i_e, pb.j_n);
         double*       f  = &g.f    [n * d2q9::Q];
         const double* fp = &g.f_tmp[n * d2q9::Q];
         for (int a : {3, 4, 6, 7, 8}) f[a] = fp[OPP[a]];
@@ -849,34 +761,15 @@ static void apply_corner_bounce_back(LatticeGrid& g, unsigned wall_face_bits)
 
 // ---------------------------------------------------------------------------
 // 应用所有已注册的边界条件
-//
-// 施加顺序（优先级由低到高，高优先级 BC 最后施加以覆盖角节点处的低优先级值）：
-//
-//   第一轮 — FullyDeveloped / FreeOutlet（零法向梯度外推，最弱约束）
-//             对整个面（含角节点）执行拷贝，为角节点提供一个"兜底"的背景值。
-//
-//   第二轮 — BounceBack / BounceBackFullWay（固壁反弹，中等约束）
-//             覆盖固壁面的幽灵方向，第一轮在固壁面上的零梯度值被修正为无滑移值。
-//
-//   第三轮 — ZouHe_Velocity / ZouHe_Pressure / Guo_Extrapolation（最强约束）
-//             最后施加，确保入/出口规定的速度或压力在角节点处不被第一轮覆盖。
-//
-// 设计动机（角节点冲突问题）：
-//   push 流式迁移后，每个角节点同时属于两个面，各自有对应的幽灵方向。
-//   若注册了 West=ZouHe_Velocity 和 South=FullyDeveloped，且 FullyDeveloped
-//   在 ZouHe 之后执行，则 FD 会将 SW 角节点的 ALL f[a] 替换为 j=1 行的值，
-//   销毁 ZouHe 精心计算的入口 f 值，导致入口角节点速度约束失效。
-//   三轮优先级排序确保 ZouHe/Guo 始终"最后说话"，角节点处入口 BC 正确生效。
-//
-// 注意：各轮内部按注册顺序执行，保持用户对同一优先级内多个 BC 的顺序语义。
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
-                                const std::vector<BoundaryCondition>& bcs)
+                                const std::vector<BoundaryCondition>& bcs,
+                                PhysicalBounds pb)
 {
     // ---- 第一轮：FullyDeveloped / FreeOutlet ----
     for (const auto& bc : bcs) {
         if (bc.type == BCType::FullyDeveloped || bc.type == BCType::FreeOutlet) {
-            apply_fully_developed(grid, bc.face);
+            apply_fully_developed(grid, bc.face, pb);
         }
     }
 
@@ -884,10 +777,10 @@ void apply_boundary_conditions(LatticeGrid& grid,
     for (const auto& bc : bcs) {
         switch (bc.type) {
             case BCType::BounceBack:
-                apply_bounce_back(grid, bc.face);
+                apply_bounce_back(grid, bc.face, pb);
                 break;
             case BCType::BounceBackFullWay:
-                apply_bounce_back_fullway(grid, bc.face);
+                apply_bounce_back_fullway(grid, bc.face, pb);
                 break;
             default:
                 break;
@@ -898,13 +791,13 @@ void apply_boundary_conditions(LatticeGrid& grid,
     for (const auto& bc : bcs) {
         switch (bc.type) {
             case BCType::ZouHe_Velocity:
-                apply_zou_he_velocity(grid, bc);
+                apply_zou_he_velocity(grid, bc, pb);
                 break;
             case BCType::ZouHe_Pressure:
-                apply_zou_he_pressure(grid, bc);
+                apply_zou_he_pressure(grid, bc, pb);
                 break;
             case BCType::Guo_Extrapolation:
-                apply_guo_extrapolation(grid, bc);
+                apply_guo_extrapolation(grid, bc, pb);
                 break;
             case BCType::Periodic:
                 // 周期边界在流式迁移的周期性取模中隐式处理
@@ -914,25 +807,26 @@ void apply_boundary_conditions(LatticeGrid& grid,
         }
     }
 
-    // 所有面 BC 完成后，对满足条件的角节点施加半步长反弹修正。
-    // 条件：角节点的两个相邻面中，至少有一面是固壁 BC（BounceBack/BounceBackFullWay）。
-    // 若两相邻面均为非固壁 BC（如 FD/FO 出口），则跳过该角节点，
-    // 避免在流体出口角点强制施加物理上不正确的 u = 0。
+    // 所有面 BC 完成后，对物理角点施加半步长反弹修正。
+    // MPI 兼容：使用 pb 中的物理坐标，仅在两相邻面均已注册 BC 且至少
+    // 一面为固壁时才修正，防止在 MPI 分区边界（无物理壁）处错误施加。
     if (!bcs.empty()) {
-        // 计算固壁面掩码：bit0=South, bit1=North, bit2=West, bit3=East
         unsigned wall_face_bits = 0u;
+        unsigned all_face_bits  = 0u;
         for (const auto& bc : bcs) {
-            if (bc.type == BCType::BounceBack || bc.type == BCType::BounceBackFullWay) {
-                switch (bc.face) {
-                    case Face::South: wall_face_bits |= 0x1u; break;
-                    case Face::North: wall_face_bits |= 0x2u; break;
-                    case Face::West:  wall_face_bits |= 0x4u; break;
-                    case Face::East:  wall_face_bits |= 0x8u; break;
-                    default: break;
-                }
+            unsigned bit = 0u;
+            switch (bc.face) {
+                case Face::South: bit = 0x1u; break;
+                case Face::North: bit = 0x2u; break;
+                case Face::West:  bit = 0x4u; break;
+                case Face::East:  bit = 0x8u; break;
+                default: break;
             }
+            all_face_bits |= bit;
+            if (bc.type == BCType::BounceBack || bc.type == BCType::BounceBackFullWay)
+                wall_face_bits |= bit;
         }
-        apply_corner_bounce_back(grid, wall_face_bits);
+        apply_corner_bounce_back(grid, wall_face_bits, all_face_bits, pb);
     }
 }
 

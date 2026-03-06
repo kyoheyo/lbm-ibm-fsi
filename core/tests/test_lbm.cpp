@@ -772,7 +772,11 @@ static int test_corner_bounce_back_skip_nonwall()
     }
 
     // 4. 直接调用 apply_boundary_conditions（不经过碰撞/流式迁移）
-    lbm::apply_boundary_conditions(g, bcs);
+    // 非 MPI 模式：物理边界就是整个网格，PhysicalBounds 使用默认（全格覆盖）
+    lbm::PhysicalBounds pb;
+    pb.j_s = 0; pb.j_n = g.ny - 1;
+    pb.i_w = 0; pb.i_e = g.nx - 1;
+    lbm::apply_boundary_conditions(g, bcs, pb);
 
     const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
     bool ok = true;

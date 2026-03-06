@@ -56,9 +56,31 @@ struct BoundaryCondition {
 };
 
 // ---------------------------------------------------------------------------
+// 物理边界范围描述符（MPI 模式下本地网格含幽灵层，须显式指定物理行/列范围）
+//
+// 非 MPI 模式（默认）：j_s=0, j_n=ny-1, i_w=0, i_e=nx-1（整个网格均为物理域）
+// 1D Y-切片 MPI 模式 ：j_s=1, j_n=local_ny, i_w=0, i_e=nx-1
+// 2D XY 块分解 MPI  ：j_s=phys_y0, j_n=phys_y0+local_ny-1,
+//                     i_w=phys_x0, i_e=phys_x0+local_nx-1
+//
+// apply_boundary_conditions() 使用此结构确保 BC 只施加到物理边界节点，
+// 防止在幽灵行/列上错误地覆盖 MPI 幽灵层交换数据。
+// ---------------------------------------------------------------------------
+struct PhysicalBounds {
+    int j_s = 0;   ///< 物理南边界行索引（含，本地坐标）
+    int j_n = 0;   ///< 物理北边界行索引（含，本地坐标）
+    int i_w = 0;   ///< 物理西边界列索引（含，本地坐标）
+    int i_e = 0;   ///< 物理东边界列索引（含，本地坐标）
+};
+
+// ---------------------------------------------------------------------------
 // 将所有已注册的边界条件应用到网格
+//
+// pb  — 物理边界范围。非 MPI 模式可忽略（使用默认值），MPI 模式下须由
+//       Solver::step() 根据当前分解信息计算后传入，以跳过幽灵行/列。
 // ---------------------------------------------------------------------------
 void apply_boundary_conditions(LatticeGrid& grid,
-                                const std::vector<BoundaryCondition>& bcs);
+                                const std::vector<BoundaryCondition>& bcs,
+                                PhysicalBounds pb);
 
 } // namespace lbm

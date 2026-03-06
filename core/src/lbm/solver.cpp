@@ -63,7 +63,27 @@ void Solver::step()
     stream();
     // 施加通过 add_boundary_condition() 注册的边界条件
     if (!bcs_.empty()) {
-        apply_boundary_conditions(grid_, bcs_);
+        // 计算物理边界在本地网格中的行/列范围。
+        // MPI 模式下本地网格含幽灵层，须跳过幽灵行/列，否则 BC 会错误覆盖幽灵数据。
+        PhysicalBounds pb;
+        pb.j_s = 0;
+        pb.j_n = grid_.ny - 1;
+        pb.i_w = 0;
+        pb.i_e = grid_.nx - 1;
+#ifdef LBM_ENABLE_MPI
+        if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+            // 1D Y-切片：幽灵在 j=0（南）和 j=local_ny+1（北）
+            pb.j_s = 1;
+            pb.j_n = grid_.ny - 2;   // = local_ny（幽灵层已各占一行）
+        }
+        if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+            pb.j_s = mpi_decomp2d_->phys_y0();
+            pb.j_n = mpi_decomp2d_->phys_y0() + mpi_decomp2d_->local_ny - 1;
+            pb.i_w = mpi_decomp2d_->phys_x0();
+            pb.i_e = mpi_decomp2d_->phys_x0() + mpi_decomp2d_->local_nx - 1;
+        }
+#endif
+        apply_boundary_conditions(grid_, bcs_, pb);
         // BC 修正了边界节点的 f 值，需重新计算宏观量以供下次碰撞使用
         grid_.compute_macroscopic();
     }
