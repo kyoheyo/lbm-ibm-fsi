@@ -762,6 +762,19 @@ static void apply_corner_bounce_back(LatticeGrid& g,
 // ---------------------------------------------------------------------------
 // 应用所有已注册的边界条件
 // ---------------------------------------------------------------------------
+
+// 辅助：检查本进程是否实际拥有指定面的物理壁（MPI 模式下仅壁面所在进程为 true）
+static inline bool is_face_owned(Face f, const PhysicalBounds& pb)
+{
+    switch (f) {
+        case Face::South: return pb.has_south_wall;
+        case Face::North: return pb.has_north_wall;
+        case Face::West:  return pb.has_west_wall;
+        case Face::East:  return pb.has_east_wall;
+        default:          return true;  // Bottom/Top：三维暂未并行化，始终拥有
+    }
+}
+
 void apply_boundary_conditions(LatticeGrid& grid,
                                 const std::vector<BoundaryCondition>& bcs,
                                 PhysicalBounds pb)
@@ -769,12 +782,16 @@ void apply_boundary_conditions(LatticeGrid& grid,
     // ---- 第一轮：FullyDeveloped / FreeOutlet ----
     for (const auto& bc : bcs) {
         if (bc.type == BCType::FullyDeveloped || bc.type == BCType::FreeOutlet) {
+            // MPI 内部进程不拥有该面物理壁时跳过，防止误覆盖内部物理行
+            if (!is_face_owned(bc.face, pb)) continue;
             apply_fully_developed(grid, bc.face, pb);
         }
     }
 
     // ---- 第二轮：BounceBack / BounceBackFullWay ----
     for (const auto& bc : bcs) {
+        // MPI 内部进程不拥有该面物理壁时跳过
+        if (!is_face_owned(bc.face, pb)) continue;
         switch (bc.type) {
             case BCType::BounceBack:
                 apply_bounce_back(grid, bc.face, pb);
@@ -789,6 +806,8 @@ void apply_boundary_conditions(LatticeGrid& grid,
 
     // ---- 第三轮：ZouHe / Guo（最强约束，最后施加） ----
     for (const auto& bc : bcs) {
+        // MPI 内部进程不拥有该面物理壁时跳过
+        if (!is_face_owned(bc.face, pb)) continue;
         switch (bc.type) {
             case BCType::ZouHe_Velocity:
                 apply_zou_he_velocity(grid, bc, pb);
@@ -808,12 +827,14 @@ void apply_boundary_conditions(LatticeGrid& grid,
     }
 
     // 所有面 BC 完成后，对物理角点施加半步长反弹修正。
-    // MPI 兼容：使用 pb 中的物理坐标，仅在两相邻面均已注册 BC 且至少
-    // 一面为固壁时才修正，防止在 MPI 分区边界（无物理壁）处错误施加。
+    // MPI 兼容：使用 pb 中的 has_*_wall 标志，仅在本进程实际拥有该面物理壁时
+    // 才计入 owned 掩码，防止在 MPI 内部分区边界（无物理壁）处错误施加。
     if (!bcs.empty()) {
         unsigned wall_face_bits = 0u;
         unsigned all_face_bits  = 0u;
         for (const auto& bc : bcs) {
+            // 只统计本进程实际拥有物理壁的面
+            if (!is_face_owned(bc.face, pb)) continue;
             unsigned bit = 0u;
             switch (bc.face) {
                 case Face::South: bit = 0x1u; break;

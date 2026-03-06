@@ -65,12 +65,27 @@ struct BoundaryCondition {
 //
 // apply_boundary_conditions() 使用此结构确保 BC 只施加到物理边界节点，
 // 防止在幽灵行/列上错误地覆盖 MPI 幽灵层交换数据。
+//
+// has_*_wall 标志（默认 true）：
+//   MPI 模式下内部分区（非全局壁面所在分区）必须将对应标志设为 false，
+//   防止 BC 错误施加到非壁面的内部物理行/列上，导致分块边界处速度出现阶跃。
+//   例：4 进程 1D Y 分解时，只有 rank 0 的 has_south_wall=true，
+//       rank 1/2/3 必须设 has_south_wall=false。
 // ---------------------------------------------------------------------------
 struct PhysicalBounds {
     int j_s = 0;   ///< 物理南边界行索引（含，本地坐标）
     int j_n = 0;   ///< 物理北边界行索引（含，本地坐标）
     int i_w = 0;   ///< 物理西边界列索引（含，本地坐标）
     int i_e = 0;   ///< 物理东边界列索引（含，本地坐标）
+
+    /// 本进程是否实际拥有全局南物理壁（仅 has_south_wall=true 时才施加 South 面 BC）
+    bool has_south_wall = true;
+    /// 本进程是否实际拥有全局北物理壁
+    bool has_north_wall = true;
+    /// 本进程是否实际拥有全局西物理壁
+    bool has_west_wall  = true;
+    /// 本进程是否实际拥有全局东物理壁
+    bool has_east_wall  = true;
 };
 
 // ---------------------------------------------------------------------------

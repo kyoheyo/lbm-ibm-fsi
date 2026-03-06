@@ -75,12 +75,24 @@ void Solver::step()
             // 1D Y-切片：幽灵在 j=0（南）和 j=local_ny+1（北）
             pb.j_s = 1;
             pb.j_n = grid_.ny - 2;   // = local_ny（幽灵层已各占一行）
+            // 只有持有全局南/北壁的进程才应施加 South/North 面 BC；
+            // 内部进程 pb.j_s=1 是内部物理行，不是壁面——必须设为 false
+            // 以防 BounceBack/ZouHe 等 BC 错误施加并造成分块边界处速度阶跃。
+            pb.has_south_wall = mpi_decomp_->has_south_wall();
+            pb.has_north_wall = mpi_decomp_->has_north_wall();
+            // 1D Y 切片：所有进程均拥有完整 X 范围（西/东壁不受 Y 分解影响）
+            pb.has_west_wall  = true;
+            pb.has_east_wall  = true;
         }
         if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
             pb.j_s = mpi_decomp2d_->phys_y0();
             pb.j_n = mpi_decomp2d_->phys_y0() + mpi_decomp2d_->local_ny - 1;
             pb.i_w = mpi_decomp2d_->phys_x0();
             pb.i_e = mpi_decomp2d_->phys_x0() + mpi_decomp2d_->local_nx - 1;
+            pb.has_south_wall = mpi_decomp2d_->has_south_wall();
+            pb.has_north_wall = mpi_decomp2d_->has_north_wall();
+            pb.has_west_wall  = mpi_decomp2d_->has_west_wall();
+            pb.has_east_wall  = mpi_decomp2d_->has_east_wall();
         }
 #endif
         apply_boundary_conditions(grid_, bcs_, pb);

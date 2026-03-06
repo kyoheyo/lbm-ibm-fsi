@@ -1679,6 +1679,129 @@ static int test_mg_refinement_indicator()
     return ok ? 0 : 1;
 }
 
+// ===========================================================================
+// MPI BC 壁面所有权过滤测试（修复分块边界速度阶跃）
+// ===========================================================================
+
+// 测试：PhysicalBounds::has_south_wall/has_north_wall=false 时
+//       South/North BC 应完全跳过（不修改内部物理行），防止 MPI 分块边界速度阶跃。
+//
+// 复现场景：4 进程 1D Y 分解中，rank 1（内部进程）的 has_south_wall=false，
+//           因此 South BounceBack 不应改变 j=1 行的 f 值。
+//           若改变，则在分块边界处产生速度 kink（即问题所描述的物理失真）。
+static int test_bc_wall_ownership_filter()
+{
+    // 模拟内部进程（non-wall rank）：local_ny=15, grid_ny=17（含南北幽灵）
+    const int nx = 16, local_ny = 15, grid_ny = local_ny + 2;
+    lbm::LatticeGrid g(nx, grid_ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 将所有物理行 f 设为已知值，以便检测是否被意外修改
+    for (int j = 1; j <= local_ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int n = g.idx(i, j);
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                g.f    [n * lbm::d2q9::Q + a] = 1.0 + 0.01 * a + 0.001 * j;
+                g.f_tmp[n * lbm::d2q9::Q + a] = g.f[n * lbm::d2q9::Q + a];
+            }
+        }
+    }
+
+    // 内部进程的 PhysicalBounds：不拥有南/北物理壁
+    lbm::PhysicalBounds pb;
+    pb.j_s = 1;        pb.j_n = local_ny;
+    pb.i_w = 0;        pb.i_e = nx - 1;
+    pb.has_south_wall = false;   // ← 关键：内部进程不持有南壁
+    pb.has_north_wall = false;   // ← 内部进程不持有北壁
+    pb.has_west_wall  = true;
+    pb.has_east_wall  = true;
+
+    // 注册 South + North BounceBack（与实际通道流配置相同）
+    std::vector<lbm::BoundaryCondition> bcs;
+    lbm::BoundaryCondition bc_s, bc_n;
+    bc_s.type = lbm::BCType::BounceBack; bc_s.face = lbm::Face::South;
+    bc_n.type = lbm::BCType::BounceBack; bc_n.face = lbm::Face::North;
+    bcs.push_back(bc_s);
+    bcs.push_back(bc_n);
+
+    // 记录 BC 施加前 j=1（紧邻南幽灵）和 j=local_ny（紧邻北幽灵）的 f 值
+    std::vector<double> f_row1_before(nx * lbm::d2q9::Q);
+    std::vector<double> f_rowN_before(nx * lbm::d2q9::Q);
+    for (int i = 0; i < nx; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            f_row1_before[i * lbm::d2q9::Q + a] =
+                g.f[g.idx(i, 1)        * lbm::d2q9::Q + a];
+            f_rowN_before[i * lbm::d2q9::Q + a] =
+                g.f[g.idx(i, local_ny) * lbm::d2q9::Q + a];
+        }
+    }
+
+    // 施加 BC（has_*_wall=false 的面应被完全跳过）
+    lbm::apply_boundary_conditions(g, bcs, pb);
+
+    bool ok = true;
+    // j=1 的 f 值应完全不变（South BounceBack 已跳过）
+    for (int i = 0; i < nx && ok; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q && ok; ++a) {
+            if (g.f[g.idx(i, 1) * lbm::d2q9::Q + a] !=
+                f_row1_before[i * lbm::d2q9::Q + a])
+                ok = false;
+        }
+    }
+    // j=local_ny 的 f 值应完全不变（North BounceBack 已跳过）
+    for (int i = 0; i < nx && ok; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q && ok; ++a) {
+            if (g.f[g.idx(i, local_ny) * lbm::d2q9::Q + a] !=
+                f_rowN_before[i * lbm::d2q9::Q + a])
+                ok = false;
+        }
+    }
+
+    std::printf("[MPI] BC wall-ownership filter (interior rank skips S/N BC): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 互补测试：has_south_wall=true 时 South BounceBack 应实际修改 j=pb.j_s 的 f 值
+static int test_bc_wall_ownership_south_applied()
+{
+    const int nx = 8, ny = 8;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    // f 和 f_tmp 设为不同的已知值，以便通过读取 f_tmp[opp] 来检测反弹是否执行
+    for (auto& v : g.f)     v = 2.0;
+    for (auto& v : g.f_tmp) v = 3.0;  // BounceBack 从 f_tmp 读取
+
+    lbm::PhysicalBounds pb;
+    pb.j_s = 0;        pb.j_n = ny - 1;
+    pb.i_w = 0;        pb.i_e = nx - 1;
+    pb.has_south_wall = true;  // 持有南壁 → BC 应被施加
+    pb.has_north_wall = true;
+    pb.has_west_wall  = true;
+    pb.has_east_wall  = true;
+
+    std::vector<lbm::BoundaryCondition> bcs;
+    lbm::BoundaryCondition bc;
+    bc.type = lbm::BCType::BounceBack; bc.face = lbm::Face::South;
+    bcs.push_back(bc);
+
+    lbm::apply_boundary_conditions(g, bcs, pb);
+
+    // 半步反弹（South 面）：南壁节点的"朝北"幽灵方向 ← f_tmp 中对应的"朝南"方向
+    // D2Q9 方向约定：2=N(0,+1), 5=NE(+1,+1), 6=NW(-1,+1) — 均为南壁的未知（幽灵）方向
+    //                4=S(0,-1), 7=SW(-1,-1), 8=SE(+1,-1) — 对应的已知（反射来源）方向
+    // 反弹：f[2]←f_tmp[4]=3, f[5]←f_tmp[7]=3, f[6]←f_tmp[8]=3（原值均为 2.0）
+    bool ok = true;
+    for (int i = 0; i < nx && ok; ++i) {
+        const double* f = &g.f[g.idx(i, 0) * lbm::d2q9::Q];
+        if (std::abs(f[2] - 3.0) > 1e-14) ok = false;   // N  ← f_tmp[S=4]  = 3.0
+        if (std::abs(f[5] - 3.0) > 1e-14) ok = false;   // NE ← f_tmp[SW=7] = 3.0
+        if (std::abs(f[6] - 3.0) > 1e-14) ok = false;   // NW ← f_tmp[SE=8] = 3.0
+    }
+
+    std::printf("[MPI] BC wall-ownership: south wall owner applies BB (f changed): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -1712,6 +1835,8 @@ int test_lbm_main()
     failures += test_mg_prolong_f();
     failures += test_mg_apply_fringe_bc();
     failures += test_mg_refinement_indicator();
+    failures += test_bc_wall_ownership_filter();
+    failures += test_bc_wall_ownership_south_applied();
     if (failures == 0)
         std::printf("1: All tests PASSED\n");
     return failures;
