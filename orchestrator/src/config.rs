@@ -158,6 +158,17 @@ pub struct OutputConfig {
     /// 提供**逐步轻量级**时间序列输出。
     #[serde(default)]
     pub enable_csv_monitor: bool,
+    /// MPI 块分解时是否将各进程分区合并为全局场，由 rank-0 写出完整快照文件。
+    ///
+    /// 启用此选项后，在每次写出快照时，rank-0 通过 MPI_Gatherv 收集各进程的
+    /// 物理区域数据，拼合为全局场后写出到 `<directory>/fluid_<NNNNNN>.<ext>`。
+    /// 分块快照仍写出到各 `<directory>/rank_<N>/fluid_<NNNNNN>.<ext>`。
+    ///
+    /// `false`（默认）时不进行全局拼合，每进程只写出自己的分区快照。
+    ///
+    /// 在非 MPI 模式（nprocs=1）或 `mode="independent"` 时此选项被忽略。
+    #[serde(default)]
+    pub combine_blocks: bool,
 }
 
 /// Python 集成配置。

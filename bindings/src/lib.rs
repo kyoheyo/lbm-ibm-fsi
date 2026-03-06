@@ -104,6 +104,18 @@ mod ffi {
                                  out_local_ny: *mut c_int) -> c_int;
         pub fn lbm_mpi_decomp_new(global_nx: c_int, global_ny: c_int) -> *mut MpiDecompHandle;
         pub fn lbm_mpi_decomp_free(h: *mut MpiDecompHandle);
+        /// 将每个进程的一个 int 值 gather 到 root 进程的 recv_buf。
+        /// 非 root 进程的 recv_buf 传 null；未启用 MPI 时直接复制。
+        pub fn lbm_mpi_gather_int(send_val: c_int, recv_buf: *mut c_int, root: c_int);
+        /// MPI_Gatherv：将各进程变长 double 数组 gather 到 root 进程。
+        /// 非 root 进程的 recv_buf/recv_counts/displs 传 null；未启用 MPI 时直接复制。
+        pub fn lbm_mpi_gatherv_f64(send_buf: *const f64, send_count: c_int,
+                                    recv_buf: *mut f64,
+                                    recv_counts: *const c_int,
+                                    displs: *const c_int,
+                                    root: c_int);
+        /// MPI 屏障同步；未启用 MPI 时为空操作。
+        pub fn lbm_mpi_barrier();
 
         // --- MPI 二维块分解接口 — 实现于 core/src/capi/lbm_capi.cpp ---
         /// 创建 2D 块分解（px×py）；px*py 必须等于 MPI 进程数，否则返回 null。
@@ -470,6 +482,62 @@ pub fn mpi_local_ny(global_ny: i32) -> (i32, i32, i32) {
         ffi::lbm_mpi_local_ny(global_ny, &mut y_start, &mut local_ny)
     };
     (grid_ny, y_start, local_ny)
+}
+
+/// 将每个进程的单个 `i32` 值 gather 到 root 进程，返回长度为 `nprocs` 的 Vec。
+///
+/// 非 root 进程返回空 Vec；未启用 MPI 时（nprocs=1）返回 `vec![send_val]`。
+pub fn mpi_gather_int(send_val: i32, root: i32) -> Vec<i32> {
+    let nprocs = mpi_size() as usize;
+    let rank   = mpi_rank();
+    if rank == root {
+        let mut buf = vec![0i32; nprocs];
+        unsafe { ffi::lbm_mpi_gather_int(send_val, buf.as_mut_ptr(), root) };
+        buf
+    } else {
+        unsafe { ffi::lbm_mpi_gather_int(send_val, std::ptr::null_mut(), root) };
+        Vec::new()
+    }
+}
+
+/// MPI_Gatherv：将各进程的变长 `f64` 数组 gather 到 root 进程。
+///
+/// - `data`   — 本进程要发送的数据切片
+/// - `root`   — 根进程编号
+///
+/// root 进程返回拼合后的全局 Vec（行主序）；非 root 进程返回空 Vec。
+/// 未启用 MPI 时（nprocs=1）直接返回 `data` 的克隆。
+///
+/// 调用方需先通过 [`mpi_gather_int`] 收集各进程的 `send_count`，
+/// 再调用本函数。
+pub fn mpi_gatherv_f64(data: &[f64], recv_counts: &[i32], displs: &[i32], root: i32) -> Vec<f64> {
+    let rank = mpi_rank();
+    let total: i32 = recv_counts.iter().sum();
+    if rank == root {
+        let mut buf = vec![0.0f64; total as usize];
+        unsafe {
+            ffi::lbm_mpi_gatherv_f64(
+                data.as_ptr(),       data.len() as i32,
+                buf.as_mut_ptr(),    recv_counts.as_ptr(),
+                displs.as_ptr(),     root,
+            );
+        }
+        buf
+    } else {
+        unsafe {
+            ffi::lbm_mpi_gatherv_f64(
+                data.as_ptr(),        data.len() as i32,
+                std::ptr::null_mut(), std::ptr::null(),
+                std::ptr::null(),     root,
+            );
+        }
+        Vec::new()
+    }
+}
+
+/// MPI 屏障同步；未启用 MPI 时为空操作。
+pub fn mpi_barrier() {
+    unsafe { ffi::lbm_mpi_barrier() };
 }
 
 // ---------------------------------------------------------------------------

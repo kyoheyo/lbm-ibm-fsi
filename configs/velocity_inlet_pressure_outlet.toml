@@ -66,6 +66,9 @@ plot_interval  = 5000   # 每 5000 步（5 次 .dat 快照之后）绘制一次�
 # 每步向 CSV 文件追加监控量（step, time, ke），便于观测入口动能演化。
 # enable_csv_monitor = true
 
+# MPI 块分解时合并各分区为全局场（rank-0 写出），单进程模式下无效。
+# combine_blocks = true
+
 [python]
 # Python 解释器（Windows 通常为 "python"，Linux/macOS 通常为 "python3"）。
 interpreter = "python"

@@ -477,8 +477,242 @@ pub fn append_monitor_csv(
 }
 
 // ---------------------------------------------------------------------------
-// NumPy .npy 编码辅助函数
+// MPI 块合并 → 全局场 gather 工具
 // ---------------------------------------------------------------------------
+
+/// 将 MPI 各进程的物理分区数据 gather 到 rank-0，返回全局场数组（行主序）。
+///
+/// 若 `nprocs == 1`（无 MPI）则直接克隆本进程数据并返回。
+///
+/// # 参数
+///
+/// * `local_data`   — 本进程的物理场数组（行主序，长度 = `local_nx * local_ny`）
+/// * `part`         — 本进程的分区信息（含 global_nx/ny 及 x_start/y_start）
+/// * `root`         — gather 目标进程编号（通常为 0）
+///
+/// # 返回
+///
+/// * `Some((rho, global_nx, global_ny))` — root 进程返回全局拼合数组及尺寸
+/// * `None`                              — 非 root 进程返回 None
+pub fn gather_field_to_root(
+    local_data: &[f64],
+    part: &PartitionInfo,
+    root: i32,
+) -> Option<(Vec<f64>, usize, usize)> {
+    let rank   = lbm_bindings::mpi_rank();
+    let nprocs = lbm_bindings::mpi_size();
+
+    let gnx    = part.global_nx;
+    let gny    = part.global_ny;
+    let local_count = local_data.len() as i32;
+
+    if nprocs == 1 {
+        // 单进程：直接构造全局数组（x_start/y_start 可能非零，但单进程时应为 0）
+        return Some((local_data.to_vec(), gnx, gny));
+    }
+
+    // Step 1：每进程将本地 count 和 x_start/y_start/local_nx/local_ny gather 到 root
+    let counts = lbm_bindings::mpi_gather_int(local_count, root);
+    let x_starts  = lbm_bindings::mpi_gather_int(part.x_start  as i32, root);
+    let y_starts  = lbm_bindings::mpi_gather_int(part.y_start  as i32, root);
+    let local_nxs = lbm_bindings::mpi_gather_int(part.local_nx as i32, root);
+    let local_nys = lbm_bindings::mpi_gather_int(part.local_ny as i32, root);
+
+    if rank == root {
+        let nprocs_u = nprocs as usize;
+        let displs: Vec<i32> = counts.iter()
+            .scan(0i32, |acc, &c| { let d = *acc; *acc += c; Some(d) })
+            .collect();
+
+        // Step 2：MPI_Gatherv 收集所有分区数据
+        let flat = lbm_bindings::mpi_gatherv_f64(local_data, &counts, &displs, root);
+
+        // Step 3：将各分区数据按 (x_start, y_start) 放置到全局数组中
+        // 全局数组布局：行主序，索引 = j * gnx + i
+        let mut global = vec![0.0f64; gnx * gny];
+        let mut offset = 0usize;
+        for r in 0..nprocs_u {
+            let nx_r = local_nxs[r] as usize;
+            let ny_r = local_nys[r] as usize;
+            let xs   = x_starts[r] as usize;
+            let ys   = y_starts[r] as usize;
+            let cnt  = (counts[r] as usize).min(nx_r * ny_r);
+            for row in 0..ny_r {
+                for col in 0..nx_r {
+                    let local_idx  = row * nx_r + col;
+                    let global_idx = (ys + row) * gnx + (xs + col);
+                    if local_idx + offset < flat.len() && global_idx < global.len() {
+                        global[global_idx] = flat[offset + local_idx];
+                    }
+                }
+            }
+            offset += cnt;
+        }
+
+        Some((global, gnx, gny))
+    } else {
+        // 非 root 进程：仍需调用 gatherv（参与通信），但不返回数据
+        lbm_bindings::mpi_gatherv_f64(local_data, &[], &[], root);
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 全局合并快照写出器（供 combine_blocks=true 时由 rank-0 调用）
+// ---------------------------------------------------------------------------
+
+/// 将预先 gather 好的全局场写出为 NPZ 格式。
+///
+/// 与 [`write_snapshot_npz`] 不同，此函数直接接受全局场数组，不再从 LbmGrid 读取。
+/// 文件写到 `<directory>/fluid_<NNNNNN>.npz`（不含 rank 子目录）。
+pub fn write_global_snapshot_npz(
+    global_rho: &[f64],
+    global_ux:  &[f64],
+    global_uy:  &[f64],
+    global_nx:  usize,
+    global_ny:  usize,
+    step: u64,
+    time: f64,
+    directory: &str,
+) -> Result<()> {
+    let path = format!("{}/fluid_{:06}.npz", directory, step);
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("Cannot create combined snapshot file: {path}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("rho.npy", options)?;
+    zip.write_all(&npy_f64(global_rho, &[global_ny, global_nx]))?;
+
+    zip.start_file("ux.npy", options)?;
+    zip.write_all(&npy_f64(global_ux, &[global_ny, global_nx]))?;
+
+    zip.start_file("uy.npy", options)?;
+    zip.write_all(&npy_f64(global_uy, &[global_ny, global_nx]))?;
+
+    zip.start_file("step.npy", options)?;
+    zip.write_all(&npy_i64(&[step as i64], &[]))?;
+
+    zip.start_file("time.npy", options)?;
+    zip.write_all(&npy_f64(&[time], &[]))?;
+
+    zip.finish()?;
+    Ok(())
+}
+
+/// 将预先 gather 好的全局场写出为 ASCII Tecplot (.dat) 格式。
+pub fn write_global_snapshot_tecplot_asc(
+    global_rho: &[f64],
+    global_ux:  &[f64],
+    global_uy:  &[f64],
+    global_nx:  usize,
+    global_ny:  usize,
+    step: u64,
+    time: f64,
+    directory: &str,
+) -> Result<()> {
+    let path = format!("{}/fluid_{:06}.dat", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("无法创建合并 Tecplot ASCII 文件：{path}"))?;
+
+    writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
+    writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
+    writeln!(
+        file,
+        "ZONE T=\"fluid\", I={global_nx}, J={global_ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}"
+    )?;
+
+    for j in 0..global_ny {
+        for i in 0..global_nx {
+            let idx = j * global_nx + i;
+            let x   = i as f64 + 0.5;
+            let y   = j as f64 + 0.5;
+            writeln!(
+                file,
+                "{x:.4} {y:.4} {rho:.8e} {ux:.8e} {uy:.8e}",
+                rho = global_rho[idx],
+                ux  = global_ux[idx],
+                uy  = global_uy[idx],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 将预先 gather 好的全局场写出为二进制 Tecplot PLT（TDV112）格式。
+pub fn write_global_snapshot_tecplot_bin(
+    global_rho: &[f64],
+    global_ux:  &[f64],
+    global_uy:  &[f64],
+    global_nx:  usize,
+    global_ny:  usize,
+    step: u64,
+    time: f64,
+    directory: &str,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let path = format!("{}/fluid_{:06}.plt", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("无法创建合并 Tecplot 二进制文件：{path}"))?;
+
+    // 魔数 + 字节序标志
+    file.write_all(b"#!TDV112")?;
+    file.write_all(&1_i32.to_le_bytes())?;
+    // 文件类型
+    file.write_all(&0_i32.to_le_bytes())?;
+    // 数据集标题
+    let title = format!("LBM Flow Field step={step:06} time={time:.3}");
+    write_tec_string(&mut file, &title)?;
+    // 变量数量（5：X Y RHO UX UY）
+    file.write_all(&5_i32.to_le_bytes())?;
+    for name in &["X", "Y", "RHO", "UX", "UY"] {
+        write_tec_string(&mut file, name)?;
+    }
+    // Zone 头
+    file.write_all(&299.0_f32.to_le_bytes())?;
+    write_tec_string(&mut file, "fluid")?;
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    file.write_all(&time.to_le_bytes())?;
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&(global_nx as i32).to_le_bytes())?;
+    file.write_all(&(global_ny as i32).to_le_bytes())?;
+    file.write_all(&1_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    // EOH
+    file.write_all(&357.0_f32.to_le_bytes())?;
+    // 数据区域
+    file.write_all(&299.0_f32.to_le_bytes())?;
+    for _ in 0..5 { file.write_all(&2_i32.to_le_bytes())?; }
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    // X 坐标
+    for _j in 0..global_ny {
+        for i in 0..global_nx {
+            file.write_all(&(i as f64 + 0.5).to_le_bytes())?;
+        }
+    }
+    // Y 坐标
+    for j in 0..global_ny {
+        let y = j as f64 + 0.5;
+        for _ in 0..global_nx { file.write_all(&y.to_le_bytes())?; }
+    }
+    // RHO
+    for v in global_rho { file.write_all(&v.to_le_bytes())?; }
+    // UX
+    for v in global_ux  { file.write_all(&v.to_le_bytes())?; }
+    // UY
+    for v in global_uy  { file.write_all(&v.to_le_bytes())?; }
+
+    Ok(())
+}
 // .npy 格式（v1.0）：
 //   魔数（6 字节）+ 版本号（2 字节）+ HEADER_LEN（u16 小端）+ 头部 + 数据
 // 前导部分共 10 字节；前导 + 头部总长度必须是 64 字节的倍数。

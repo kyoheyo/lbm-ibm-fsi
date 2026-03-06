@@ -87,6 +87,13 @@ plot_interval  = 2000   # 每 2000 步（4 次 .dat 快照之后）绘制一次�
 # 开启后在 directory/monitor.csv 中记录动能演化历史，可用于收敛判断。
 # enable_csv_monitor = true
 
+# MPI 块分解时是否将各进程分区合并为全局场（由 rank-0 写出）。
+# 开启后，每次写出快照时 rank-0 通过 MPI_Gatherv 收集各进程物理区域数据，
+# 拼合为全局流场后写出到 <directory>/fluid_NNNNNN.<ext>。
+# 各进程的分区快照仍写出到 <directory>/rank_N/fluid_NNNNNN.<ext>。
+# 单进程（nprocs=1）模式下此选项无效。
+# combine_blocks = true
+
 [python]
 # ─── Python 集成说明 ──────────────────────────────────────────────────────────
 # 支持两种互补模式，可同时开启：

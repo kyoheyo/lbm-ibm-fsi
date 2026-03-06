@@ -337,3 +337,149 @@ class TestTecplotBinReader:
         p.write_bytes(b"NOTMAGIC" + b"\x00" * 64)
         with pytest.raises(ValueError, match="TDV112"):
             TecplotBinReader(tmp_path).read(p)
+
+
+# ---------------------------------------------------------------------------
+# combine_block_snapshots — MPI 分块结果拼合
+# ---------------------------------------------------------------------------
+
+from lbm_post.vtk_reader import combine_block_snapshots
+
+
+def _make_partition_npz(path, rho, ux, uy, step, time,
+                         x_start, y_start, global_nx, global_ny):
+    """写出含分区元数据的 NPZ 文件（模拟 Rust 求解器输出）。"""
+    import numpy as np
+    np.savez_compressed(
+        path,
+        rho=rho, ux=ux, uy=uy,
+        step=np.array(step),
+        time=np.array(time),
+        x_start=np.array(x_start),
+        y_start=np.array(y_start),
+        global_nx=np.array(global_nx),
+        global_ny=np.array(global_ny),
+    )
+
+
+class TestCombineBlockSnapshots:
+    """测试 combine_block_snapshots：从 rank_* 子目录拼合全局场。"""
+
+    def _make_2rank_output(self, tmp_path, nx=8, ny=6, step=100, time=1.0):
+        """
+        模拟 2 rank 的 1D-Y 切片输出：rank_0 持有 y=[0,ny//2)，rank_1 持有 y=[ny//2,ny)。
+        返回预期的全局 rho 数组。
+        """
+        global_rho = np.random.rand(ny, nx)
+        global_ux  = np.random.rand(ny, nx)
+        global_uy  = np.random.rand(ny, nx)
+
+        half = ny // 2
+
+        # rank_0: y=0..half
+        rank0_dir = tmp_path / "rank_0"
+        rank0_dir.mkdir(exist_ok=True)
+        _make_partition_npz(
+            rank0_dir / f"fluid_{step:06d}.npz",
+            rho=global_rho[:half, :],
+            ux=global_ux[:half, :],
+            uy=global_uy[:half, :],
+            step=step, time=time,
+            x_start=0, y_start=0,
+            global_nx=nx, global_ny=ny,
+        )
+
+        # rank_1: y=half..ny
+        rank1_dir = tmp_path / "rank_1"
+        rank1_dir.mkdir(exist_ok=True)
+        _make_partition_npz(
+            rank1_dir / f"fluid_{step:06d}.npz",
+            rho=global_rho[half:, :],
+            ux=global_ux[half:, :],
+            uy=global_uy[half:, :],
+            step=step, time=time,
+            x_start=0, y_start=half,
+            global_nx=nx, global_ny=ny,
+        )
+
+        return global_rho, global_ux, global_uy
+
+    def test_basic_combine(self, tmp_path):
+        """基本拼合：2 rank × 1 步，全局场应完整还原。"""
+        expected_rho, expected_ux, _ = self._make_2rank_output(tmp_path)
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert len(written) == 1
+
+        result = np.load(written[0])
+        np.testing.assert_allclose(result["rho"], expected_rho, rtol=1e-12)
+        np.testing.assert_allclose(result["ux"],  expected_ux,  rtol=1e-12)
+
+    def test_multiple_steps(self, tmp_path):
+        """多时间步拼合：每步均写出一个合并文件。"""
+        for s in [100, 200, 300]:
+            self._make_2rank_output(tmp_path, step=s, time=float(s))
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert len(written) == 3
+
+    def test_custom_out_dir(self, tmp_path):
+        """指定自定义输出目录。"""
+        self._make_2rank_output(tmp_path, step=50)
+        custom = tmp_path / "my_combined"
+        written = combine_block_snapshots(tmp_path, fmt="npz", out_dir=custom)
+        assert written[0].parent == custom
+
+    def test_default_out_dir_is_combined(self, tmp_path):
+        """默认输出目录为 <output_dir>/combined/。"""
+        self._make_2rank_output(tmp_path, step=1)
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        assert written[0].parent == tmp_path / "combined"
+
+    def test_metadata_preserved(self, tmp_path):
+        """合并文件中 step 和 time 字段应与输入一致。"""
+        self._make_2rank_output(tmp_path, step=999, time=9.99)
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        data = np.load(written[0])
+        assert int(data["step"]) == 999
+        assert abs(float(data["time"]) - 9.99) < 1e-6
+
+    def test_no_rank_dirs_raises(self, tmp_path):
+        """没有 rank_* 子目录时应抛出 FileNotFoundError。"""
+        with pytest.raises(FileNotFoundError):
+            combine_block_snapshots(tmp_path, fmt="npz")
+
+    def test_nonexistent_dir_raises(self):
+        """不存在的目录应抛出 FileNotFoundError。"""
+        with pytest.raises(FileNotFoundError):
+            combine_block_snapshots("/nonexistent/path_xyz", fmt="npz")
+
+    def test_dat_format_raises_informative(self, tmp_path):
+        """dat 格式分区文件无元数据，应抛出明确错误。"""
+        with pytest.raises(ValueError, match="元数据"):
+            combine_block_snapshots(tmp_path, fmt="dat")
+
+    def test_4rank_2d_decomposition(self, tmp_path):
+        """2×2 二维块分解：4 rank 拼合全局场。"""
+        nx, ny = 8, 8
+        hx, hy = nx // 2, ny // 2
+        global_rho = np.arange(nx * ny, dtype=np.float64).reshape(ny, nx)
+
+        for ry in range(2):
+            for rx in range(2):
+                rank = ry * 2 + rx
+                rd = tmp_path / f"rank_{rank}"
+                rd.mkdir()
+                _make_partition_npz(
+                    rd / "fluid_000010.npz",
+                    rho=global_rho[ry*hy:(ry+1)*hy, rx*hx:(rx+1)*hx],
+                    ux=np.zeros((hy, hx)),
+                    uy=np.zeros((hy, hx)),
+                    step=10, time=0.1,
+                    x_start=rx*hx, y_start=ry*hy,
+                    global_nx=nx, global_ny=ny,
+                )
+
+        written = combine_block_snapshots(tmp_path, fmt="npz")
+        result = np.load(written[0])
+        np.testing.assert_allclose(result["rho"], global_rho, rtol=1e-12)

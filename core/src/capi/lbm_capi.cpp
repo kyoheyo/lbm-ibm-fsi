@@ -472,6 +472,56 @@ int lbm_mpi_decomp2d_phys_y0(const MpiDecomp2DHandle* h)
 #endif
 }
 
+/// 将每个进程的一个 int 值 gather 到 root 进程的 recv_buf 数组。
+/// 非 root 进程的 recv_buf 忽略（传 nullptr 即可）。
+/// 未启用 MPI 时：将 send_val 复制到 recv_buf[0]（若 recv_buf 非空）。
+void lbm_mpi_gather_int(int send_val, int* recv_buf, int root)
+{
+#ifdef LBM_ENABLE_MPI
+    MPI_Gather(&send_val, 1, MPI_INT,
+               recv_buf,  1, MPI_INT,
+               root, MPI_COMM_WORLD);
+#else
+    if (recv_buf) recv_buf[0] = send_val;
+    (void)root;
+#endif
+}
+
+/// 将各进程的变长 double 数组 gather 到 root 进程（MPI_Gatherv）。
+///
+/// @param send_buf     本进程发送缓冲区
+/// @param send_count   本进程发送元素个数
+/// @param recv_buf     root 进程接收缓冲区（非 root 传 nullptr）
+/// @param recv_counts  root 进程：各进程元素个数数组（长度 nprocs；非 root 传 nullptr）
+/// @param displs       root 进程：各进程在 recv_buf 中的偏移数组（长度 nprocs；非 root 传 nullptr）
+/// @param root         根进程编号
+/// 未启用 MPI 时：直接把 send_buf 的 send_count 个元素复制到 recv_buf（若非空）。
+void lbm_mpi_gatherv_f64(const double* send_buf, int send_count,
+                          double* recv_buf,
+                          const int* recv_counts,
+                          const int* displs,
+                          int root)
+{
+#ifdef LBM_ENABLE_MPI
+    MPI_Gatherv(send_buf,   send_count,  MPI_DOUBLE,
+                recv_buf,   recv_counts, displs, MPI_DOUBLE,
+                root, MPI_COMM_WORLD);
+#else
+    if (recv_buf && send_buf && send_count > 0) {
+        std::copy(send_buf, send_buf + send_count, recv_buf);
+    }
+    (void)recv_counts; (void)displs; (void)root;
+#endif
+}
+
+/// MPI 全局屏障同步。未启用 MPI 时为空操作。
+void lbm_mpi_barrier()
+{
+#ifdef LBM_ENABLE_MPI
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+}
+
 } // extern "C"
 
 // ===========================================================================

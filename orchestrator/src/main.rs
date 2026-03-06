@@ -428,13 +428,26 @@ fn run() -> Result<()> {
     };
     std::fs::create_dir_all(&output_dir)?;
 
+    // combine_blocks=true 时，rank-0 额外向全局输出目录写出合并快照
+    let combine_blocks = cfg.output.combine_blocks && nprocs > 1 && eff_mode == "block";
+    if combine_blocks && rank == 0 {
+        std::fs::create_dir_all(&cfg.output.directory)?;
+    }
+
     if nprocs > 1 && eff_mode == "block" {
         // 每个进程输出自己的目录信息
-        println!(
-            "输出目录  : rank={} → {}/rank_{}/  \
-             (MPI 块分解，各进程独立写出物理分区数据，后处理可按 x_start/y_start 拼合全局场)",
-            rank, cfg.output.directory, rank
-        );
+        if rank == 0 {
+            let combine_note = if combine_blocks {
+                format!("（+合并全局快照 → {}/fluid_*.{}）",
+                        cfg.output.directory, cfg.output.format.replace("tecplot_", ""))
+            } else {
+                "（后处理可按 x_start/y_start 拼合全局场，或设 combine_blocks=true 自动合并）".to_string()
+            };
+            println!(
+                "输出目录  : rank=0 → {}/rank_0/  (MPI 块分解，各进程独立写出物理分区数据{})",
+                cfg.output.directory, combine_note
+            );
+        }
     }
 
     let csv_path = format!("{}/monitor.csv", output_dir);
@@ -476,6 +489,61 @@ fn run() -> Result<()> {
                         .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
                 }
             }
+
+            // -- combine_blocks：gather 各分区数据，由 rank-0 写出全局合并快照 --
+            if combine_blocks {
+                if let Some(p) = partition {
+                    // 提取本地物理场
+                    let grid_nx  = grid.nx() as usize;
+                    let n_phys   = p.local_nx * p.local_ny;
+                    let mut l_rho = Vec::with_capacity(n_phys);
+                    let mut l_ux  = Vec::with_capacity(n_phys);
+                    let mut l_uy  = Vec::with_capacity(n_phys);
+                    for j in p.phys_y0..(p.phys_y0 + p.local_ny) {
+                        for i in p.phys_x0..(p.phys_x0 + p.local_nx) {
+                            let idx = (j * grid_nx + i) as i32;
+                            l_rho.push(grid.rho(idx));
+                            l_ux .push(grid.ux (idx));
+                            l_uy .push(grid.uy (idx));
+                        }
+                    }
+                    // Gather 三个场到 rank-0
+                    if let (Some((g_rho, gnx, gny)), Some((g_ux, _, _)), Some((g_uy, _, _))) = (
+                        output::gather_field_to_root(&l_rho, &p, 0),
+                        output::gather_field_to_root(&l_ux,  &p, 0),
+                        output::gather_field_to_root(&l_uy,  &p, 0),
+                    ) {
+                        // 只有 rank-0 执行写出（gather_field_to_root 对非 root 进程返回 None）
+                        match cfg.output.format.as_str() {
+                            "tecplot_asc" => {
+                                output::write_global_snapshot_tecplot_asc(
+                                    &g_rho, &g_ux, &g_uy, gnx, gny,
+                                    step + 1, time, &cfg.output.directory,
+                                ).with_context(|| format!(
+                                    "写出合并 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
+                            }
+                            "tecplot_bin" => {
+                                output::write_global_snapshot_tecplot_bin(
+                                    &g_rho, &g_ux, &g_uy, gnx, gny,
+                                    step + 1, time, &cfg.output.directory,
+                                ).with_context(|| format!(
+                                    "写出合并 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
+                            }
+                            _ => {
+                                output::write_global_snapshot_npz(
+                                    &g_rho, &g_ux, &g_uy, gnx, gny,
+                                    step + 1, time, &cfg.output.directory,
+                                ).with_context(|| format!(
+                                    "写出合并 NPZ 快照失败（步数 {}）", step + 1))?;
+                            }
+                        }
+                    } else {
+                        // 非 root 进程：等待 root 进程的 gather 调用（非 root 参与通信）
+                        // 由于 gather_field_to_root 对每个字段都会调用 MPI Gatherv，
+                        // 非 root 进程已在函数内部参与通信，这里不需要额外操作。
+                    }
+                }
+            }
         }
 
         // -- 逐步：轻量级 CSV 监控日志 -----------------------------------------
@@ -505,30 +573,80 @@ fn run() -> Result<()> {
         #[cfg(feature = "python-ffi")]
         if let Some(pi) = cfg.output.plot_interval {
             if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
-                // 仅使用物理节点（排除幽灵行/列）
-                let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
-                    (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
-                } else {
-                    (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
-                };
-                let n_phys = pnx * pny;
-                let mut rho = Vec::with_capacity(n_phys);
-                let mut ux  = Vec::with_capacity(n_phys);
-                let mut uy  = Vec::with_capacity(n_phys);
-                for j in py0..(py0 + pny) {
-                    for i in px0..(px0 + pnx) {
-                        let idx = (j * gnx + i) as i32;
-                        rho.push(grid.rho(idx));
-                        ux .push(grid.ux (idx));
-                        uy .push(grid.uy (idx));
-                    }
-                }
+                // 准备物理节点数据（当 combine_blocks=true 时使用全局场；否则用本地分区场）
+                let (plot_rho, plot_ux, plot_uy, plot_nx, plot_ny, plot_dir) =
+                    if combine_blocks {
+                        // combine_blocks 模式：gather 全局场并只在 rank-0 绘图
+                        if let Some(p) = partition {
+                            let grid_nx  = grid.nx() as usize;
+                            let n_phys   = p.local_nx * p.local_ny;
+                            let mut l_rho = Vec::with_capacity(n_phys);
+                            let mut l_ux  = Vec::with_capacity(n_phys);
+                            let mut l_uy  = Vec::with_capacity(n_phys);
+                            for j in p.phys_y0..(p.phys_y0 + p.local_ny) {
+                                for i in p.phys_x0..(p.phys_x0 + p.local_nx) {
+                                    let idx = (j * grid_nx + i) as i32;
+                                    l_rho.push(grid.rho(idx));
+                                    l_ux .push(grid.ux (idx));
+                                    l_uy .push(grid.uy (idx));
+                                }
+                            }
+                            let grho = output::gather_field_to_root(&l_rho, &p, 0);
+                            let gux  = output::gather_field_to_root(&l_ux,  &p, 0);
+                            let guy  = output::gather_field_to_root(&l_uy,  &p, 0);
+                            if let (Some((gr, gnx, gny)), Some((gu, _, _)), Some((gv, _, _))) =
+                                (grho, gux, guy)
+                            {
+                                (gr, gu, gv, gnx, gny, cfg.output.directory.clone())
+                            } else {
+                                // 非 root 进程：不绘图（continue to next iter）
+                                continue;
+                            }
+                        } else {
+                            // partition 为 None（不应发生）
+                            let (px0, py0, pnx, pny, gnx) =
+                                (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize);
+                            let n_phys = pnx * pny;
+                            let mut rho = Vec::with_capacity(n_phys);
+                            let mut ux  = Vec::with_capacity(n_phys);
+                            let mut uy  = Vec::with_capacity(n_phys);
+                            for j in py0..(py0 + pny) {
+                                for i in px0..(px0 + pnx) {
+                                    let idx = (j * gnx + i) as i32;
+                                    rho.push(grid.rho(idx));
+                                    ux .push(grid.ux (idx));
+                                    uy .push(grid.uy (idx));
+                                }
+                            }
+                            (rho, ux, uy, pnx, pny, output_dir.clone())
+                        }
+                    } else {
+                        // 普通模式：使用本地分区场（原有行为）
+                        let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+                            (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+                        } else {
+                            (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+                        };
+                        let n_phys = pnx * pny;
+                        let mut rho = Vec::with_capacity(n_phys);
+                        let mut ux  = Vec::with_capacity(n_phys);
+                        let mut uy  = Vec::with_capacity(n_phys);
+                        for j in py0..(py0 + pny) {
+                            for i in px0..(px0 + pnx) {
+                                let idx = (j * gnx + i) as i32;
+                                rho.push(grid.rho(idx));
+                                ux .push(grid.ux (idx));
+                                uy .push(grid.uy (idx));
+                            }
+                        }
+                        (rho, ux, uy, pnx, pny, output_dir.clone())
+                    };
 
                 for field_name in &["velocity_magnitude", "vorticity"] {
                     if let Err(e) = python_bridge::plot_field(
-                        &rho, &ux, &uy, pnx, pny,
+                        &plot_rho, &plot_ux, &plot_uy, plot_nx, plot_ny,
                         step + 1, time,
-                        &output_dir,
+                        &plot_dir,
                         field_name,
                     ) {
                         eprintln!("[python-ffi] plot {field_name} failed at step {}: {e}", step + 1);

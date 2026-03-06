@@ -47,6 +47,7 @@ __all__ = [
     "TecplotAscReader",
     "TecplotBinReader",
     "load_snapshot",
+    "combine_block_snapshots",
 ]
 
 
@@ -652,6 +653,151 @@ def load_snapshot(path: str | Path) -> FieldSnapshot:
         return VtkReader.read_vtu(p)
     else:
         raise ValueError(f"不支持的快照格式：{p.suffix}（支持 .npz / .dat / .plt / .vtu）")
+
+
+# ---------------------------------------------------------------------------
+# MPI 块分解结果合并工具（计算后离线拼合）
+# ---------------------------------------------------------------------------
+
+def combine_block_snapshots(
+    output_dir: "str | Path",
+    fmt: str = "npz",
+    out_dir: "str | Path | None" = None,
+) -> "list[Path]":
+    """
+    将 MPI 块分解模式下离散输出的各 rank 分区快照拼合为全局完整流场文件。
+
+    求解器以 ``mpi.mode = "block"`` 运行时，每个 MPI rank 将本地物理分区数据
+    写入 ``<output_dir>/rank_<N>/fluid_<NNNNNN>.<ext>``。本函数扫描所有
+    ``rank_*`` 子目录，按时间步号对齐后，依据每个分区文件中记录的
+    ``x_start / y_start / global_nx / global_ny`` 元数据将各分区拼合到同一
+    全局数组，并将结果写出到 ``<out_dir>/fluid_<NNNNNN>.<ext>``。
+
+    参数
+    ----
+    output_dir : 包含 ``rank_0/``、``rank_1/`` … 子目录的基础输出目录
+    fmt        : 输出格式 — ``"npz"``（默认）、``"dat"``（ASCII Tecplot）、
+                 ``"plt"``（二进制 Tecplot TDV112）
+    out_dir    : 合并文件的写出目录；缺省时写到 ``<output_dir>/combined/``
+
+    返回
+    ----
+    已写出的合并文件路径列表（按时间步升序排列）。
+
+    异常
+    ----
+    FileNotFoundError : ``output_dir`` 不存在或其中没有任何 ``rank_*`` 子目录
+    ValueError        : 分区文件缺少 ``x_start / y_start / global_nx / global_ny``
+                        元数据（须以 NPZ 格式输出；.dat/.plt 分区文件暂不含元数据）
+
+    示例
+    ----
+    >>> from lbm_post.vtk_reader import combine_block_snapshots
+    >>> written = combine_block_snapshots("output/my_run", fmt="npz")
+    >>> print(written[0])
+    output/my_run/combined/fluid_001000.npz
+
+    注意
+    ----
+    当前版本仅支持以 NPZ 格式输出的分区文件（因为 .npz 文件内嵌了分区元数据）。
+    若使用 ``tecplot_asc`` / ``tecplot_bin`` 格式输出，请改用 ``combine_blocks=true``
+    配置项在计算过程中由求解器直接写出全局合并文件。
+    """
+    base = Path(output_dir)
+    if not base.exists():
+        raise FileNotFoundError(f"输出目录不存在：{base}")
+
+    if fmt not in {"npz", "dat", "plt"}:
+        raise ValueError(f"不支持的输出格式 {fmt!r}，可选：'npz'、'dat'、'plt'")
+    if fmt in {"dat", "plt"}:
+        raise ValueError(
+            f"格式 {fmt!r} 的分区文件不包含位置元数据（x_start/y_start），"
+            "无法自动拼合。请在 TOML 中设置 combine_blocks=true 以在计算时"
+            "由求解器直接写出全局合并文件。"
+        )
+
+    # 扫描所有 rank_* 子目录
+    rank_dirs = sorted(
+        [d for d in base.iterdir() if d.is_dir() and d.name.startswith("rank_")],
+        key=lambda d: int(d.name.split("_", 1)[1]),
+    )
+    if not rank_dirs:
+        raise FileNotFoundError(
+            f"目录 {base} 中没有找到任何 rank_* 子目录。"
+            f"请确认求解器使用了 mpi.mode=\"block\" 并成功运行。"
+        )
+
+    dst_dir = Path(out_dir) if out_dir is not None else base / "combined"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # 收集所有 rank 的文件列表，按步号索引
+    from collections import defaultdict
+    step_to_files: "dict[int, list[Path]]" = defaultdict(list)
+    for rd in rank_dirs:
+        for p in sorted(rd.glob(f"fluid_*.{fmt}"),
+                        key=lambda x: int(re.search(r"(\d+)", x.stem).group(1))):
+            step_no = int(re.search(r"(\d+)", p.stem).group(1))
+            step_to_files[step_no].append(p)
+
+    if not step_to_files:
+        raise FileNotFoundError(
+            f"在 {base}/rank_*/ 目录中未找到任何 fluid_*.{fmt} 文件。"
+        )
+
+    written: list[Path] = []
+
+    for step_no in sorted(step_to_files.keys()):
+        files = step_to_files[step_no]
+        if not files:
+            continue
+
+        # 读第一个分区以获取全局尺寸和时间
+        first_data = np.load(files[0])
+        if "global_nx" not in first_data or "global_ny" not in first_data:
+            raise ValueError(
+                f"文件 {files[0]} 中缺少 global_nx/global_ny 元数据。"
+                "请确认求解器以 NPZ 格式输出分区数据，且每个 .npz 文件包含"
+                "x_start / y_start / global_nx / global_ny 字段。"
+            )
+        gnx  = int(first_data["global_nx"])
+        gny  = int(first_data["global_ny"])
+        step_val = int(first_data.get("step", step_no))
+        time_val = float(first_data.get("time", 0.0))
+
+        # 初始化全局数组（覆盖顺序不影响结果，因为各分区不重叠）
+        g_rho = np.zeros((gny, gnx), dtype=np.float64)
+        g_ux  = np.zeros((gny, gnx), dtype=np.float64)
+        g_uy  = np.zeros((gny, gnx), dtype=np.float64)
+
+        for fpath in files:
+            d = np.load(fpath)
+            if "x_start" not in d or "y_start" not in d:
+                raise ValueError(
+                    f"文件 {fpath} 中缺少 x_start/y_start 元数据，"
+                    "无法确定该分区在全局坐标系中的位置。"
+                )
+            xs  = int(d["x_start"])
+            ys  = int(d["y_start"])
+            rho = d["rho"]   # shape (local_ny, local_nx)
+            ux  = d["ux"]
+            uy  = d["uy"]
+            local_ny, local_nx = rho.shape
+            # 将分区放置到全局数组中
+            g_rho[ys:ys + local_ny, xs:xs + local_nx] = rho
+            g_ux [ys:ys + local_ny, xs:xs + local_nx] = ux
+            g_uy [ys:ys + local_ny, xs:xs + local_nx] = uy
+
+        # 写出合并文件
+        out_path = dst_dir / f"fluid_{step_no:06d}.npz"
+        np.savez_compressed(
+            out_path,
+            rho=g_rho, ux=g_ux, uy=g_uy,
+            step=np.array(step_val),
+            time=np.array(time_val),
+        )
+        written.append(out_path)
+
+    return written
 
 
 # ---------------------------------------------------------------------------
