@@ -236,6 +236,119 @@ class SolverConfig:
         return cfg
 
     @classmethod
+    def pressure_driven_channel(cls, nx: int = 200, ny: int = 60,
+                                 nu: float = 0.1,
+                                 rho_in: float = 1.005,
+                                 rho_out: float = 1.0) -> "SolverConfig":
+        """
+        Create a pressure-driven channel (Poiseuille) flow configuration.
+
+        The pressure difference between the west (inlet) and east (outlet) faces
+        drives the flow.  At steady state the velocity profile converges to the
+        parabolic Poiseuille solution  u(y) = ΔP·y·(H−y) / (2ν·ρ).
+
+        Parameters
+        ----------
+        nx, ny   : grid resolution (ny is the channel height H)
+        nu       : kinematic viscosity in lattice units
+        rho_in   : inlet density  (higher pressure side)
+        rho_out  : outlet density (reference pressure side)
+        """
+        cfg = cls(
+            simulation=SimConfig(n_steps=20000, collision_model="MRT"),
+            fluid=FluidConfig(
+                nx=nx, ny=ny, nu=nu, rho0=1.0,
+                boundary_conditions=[
+                    BoundaryConditionConfig("zou_he_pressure", "west",
+                                            rho=rho_in),
+                    BoundaryConditionConfig("zou_he_pressure", "east",
+                                            rho=rho_out),
+                    BoundaryConditionConfig("bounce_back", "south"),
+                    BoundaryConditionConfig("bounce_back", "north"),
+                ],
+            ),
+            output=OutputConfig(write_interval=1000,
+                                directory="output/pressure_channel"),
+        )
+        return cfg
+
+    @classmethod
+    def velocity_inlet_channel(cls, nx: int = 300, ny: int = 60,
+                                Re: float = 30.0,
+                                U_inlet: float = 0.05) -> "SolverConfig":
+        """
+        Create a velocity-inlet channel flow configuration.
+
+        A uniform velocity is prescribed at the west face (inlet), the east
+        face uses a fully-developed (zero-gradient) outflow condition, and the
+        south/north faces are no-slip solid walls.  The flow develops from the
+        uniform inlet profile into the Poiseuille parabolic profile downstream.
+
+        Parameters
+        ----------
+        nx, ny    : grid resolution (ny is the channel height H)
+        Re        : Reynolds number  (Re = U·H / ν)
+        U_inlet   : inlet velocity in lattice units
+        """
+        nu = reynolds_to_nu(Re, U_inlet, float(ny))
+        cfg = cls(
+            simulation=SimConfig(n_steps=30000, collision_model="MRT"),
+            fluid=FluidConfig(
+                nx=nx, ny=ny, nu=nu, rho0=1.0,
+                boundary_conditions=[
+                    BoundaryConditionConfig("zou_he_velocity", "west",
+                                            ux=U_inlet, uy=0.0),
+                    BoundaryConditionConfig("fully_developed", "east"),
+                    BoundaryConditionConfig("bounce_back", "south"),
+                    BoundaryConditionConfig("bounce_back", "north"),
+                ],
+            ),
+            output=OutputConfig(write_interval=1000,
+                                directory=f"output/velocity_inlet_channel_Re{int(Re)}"),
+        )
+        return cfg
+
+    @classmethod
+    def velocity_inlet_free_outlet(cls, nx: int = 200, ny: int = 80,
+                                    Re: float = 80.0,
+                                    U_inlet: float = 0.05) -> "SolverConfig":
+        """
+        Create a velocity-inlet / pressure-outlet configuration with free-outlet
+        walls on the south and north faces.
+
+        Useful for open-domain or jet-like problems where fluid may leave through
+        the top and bottom boundaries.  Because the south and north faces use
+        ``free_outlet`` (a non-solid-wall BC), the corner nodes (SW/SE/NW/NE)
+        whose two adjacent faces are both non-solid-wall BCs will automatically
+        skip the corner bounce-back correction, avoiding an unphysical u = 0
+        constraint at those open corners.
+
+        Parameters
+        ----------
+        nx, ny    : grid resolution
+        Re        : Reynolds number  (Re = U·H / ν, H = ny)
+        U_inlet   : inlet velocity in lattice units
+        """
+        nu = reynolds_to_nu(Re, U_inlet, float(ny))
+        cfg = cls(
+            simulation=SimConfig(n_steps=25000, collision_model="MRT"),
+            fluid=FluidConfig(
+                nx=nx, ny=ny, nu=nu, rho0=1.0,
+                boundary_conditions=[
+                    BoundaryConditionConfig("zou_he_velocity", "west",
+                                            ux=U_inlet, uy=0.0),
+                    BoundaryConditionConfig("zou_he_pressure", "east",
+                                            rho=1.0),
+                    BoundaryConditionConfig("free_outlet", "south"),
+                    BoundaryConditionConfig("free_outlet", "north"),
+                ],
+            ),
+            output=OutputConfig(write_interval=1000,
+                                directory=f"output/velocity_inlet_free_outlet_Re{int(Re)}"),
+        )
+        return cfg
+
+    @classmethod
     def fsi_filament(cls, nx: int = 150, ny: int = 60,
                      Re: float = 200.0,
                      U_inlet: float = 0.05) -> "SolverConfig":

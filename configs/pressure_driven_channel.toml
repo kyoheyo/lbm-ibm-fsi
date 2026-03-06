@@ -1,0 +1,45 @@
+# 压力驱动通道流（Poiseuille 流）基准算例
+# 入口（西壁）施加略高压力，出口（东壁）施加参考压力，上下两壁为无滑移固壁。
+# 稳态时流场收敛至抛物线速度剖面 u(y) = ΔP · y(H − y) / (2νρ)，
+# 其中 ΔP = p_in − p_out = (ρ_in − ρ_out) · cs²（cs² = 1/3，格子单位）。
+# 最大速度 U_max = ΔP · H² / (8νρ)，雷诺数 Re = U_max · H / ν。
+
+[simulation]
+n_steps        = 20000
+dt             = 1.0           # 格子时间单位
+lattice_model  = "D2Q9"
+collision_model = "MRT"        # MRT 在低粘度下更稳定
+
+[fluid]
+nx   = 200                     # 通道长度（格点）
+ny   = 60                      # 通道高度 H（格点）
+nz   = 1
+nu   = 0.1                     # 运动粘度（格子单位）；ν = 0.1 → τ = 0.8，稳定
+rho0 = 1.0
+
+  # 西壁（入口）：Zou-He 压力边界条件，规定入口密度（对应较高压力）
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_pressure"
+  face    = "west"
+  rho     = 1.005               # 入口密度（压力正比于 rho × cs²）
+
+  # 东壁（出口）：Zou-He 压力边界条件，规定出口密度（参考压力）
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_pressure"
+  face    = "east"
+  rho     = 1.0                 # 出口参考密度
+
+  # 南壁（底部固壁）：半步长反弹，无滑移
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "south"
+
+  # 北壁（顶部固壁）：半步长反弹，无滑移
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/pressure_channel"
+format         = "npz"

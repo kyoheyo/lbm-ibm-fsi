@@ -1,0 +1,44 @@
+# 速度入口通道流（均匀入口 + 充分发展出口）
+# 西壁规定均匀速度 ux = U_inlet，东壁施加充分发展出口（零法向梯度），
+# 上下两壁为无滑移固壁。流场将从均匀入口逐渐发展为 Poiseuille 抛物线剖面。
+# 雷诺数：Re = U_inlet · H / ν
+
+[simulation]
+n_steps        = 30000
+dt             = 1.0
+lattice_model  = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 300                     # 通道长度（格点）；足够长以充分发展
+ny   = 60                      # 通道高度 H（格点）
+nz   = 1
+nu   = 0.1                     # 运动粘度（格子单位）
+rho0 = 1.0
+
+  # 西壁（速度入口）：Zou-He 速度边界条件，均匀入口速度
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_velocity"
+  face    = "west"
+  ux      = 0.05               # 入口速度（格子单位）；Re = 0.05 × 60 / 0.1 = 30
+  uy      = 0.0
+
+  # 东壁（充分发展出口）：零法向梯度，拷贝上游一层分布函数
+  [[fluid.boundary_conditions]]
+  bc_type = "fully_developed"
+  face    = "east"
+
+  # 南壁（底部固壁）：半步长反弹，无滑移
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "south"
+
+  # 北壁（顶部固壁）：半步长反弹，无滑移
+  [[fluid.boundary_conditions]]
+  bc_type = "bounce_back"
+  face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/velocity_inlet_channel"
+format         = "npz"

@@ -1,0 +1,46 @@
+# 速度入口 + 压力出口 + 上下两壁自由出口
+# 适用于开放域或射流类问题：西壁规定速度，东壁规定压力（Zou-He 压力），
+# 南北两壁施加自由出口（充分发展/零梯度），允许流体在侧向自由流出。
+# 此配置中南北壁为非固壁 BC，角节点（SW/SE/NW/NE）的两相邻面均为
+# 非固壁 BC，自动跳过角点反弹修正，避免对出口角点施加错误的 u=0 约束。
+
+[simulation]
+n_steps        = 25000
+dt             = 1.0
+lattice_model  = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 200                     # 通道长度（格点）
+ny   = 80                      # 通道高度 H（格点）
+nz   = 1
+nu   = 0.05                    # 运动粘度（格子单位）；ν = 0.05 → τ = 0.65
+rho0 = 1.0
+
+  # 西壁（速度入口）：Zou-He 速度边界条件
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_velocity"
+  face    = "west"
+  ux      = 0.05               # 入口速度（格子单位）
+  uy      = 0.0
+
+  # 东壁（压力出口）：Zou-He 压力边界条件，规定出口参考密度
+  [[fluid.boundary_conditions]]
+  bc_type = "zou_he_pressure"
+  face    = "east"
+  rho     = 1.0
+
+  # 南壁（自由出口）：充分发展出口，零法向梯度
+  [[fluid.boundary_conditions]]
+  bc_type = "free_outlet"
+  face    = "south"
+
+  # 北壁（自由出口）：充分发展出口，零法向梯度
+  [[fluid.boundary_conditions]]
+  bc_type = "free_outlet"
+  face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/velocity_inlet_pressure_outlet"
+format         = "npz"
