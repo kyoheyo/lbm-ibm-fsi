@@ -331,6 +331,122 @@ void lbm_solver_attach_mpi(lbm::Solver* s, MpiDecompHandle* h)
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 二维（XY 方向）MPI 块分解接口
+// ---------------------------------------------------------------------------
+
+/// 指向堆上 lbm::MpiDecomp2D 的不透明句柄
+struct MpiDecomp2DHandle;
+
+/// 在堆上创建 MpiDecomp2D；若 MPI 未初始化或未启用，返回 nullptr。
+/// px * py 必须等于 MPI 进程总数，否则返回 nullptr。
+/// Rust 封装: LbmMpiDecomp2D::new() — bindings/src/lib.rs
+MpiDecomp2DHandle* lbm_mpi_decomp2d_new(int global_nx, int global_ny,
+                                          int px, int py)
+{
+#ifdef LBM_ENABLE_MPI
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized) return nullptr;
+    try {
+        auto* d = new lbm::MpiDecomp2D(
+            lbm::MpiDecomp2D::create(global_nx, global_ny, px, py));
+        return reinterpret_cast<MpiDecomp2DHandle*>(d);
+    } catch (...) {
+        return nullptr;
+    }
+#else
+    (void)global_nx; (void)global_ny; (void)px; (void)py;
+    return nullptr;
+#endif
+}
+
+/// 释放由 lbm_mpi_decomp2d_new 创建的 MpiDecomp2D。
+/// Rust 触发: <LbmMpiDecomp2D as Drop>::drop()
+void lbm_mpi_decomp2d_free(MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    delete reinterpret_cast<lbm::MpiDecomp2D*>(h);
+#else
+    (void)h;
+#endif
+}
+
+/// 将 MpiDecomp2D 绑定到求解器；之后每次 step() 自动执行二维幽灵层交换。
+/// Rust 封装: LbmSolver::attach_mpi2d() — bindings/src/lib.rs
+void lbm_solver_attach_mpi2d(lbm::Solver* s, MpiDecomp2DHandle* h)
+{
+    if (!s) return;
+#ifdef LBM_ENABLE_MPI
+    s->attach_mpi2d(reinterpret_cast<const lbm::MpiDecomp2D*>(h));
+#else
+    (void)h;
+#endif
+}
+
+/// 返回二维分解中本进程的本地 nx（含幽灵列）
+int lbm_mpi_decomp2d_grid_nx(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->grid_nx();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回二维分解中本进程的本地 ny（含幽灵行）
+int lbm_mpi_decomp2d_grid_ny(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->grid_ny();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回二维分解中本进程的物理 X 起始坐标（全局坐标）
+int lbm_mpi_decomp2d_x_start(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->x_start;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回二维分解中本进程的物理 Y 起始坐标（全局坐标）
+int lbm_mpi_decomp2d_y_start(const MpiDecomp2DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp2D*>(h)->y_start;
+#else
+    (void)h; return 0;
+#endif
+}
+
+} // extern "C"
+
+// ===========================================================================
+// OpenMP 线程数设置接口
+// ===========================================================================
+extern "C" {
+
+/// 设置 OpenMP 线程数（等价于 omp_set_num_threads()）。
+/// 若未启用 OpenMP，此函数为空操作。
+/// Rust 封装: set_omp_num_threads() — bindings/src/lib.rs
+void lbm_omp_set_num_threads(int n)
+{
+#ifdef LBM_ENABLE_OPENMP
+    if (n > 0) omp_set_num_threads(n);
+#else
+    (void)n;
+#endif
+}
+
 } // extern "C"
 
 // ===========================================================================

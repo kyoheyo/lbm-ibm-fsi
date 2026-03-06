@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use config::Config;
-use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face};
+use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face,
+                   mpi_rank, mpi_size, mpi_local_ny};
 
 // ---------------------------------------------------------------------------
 /// LBM + IBM + FSI 求解器
@@ -85,7 +86,27 @@ fn main() -> Result<()> {
             _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
         }
     });
+
+    // -----------------------------------------------------------------------
+    // 应用并行配置：OpenMP 线程数
+    // -----------------------------------------------------------------------
+    if cfg.parallel.omp_num_threads > 0 {
+        lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
+        println!("OpenMP   : 线程数 = {}（由 [parallel].omp_num_threads 设置）",
+                 cfg.parallel.omp_num_threads);
+    }
+
     lbm_bindings::print_parallel_status();
+
+    // 打印 MPI 模式信息
+    {
+        let mpi_mode = cfg.mpi.mode.as_str();
+        match mpi_mode {
+            "2d_xy" => println!("MPI模式  : 二维块分解 {}×{}", cfg.mpi.nx_blocks, cfg.mpi.ny_blocks),
+            "multi_grid" => println!("MPI模式  : 多网格独立（每进程独立仿真）"),
+            _ => println!("MPI模式  : 一维 Y 方向切片"),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 插件启动日志
@@ -168,16 +189,103 @@ fn main() -> Result<()> {
         _     => CollisionModel::Bgk,
     };
 
+    // -----------------------------------------------------------------------
+    // MPI 域分解：根据 [mpi] 配置计算本进程的本地网格尺寸
+    //
+    // 三种模式：
+    //   "1d_y"       : 一维 Y 切片（默认）
+    //   "2d_xy"      : 二维 XY 块分解（需要 nx_blocks * ny_blocks == nprocs）
+    //   "multi_grid" : 每进程独立仿真，无通信
+    // -----------------------------------------------------------------------
+    let rank   = lbm_bindings::mpi_rank();
+    let nprocs = lbm_bindings::mpi_size();
+
+    // 确定本进程实际使用的网格尺寸
+    let (grid_nx, grid_ny, grid_nz) = match cfg.mpi.mode.as_str() {
+        "2d_xy" => {
+            // 二维块分解：本进程的 nx/ny 由 LbmMpiDecomp2D 计算
+            let px = cfg.mpi.nx_blocks as i32;
+            let py = cfg.mpi.ny_blocks as i32;
+            if px * py != nprocs {
+                eprintln!(
+                    "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
+                     Falling back to 1d_y decomposition.",
+                    px, py, px * py, nprocs
+                );
+                // Fallback：使用 1D Y 分解
+                let (gny, _, _) = lbm_bindings::mpi_local_ny(cfg.fluid.ny as i32);
+                (cfg.fluid.nx as i32, gny, cfg.fluid.nz as i32)
+            } else if let Some(d2) = lbm_bindings::LbmMpiDecomp2D::new(
+                cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py)
+            {
+                (d2.grid_nx(), d2.grid_ny(), cfg.fluid.nz as i32)
+            } else {
+                // MPI 未启用时退化为全局网格
+                (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
+            }
+        }
+        "multi_grid" => {
+            // 多网格独立模式：每进程使用完整的全局网格，无幽灵层
+            (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
+        }
+        _ => {
+            // "1d_y"（默认）：Y 方向一维切片
+            let (gny, _, _) = lbm_bindings::mpi_local_ny(cfg.fluid.ny as i32);
+            (cfg.fluid.nx as i32, gny, cfg.fluid.nz as i32)
+        }
+    };
+
+    if nprocs > 1 {
+        println!("本地网格  : rank={} → {}×{}×{}", rank, grid_nx, grid_ny, grid_nz);
+    }
+
     // 初始化流体格子网格
-    let mut grid = LbmGrid::new(
-        cfg.fluid.nx as i32,
-        cfg.fluid.ny as i32,
-        cfg.fluid.nz as i32,
-        model,
-    );
+    let mut grid = LbmGrid::new(grid_nx, grid_ny, grid_nz, model);
 
     // 初始化求解器
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
+
+    // -----------------------------------------------------------------------
+    // MPI 域分解绑定：根据模式创建并绑定 MpiDecomp 或 MpiDecomp2D
+    // -----------------------------------------------------------------------
+    // 声明持有者以延长生命周期到仿真循环结束
+    let mut _decomp1d: Option<lbm_bindings::LbmMpiDecomp>   = None;
+    let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
+
+    match cfg.mpi.mode.as_str() {
+        "2d_xy" => {
+            let px = cfg.mpi.nx_blocks as i32;
+            let py = cfg.mpi.ny_blocks as i32;
+            if px * py == nprocs {
+                if let Some(mut d) = lbm_bindings::LbmMpiDecomp2D::new(
+                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, px, py)
+                {
+                    solver.attach_mpi2d(Some(&mut d));
+                    _decomp2d = Some(d);
+                }
+            } else {
+                // 已在上方打印警告，退化为 1D
+                if let Some(mut d) = lbm_bindings::LbmMpiDecomp::new(
+                    cfg.fluid.nx as i32, cfg.fluid.ny as i32)
+                {
+                    solver.attach_mpi(Some(&mut d));
+                    _decomp1d = Some(d);
+                }
+            }
+        }
+        "multi_grid" => {
+            // 无 MPI 通信，不绑定任何分解
+        }
+        _ => {
+            // "1d_y"（默认）
+            if let Some(mut d) = lbm_bindings::LbmMpiDecomp::new(
+                cfg.fluid.nx as i32, cfg.fluid.ny as i32)
+            {
+                solver.attach_mpi(Some(&mut d));
+                _decomp1d = Some(d);
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 注册边界条件（将 TOML 配置中的 [[fluid.boundary_conditions]] 传入 C++ 核心）
@@ -235,9 +343,15 @@ fn main() -> Result<()> {
     }
 
     // 创建输出目录
-    std::fs::create_dir_all(&cfg.output.directory)?;
+    // 多网格独立模式下，每进程的输出写入各自的子目录 <output.directory>/rank_<N>/
+    let output_dir = if cfg.mpi.mode == "multi_grid" && nprocs > 1 {
+        format!("{}/rank_{}", cfg.output.directory, rank)
+    } else {
+        cfg.output.directory.clone()
+    };
+    std::fs::create_dir_all(&output_dir)?;
 
-    let csv_path = format!("{}/monitor.csv", cfg.output.directory);
+    let csv_path = format!("{}/monitor.csv", output_dir);
 
     println!("\nStarting time integration...");
     if cfg.simulation.n_steps == 0 {
@@ -256,17 +370,17 @@ fn main() -> Result<()> {
             match cfg.output.format.as_str() {
                 "tecplot_asc" => {
                     // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
-                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &cfg.output.directory)
+                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &output_dir)
                         .with_context(|| format!("写出 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
                 }
                 "tecplot_bin" => {
                     // 二进制 Tecplot .plt 格式（TDV112）：体积最小，Tecplot 软件可直接打开
-                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &cfg.output.directory)
+                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &output_dir)
                         .with_context(|| format!("写出 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
                 }
                 _ => {
                     // 默认："npz"——NumPy .npz 压缩归档，Python 后处理首选格式
-                    output::write_snapshot_npz(&grid, step + 1, time, &cfg.output.directory)
+                    output::write_snapshot_npz(&grid, step + 1, time, &output_dir)
                         .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
                 }
             }
@@ -302,7 +416,7 @@ fn main() -> Result<()> {
                     if let Err(e) = python_bridge::plot_field(
                         &rho, &ux, &uy, nx, ny,
                         step + 1, time,
-                        &cfg.output.directory,
+                        &output_dir,
                         field_name,
                     ) {
                         eprintln!("[python-ffi] plot {field_name} failed at step {}: {e}", step + 1);
@@ -319,7 +433,7 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     if let Some(ref script) = cfg.python.post_script.clone() {
         println!("\n--- Post-processing (Python subprocess) ---");
-        run_python_subprocess(&cfg.python.interpreter, script, &[&cfg.output.directory])?;
+        run_python_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
     }
 
     Ok(())

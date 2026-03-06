@@ -93,6 +93,26 @@ mod ffi {
         pub fn lbm_mpi_decomp_new(global_nx: c_int, global_ny: c_int) -> *mut MpiDecompHandle;
         pub fn lbm_mpi_decomp_free(h: *mut MpiDecompHandle);
 
+        // --- MPI 二维块分解接口 — 实现于 core/src/capi/lbm_capi.cpp ---
+        /// 创建 2D 块分解（px×py）；px*py 必须等于 MPI 进程数，否则返回 null。
+        pub fn lbm_mpi_decomp2d_new(global_nx: c_int, global_ny: c_int,
+                                     px: c_int, py: c_int) -> *mut MpiDecomp2DHandle;
+        pub fn lbm_mpi_decomp2d_free(h: *mut MpiDecomp2DHandle);
+        /// 将 MpiDecomp2D 绑定到求解器（启用 2D 幽灵层自动交换）。
+        pub fn lbm_solver_attach_mpi2d(s: *mut SolverHandle, h: *mut MpiDecomp2DHandle);
+        /// 返回本进程本地网格含幽灵列的 nx。
+        pub fn lbm_mpi_decomp2d_grid_nx(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回本进程本地网格含幽灵行的 ny。
+        pub fn lbm_mpi_decomp2d_grid_ny(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回本进程物理区域在全局坐标系中的 x 起始坐标。
+        pub fn lbm_mpi_decomp2d_x_start(h: *const MpiDecomp2DHandle) -> c_int;
+        /// 返回本进程物理区域在全局坐标系中的 y 起始坐标。
+        pub fn lbm_mpi_decomp2d_y_start(h: *const MpiDecomp2DHandle) -> c_int;
+
+        // --- OpenMP 线程数设置 — 实现于 core/src/capi/lbm_capi.cpp ---
+        /// 设置 OpenMP 线程数（等价于 omp_set_num_threads()）。
+        pub fn lbm_omp_set_num_threads(n: c_int);
+
         // --- GPU（CUDA）接口 — 实现于 core/src/capi/lbm_capi.cpp ---
         pub fn lbm_gpu_solver_new(g: *mut LatticeGridHandle, omega: f64) -> *mut GpuSolverHandle;
         pub fn lbm_gpu_solver_free(h: *mut GpuSolverHandle);
@@ -132,6 +152,8 @@ mod ffi {
 
     /// MPI 域分解描述符的不透明句柄（仅持有指针，不可实例化）
     pub enum MpiDecompHandle {}
+    /// MPI 二维块分解描述符的不透明句柄
+    pub enum MpiDecomp2DHandle {}
     /// GPU 求解器的不透明句柄
     pub enum GpuSolverHandle {}
 }
@@ -464,12 +486,87 @@ impl Drop for LbmMpiDecomp {
 }
 
 impl LbmSolver {
-    /// 绑定 MPI 域分解：之后每次 `step()` 的流式迁移后自动执行幽灵行交换。
+    /// 绑定 MPI 一维（Y 方向）域分解：之后每次 `step()` 的流式迁移后自动执行幽灵行交换。
     /// 传入 `None` 可解除绑定（恢复单进程模式）。
     pub fn attach_mpi(&mut self, decomp: Option<&mut LbmMpiDecomp>) {
         let h = decomp.map_or(std::ptr::null_mut(), |d| d.as_mut_ptr());
         unsafe { ffi::lbm_solver_attach_mpi(self.ptr, h) };
     }
+
+    /// 绑定 MPI 二维（XY 方向）块分解：之后每次 `step()` 自动执行 2D 幽灵层交换。
+    /// 传入 `None` 可解除绑定。
+    pub fn attach_mpi2d(&mut self, decomp: Option<&mut LbmMpiDecomp2D>) {
+        let h = decomp.map_or(std::ptr::null_mut(), |d| d.as_mut_ptr());
+        unsafe { ffi::lbm_solver_attach_mpi2d(self.ptr, h) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// `lbm::MpiDecomp2D` 的安全封装（二维 XY 块分解）
+// ---------------------------------------------------------------------------
+pub struct LbmMpiDecomp2D {
+    ptr: *mut ffi::MpiDecomp2DHandle,
+}
+
+unsafe impl Send for LbmMpiDecomp2D {}
+
+impl LbmMpiDecomp2D {
+    /// 创建 MPI 二维块分解（需先调用 `mpi_init()`）。
+    ///
+    /// - `global_nx`：全局 X 方向节点数
+    /// - `global_ny`：全局 Y 方向节点数
+    /// - `px`：X 方向进程数
+    /// - `py`：Y 方向进程数
+    ///
+    /// `px * py` 必须等于 MPI 进程总数，否则返回 `None`。
+    /// 未启用 MPI 时也返回 `None`。
+    pub fn new(global_nx: i32, global_ny: i32, px: i32, py: i32) -> Option<Self> {
+        let ptr = unsafe { ffi::lbm_mpi_decomp2d_new(global_nx, global_ny, px, py) };
+        if ptr.is_null() { None } else { Some(LbmMpiDecomp2D { ptr }) }
+    }
+
+    /// 本进程本地网格含幽灵列的 nx。
+    pub fn grid_nx(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_grid_nx(self.ptr as *const _) }
+    }
+
+    /// 本进程本地网格含幽灵行的 ny。
+    pub fn grid_ny(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_grid_ny(self.ptr as *const _) }
+    }
+
+    /// 本进程物理区域在全局坐标系中的 x 起始坐标。
+    pub fn x_start(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_x_start(self.ptr as *const _) }
+    }
+
+    /// 本进程物理区域在全局坐标系中的 y 起始坐标。
+    pub fn y_start(&self) -> i32 {
+        unsafe { ffi::lbm_mpi_decomp2d_y_start(self.ptr as *const _) }
+    }
+
+    /// 原始可变指针（仅供 LbmSolver::attach_mpi2d 内部使用）
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut ffi::MpiDecomp2DHandle { self.ptr }
+}
+
+impl Drop for LbmMpiDecomp2D {
+    fn drop(&mut self) {
+        unsafe { ffi::lbm_mpi_decomp2d_free(self.ptr) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// 设置 OpenMP 线程数（等价于 `OMP_NUM_THREADS` 环境变量，但在进程内即时生效）。
+///
+/// 若未以 `LBM_ENABLE_OPENMP=ON` 编译，此函数为空操作。
+///
+/// # 示例
+///
+/// ```no_run
+/// lbm_bindings::set_omp_num_threads(8);  // 使用 8 个 OpenMP 线程
+/// ```
+pub fn set_omp_num_threads(n: i32) {
+    unsafe { ffi::lbm_omp_set_num_threads(n) };
 }
 
 // ---------------------------------------------------------------------------

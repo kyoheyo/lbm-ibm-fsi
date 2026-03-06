@@ -97,12 +97,12 @@ void Solver::collide_bgk()
     const int n = grid_.size();
     const int d = grid_.dim();
 
-    // MPI 模式下，幽灵行（ghost rows）持有相邻进程传来的物理行数据，
+    // MPI 一维模式下，幽灵行（ghost rows）持有相邻进程传来的物理行数据，
     // 已在对方进程完成了一次碰撞；若再次对幽灵行执行碰撞（二次碰撞），
     // 会导致边界区域的分布函数被过度松弛，引起物理错误（边界附近的密度/速度误差）。
     // 因此仅对当前进程持有的物理行（以及南/北物理壁节点）执行碰撞。
     //
-    // 节点索引布局（MPI，nprocs > 1）：
+    // 节点索引布局（MPI 一维，nprocs > 1）：
     //   j=0           : 南幽灵（或南物理壁，rank 0）   → 节点 0..nx-1
     //   j=1..local_ny : 物理行                          → 节点 nx..(local_ny)*nx-1
     //   j=local_ny+1  : 北幽灵（或北物理壁，最后 rank）→ 节点 (local_ny+1)*nx..n-1
@@ -118,6 +118,17 @@ void Solver::collide_bgk()
         if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
         if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
     }
+
+    // MPI 二维模式：幽灵层在四个方向上均存在，通过逐节点检查跳过幽灵节点
+    // 注意：n_start/n_end 在二维模式下不适用（改用内循环 is_ghost 检查）
+    const bool use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
+    const int gnx2d = use_mpi2d ? grid_.nx : 0;
+    const int gny2d = use_mpi2d ? grid_.ny : 0;
+    const bool sg2d = use_mpi2d && mpi_decomp2d_->has_south_ghost();
+    const bool ng2d = use_mpi2d && mpi_decomp2d_->has_north_ghost();
+    const bool wg2d = use_mpi2d && mpi_decomp2d_->has_west_ghost();
+    const bool eg2d = use_mpi2d && mpi_decomp2d_->has_east_ghost();
+    if (use_mpi2d) { n_start = 0; n_end = n; }
 #endif
 
     if (grid_.model == LatticeModel::D2Q9) {
@@ -125,6 +136,15 @@ void Solver::collide_bgk()
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = n_start; i < n_end; ++i) {
+#ifdef LBM_ENABLE_MPI
+            // 二维模式：跳过幽灵层节点（南/北幽灵行 或 西/东幽灵列）
+            if (use_mpi2d) {
+                const int ix = i % gnx2d;
+                const int iy = i / gnx2d;
+                if ((sg2d && iy == 0) || (ng2d && iy == gny2d - 1)) continue;
+                if ((wg2d && ix == 0) || (eg2d && ix == gnx2d - 1)) continue;
+            }
+#endif
             const double* ui = &grid_.u[i * d];
             const double  ri = grid_.rho[i];
             const double* Fi = &grid_.force[i * d];
@@ -202,7 +222,7 @@ void Solver::collide_mrt()
     const int n = grid_.size();
     const int d = 2;
 
-    // MPI 幽灵行跳过逻辑（同 collide_bgk，防止二次碰撞）
+    // MPI 幽灵层跳过逻辑（同 collide_bgk，防止二次碰撞）
     int n_start = 0;
     int n_end   = n;
 #ifdef LBM_ENABLE_MPI
@@ -210,12 +230,28 @@ void Solver::collide_mrt()
         if (!mpi_decomp_->has_south_wall()) n_start = grid_.nx;
         if (!mpi_decomp_->has_north_wall()) n_end   = n - grid_.nx;
     }
+    const bool use_mpi2d_mrt = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
+    const int gnx2d_mrt = use_mpi2d_mrt ? grid_.nx : 0;
+    const int gny2d_mrt = use_mpi2d_mrt ? grid_.ny : 0;
+    const bool sg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_south_ghost();
+    const bool ng2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_north_ghost();
+    const bool wg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_west_ghost();
+    const bool eg2d_mrt = use_mpi2d_mrt && mpi_decomp2d_->has_east_ghost();
+    if (use_mpi2d_mrt) { n_start = 0; n_end = n; }
 #endif
 
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int i = n_start; i < n_end; ++i) {
+#ifdef LBM_ENABLE_MPI
+        if (use_mpi2d_mrt) {
+            const int ix = i % gnx2d_mrt;
+            const int iy = i / gnx2d_mrt;
+            if ((sg2d_mrt && iy == 0) || (ng2d_mrt && iy == gny2d_mrt - 1)) continue;
+            if ((wg2d_mrt && ix == 0) || (eg2d_mrt && ix == gnx2d_mrt - 1)) continue;
+        }
+#endif
         const double* fi = &grid_.f[i * d2q9::Q];
         const double* ui = &grid_.u[i * d];
         const double  ri = grid_.rho[i];
@@ -338,9 +374,11 @@ void Solver::stream()
     std::swap(grid_.f, grid_.f_tmp);
 
 #ifdef LBM_ENABLE_MPI
-    // MPI 幽灵行交换（在 BC 施加之前完成，使边界节点拿到正确的邻居数据）
+    // MPI 幽灵层交换（在 BC 施加之前完成，使边界节点拿到正确的邻居数据）
     if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
         halo_exchange_d2q9(grid_, *mpi_decomp_);
+    } else if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+        halo_exchange_d2q9_2d(grid_, *mpi_decomp2d_);
     }
 #endif
 

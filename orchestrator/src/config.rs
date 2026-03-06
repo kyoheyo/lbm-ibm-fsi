@@ -19,6 +19,12 @@ pub struct Config {
     /// 可选插件选择（边界条件 / 网格 / 运动 / 柔性体）
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// 可选并行配置（OpenMP 线程数等）
+    #[serde(default)]
+    pub parallel: ParallelConfig,
+    /// 可选 MPI 并行配置（域分解模式、块数等）
+    #[serde(default)]
+    pub mpi: MpiRunConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -258,6 +264,89 @@ fn default_delta_kernel()       -> String { "four_point".to_string() }
 fn default_output_dir()         -> String { "output".to_string() }
 fn default_output_format()      -> String { "npz".to_string() }
 fn default_python_interpreter() -> String { "python3".to_string() }
+fn default_mpi_mode()           -> String { "1d_y".to_string() }
+
+// ---------------------------------------------------------------------------
+/// 并行计算配置（OpenMP 线程数等运行期设置）
+///
+/// ## TOML 示例
+///
+/// ```toml
+/// [parallel]
+/// omp_num_threads = 8   # 设置 OpenMP 线程数；0 或缺省 = 使用全部 CPU 核心
+/// ```
+///
+/// `omp_num_threads` 的优先级高于 `OMP_NUM_THREADS` 环境变量（在进程内通过
+/// `omp_set_num_threads()` 即时生效）。若同时设置了两者，TOML 中的值优先。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ParallelConfig {
+    /// OpenMP 线程数。
+    /// - `0`（默认）：使用 OpenMP 运行时默认值（通常是全部 CPU 核心数，
+    ///   也可由 `OMP_NUM_THREADS` 环境变量覆盖）。
+    /// - 正整数 N：强制使用 N 个线程（等价于 `OMP_NUM_THREADS=N`，但优先级更高）。
+    #[serde(default)]
+    pub omp_num_threads: u32,
+}
+
+// ---------------------------------------------------------------------------
+/// MPI 并行运行配置
+///
+/// 控制域分解模式和块数。有三种模式：
+///
+/// | `mode` | 说明 |
+/// |--------|------|
+/// | `"1d_y"` | 一维 Y 方向切片（默认）：进程沿 Y 方向均匀分配行 |
+/// | `"2d_xy"` | 二维 XY 块分解：进程按 `nx_blocks × ny_blocks` 排列 |
+/// | `"multi_grid"` | 多网格独立模式：每个 MPI 进程运行完全独立的仿真，无通信开销 |
+///
+/// ## TOML 示例
+///
+/// ### 一维 Y 方向切片（默认）
+/// ```toml
+/// [mpi]
+/// mode = "1d_y"   # 可省略，此为默认值
+/// ```
+///
+/// ### 二维 XY 块分解（4×2 = 8 进程）
+/// ```toml
+/// [mpi]
+/// mode      = "2d_xy"
+/// nx_blocks = 4     # X 方向切 4 块
+/// ny_blocks = 2     # Y 方向切 2 块
+/// # nx_blocks * ny_blocks 必须等于 mpirun -n N 指定的进程数
+/// ```
+///
+/// ### 多网格独立模式（每进程独立仿真）
+/// ```toml
+/// [mpi]
+/// mode = "multi_grid"
+/// # 每个 rank 运行完全相同的配置，互不通信
+/// # 适合参数扫描：各 rank 通过不同的输出目录区分结果
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct MpiRunConfig {
+    /// MPI 域分解模式：`"1d_y"`、`"2d_xy"` 或 `"multi_grid"`。
+    #[serde(default = "default_mpi_mode")]
+    pub mode: String,
+    /// X 方向进程块数（仅 `mode = "2d_xy"` 时有效）。
+    #[serde(default = "default_one")]
+    pub nx_blocks: u32,
+    /// Y 方向进程块数（仅 `mode = "2d_xy"` 时有效）。
+    #[serde(default = "default_one")]
+    pub ny_blocks: u32,
+}
+
+fn default_one() -> u32 { 1 }
+
+impl Default for MpiRunConfig {
+    fn default() -> Self {
+        MpiRunConfig {
+            mode: default_mpi_mode(),
+            nx_blocks: 1,
+            ny_blocks: 1,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 impl Config {
