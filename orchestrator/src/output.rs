@@ -208,7 +208,7 @@ pub fn write_snapshot_tecplot_asc(
 
     let path = format!("{}/fluid_{:06}.dat", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建 Tecplot ASCII 文件：{path}"))?;
+        .with_context(|| format!("failed to create Tecplot ASCII file: {path}"))?;
 
     // 写文件头：标题、变量名、Zone 描述
     writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
@@ -295,7 +295,7 @@ pub fn write_snapshot_tecplot_bin(
 
     let path = format!("{}/fluid_{:06}.plt", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建 Tecplot 二进制文件：{path}"))?;
+        .with_context(|| format!("failed to create Tecplot binary file: {path}"))?;
 
     // -----------------------------------------------------------------------
     // 1. 魔数（8 字节 ASCII + 空终止）+ 字节序标志
@@ -614,7 +614,7 @@ pub fn write_global_snapshot_tecplot_asc(
 ) -> Result<()> {
     let path = format!("{}/fluid_{:06}.dat", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建合并 Tecplot ASCII 文件：{path}"))?;
+        .with_context(|| format!("failed to create combined Tecplot ASCII file: {path}"))?;
 
     writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
     writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
@@ -655,7 +655,7 @@ pub fn write_global_snapshot_tecplot_bin(
 
     let path = format!("{}/fluid_{:06}.plt", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建合并 Tecplot 二进制文件：{path}"))?;
+        .with_context(|| format!("failed to create combined Tecplot binary file: {path}"))?;
 
     // 魔数 + 字节序标志
     file.write_all(b"#!TDV112")?;

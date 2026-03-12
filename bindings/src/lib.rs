@@ -564,24 +564,24 @@ pub fn print_parallel_status() {
     let cuda_on = unsafe { ffi::lbm_cuda_enabled()   } != 0;
     let mpi_on  = unsafe { ffi::lbm_mpi_enabled()    } != 0;
 
-    println!("并行配置：");
+    println!("Parallel config:");
     if omp_on {
         let threads = unsafe { ffi::lbm_openmp_max_threads() };
-        println!("  OpenMP : 已启用  线程数 = {}（受 OMP_NUM_THREADS 控制）", threads);
+        println!("  OpenMP : enabled   threads = {} (controlled by OMP_NUM_THREADS)", threads);
     } else {
-        println!("  OpenMP : 未启用");
+        println!("  OpenMP : disabled");
     }
     if mpi_on {
         let rank  = mpi_rank();
         let procs = mpi_size();
-        println!("  MPI    : 已启用  进程数 = {}  当前 rank = {}", procs, rank);
+        println!("  MPI    : enabled   nprocs = {}  rank = {}", procs, rank);
     } else {
-        println!("  MPI    : 未启用");
+        println!("  MPI    : disabled");
     }
     if cuda_on {
-        println!("  GPU    : 已启用（CUDA）");
+        println!("  GPU    : enabled (CUDA)");
     } else {
-        println!("  GPU    : 未启用");
+        println!("  GPU    : disabled");
     }
 }
 
@@ -783,24 +783,24 @@ unsafe impl Send for LbmMpiDecomp3D {}
 /// 粗网格（level=0）作为根节点，细化网格块（patches）作为子节点，
 /// 支持任意嵌套深度和数量，以及 2D/3D 两种维度。
 ///
-/// # 三种遍历模式（在 C++ 端实现）
-/// - `traverse_coarse_to_fine`：从粗到细（BFS），适合逐层 LBM 步进
-/// - `traverse_fine_to_coarse`：从细到粗（BFS 逆序），适合残差传递
+/// # Traversal modes (implemented in C++)
+/// - `traverse_coarse_to_fine`: coarse-to-fine (BFS), for per-level LBM time-stepping
+/// - `traverse_fine_to_coarse`: fine-to-coarse (BFS reverse), for residual transfer
 ///
-/// # 示例（2D 双层嵌套）
+/// # Example (2D two-level nesting)
 /// ```no_run
 /// use lbm_bindings::{LbmMgTree, LbmGrid, LatticeModel};
 ///
-/// // 创建粗网格（256×256，2D）
+/// // Create coarse grid (256x256, 2D)
 /// let mut tree = LbmMgTree::new(0, 255, 0, 255, 0, 0, false)
 ///     .expect("MgTree creation failed");
 ///
-/// // 在粗网格中嵌套一个细网格（中心 64×64 区域，加密比 2）
+/// // Nest a fine grid inside the coarse grid (centre 64x64, refine ratio 2)
 /// let fine = tree.add_level_from_root(96, 159, 96, 159, 0, 0, 2)
 ///     .expect("add_level failed");
 ///
-/// println!("树深度: {}", tree.max_level());   // 1
-/// println!("节点数: {}", tree.node_count()); // 2
+/// println!("tree depth: {}", tree.max_level());   // 1
+/// println!("node count: {}", tree.node_count()); // 2
 /// ```
 pub struct LbmMgTree {
     ptr: *mut ffi::MgTreeHandle,

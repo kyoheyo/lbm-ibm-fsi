@@ -511,16 +511,15 @@ fn run() -> Result<()> {
     }
 
     if nprocs > 1 && eff_mode == "block" {
-        // 每个进程输出自己的目录信息
         if rank == 0 {
             let combine_note = if combine_blocks {
-                format!("（+合并全局快照 → {}/fluid_*.{}）",
+                format!(" (+combined global snapshots -> {}/fluid_*.{})",
                         cfg.output.directory, cfg.output.format.replace("tecplot_", ""))
             } else {
-                "（后处理可按 x_start/y_start 拼合全局场，或设 combine_blocks=true 自动合并）".to_string()
+                " (post-process: stitch partitions via x_start/y_start, or set combine_blocks=true)".to_string()
             };
             println!(
-                "输出目录  : rank=0 → {}/rank_0/  (MPI 块分解，各进程独立写出物理分区数据{})",
+                "Output dir : rank=0 -> {}/rank_0/  (MPI block mode, each rank writes its partition{})",
                 cfg.output.directory, combine_note
             );
         }
@@ -550,26 +549,22 @@ fn run() -> Result<()> {
             }
             match cfg.output.format.as_str() {
                 "tecplot_asc" => {
-                    // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
                     output::write_snapshot_tecplot_asc(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
+                        .with_context(|| format!("failed to write Tecplot ASCII snapshot (step {})", step + 1))?;
                 }
                 "tecplot_bin" => {
-                    // 二进制 Tecplot .plt 格式（TDV112）：体积最小，Tecplot 软件可直接打开
                     output::write_snapshot_tecplot_bin(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
+                        .with_context(|| format!("failed to write Tecplot binary snapshot (step {})", step + 1))?;
                 }
                 _ => {
-                    // 默认："npz"——NumPy .npz 压缩归档，Python 后处理首选格式
                     output::write_snapshot_npz(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
+                        .with_context(|| format!("failed to write NPZ snapshot (step {})", step + 1))?;
                 }
             }
 
-            // -- combine_blocks：gather 各分区数据，由 rank-0 写出全局合并快照 --
+            // -- combine_blocks: rank-0 gathers all partition data and writes a combined global snapshot --
             if combine_blocks {
                 if let Some(p) = partition {
-                    // 提取本地物理场
                     let grid_nx  = grid.nx() as usize;
                     let n_phys   = p.local_nx * p.local_ny;
                     let mut l_rho = Vec::with_capacity(n_phys);
@@ -583,40 +578,39 @@ fn run() -> Result<()> {
                             l_uy .push(grid.uy (idx));
                         }
                     }
-                    // Gather 三个场到 rank-0
+                    // Gather three fields to rank-0
                     if let (Some((g_rho, gnx, gny)), Some((g_ux, _, _)), Some((g_uy, _, _))) = (
                         output::gather_field_to_root(&l_rho, &p, 0),
                         output::gather_field_to_root(&l_ux,  &p, 0),
                         output::gather_field_to_root(&l_uy,  &p, 0),
                     ) {
-                        // 只有 rank-0 执行写出（gather_field_to_root 对非 root 进程返回 None）
+                        // Only rank-0 writes (gather_field_to_root returns None for non-root ranks)
                         match cfg.output.format.as_str() {
                             "tecplot_asc" => {
                                 output::write_global_snapshot_tecplot_asc(
                                     &g_rho, &g_ux, &g_uy, gnx, gny,
                                     step + 1, time, &cfg.output.directory,
                                 ).with_context(|| format!(
-                                    "写出合并 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
+                                    "failed to write combined Tecplot ASCII snapshot (step {})", step + 1))?;
                             }
                             "tecplot_bin" => {
                                 output::write_global_snapshot_tecplot_bin(
                                     &g_rho, &g_ux, &g_uy, gnx, gny,
                                     step + 1, time, &cfg.output.directory,
                                 ).with_context(|| format!(
-                                    "写出合并 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
+                                    "failed to write combined Tecplot binary snapshot (step {})", step + 1))?;
                             }
                             _ => {
                                 output::write_global_snapshot_npz(
                                     &g_rho, &g_ux, &g_uy, gnx, gny,
                                     step + 1, time, &cfg.output.directory,
                                 ).with_context(|| format!(
-                                    "写出合并 NPZ 快照失败（步数 {}）", step + 1))?;
+                                    "failed to write combined NPZ snapshot (step {})", step + 1))?;
                             }
                         }
                     } else {
-                        // 非 root 进程：等待 root 进程的 gather 调用（非 root 参与通信）
-                        // 由于 gather_field_to_root 对每个字段都会调用 MPI Gatherv，
-                        // 非 root 进程已在函数内部参与通信，这里不需要额外操作。
+                        // Non-root ranks: already participated in MPI_Gatherv inside gather_field_to_root;
+                        // no additional action needed here.
                     }
                 }
             }
