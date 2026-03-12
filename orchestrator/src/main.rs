@@ -348,6 +348,67 @@ fn run() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // 固体标记与反弹方案设置（读取 [solid] 配置段）
+    //
+    // 执行顺序：
+    //   1. 遍历 [[solid.bodies]] 列表，依次调用对应几何标记函数
+    //   2. 根据 solid.bc_type 设置求解器的固体反弹方案
+    //      "bounce_back"             → SolidBCType::BounceBack（半步长，一阶）
+    //      "interpolated_bounce_back"→ SolidBCType::InterpolatedBounceBack（Bouzidi，二阶）
+    //      其他 / "none"             → 不施加固体边界（仅标记，不反弹）
+    //
+    // 注意：圆柱标记会同时计算精确的 IBB 距离分数 q，矩形标记使用默认 q=0.5。
+    // bc_type 别名一览（均等价）：
+    //   "bounce_back"               → BounceBack（半步长，Ladd 1994，一阶精度）
+    //   "interpolated_bounce_back"  → IBB（Bouzidi 2001，二阶精度；别名 "ibb" / "bouzidi"）
+    //   "none" / 其他               → 不施加固体反弹（仅标记，用于调试）
+    // -----------------------------------------------------------------------
+    if !cfg.solid.bodies.is_empty() {
+        for body in &cfg.solid.bodies {
+            match body.shape.to_lowercase().as_str() {
+                "cylinder" => {
+                    lbm_bindings::mark_solid_cylinder(&mut grid, body.cx, body.cy, body.radius);
+                    if rank == 0 {
+                        println!(
+                            "  [solid] 圆柱标记: center=({:.2}, {:.2}), radius={:.2}",
+                            body.cx, body.cy, body.radius
+                        );
+                    }
+                }
+                "rectangle" => {
+                    lbm_bindings::mark_solid_rectangle(&mut grid, body.i0, body.j0, body.i1, body.j1);
+                    if rank == 0 {
+                        println!(
+                            "  [solid] 矩形标记: [{}, {}] × [{}, {}]",
+                            body.i0, body.i1, body.j0, body.j1
+                        );
+                    }
+                }
+                other => {
+                    if rank == 0 {
+                        eprintln!("  [warn] 未知固体形状 {:?}，跳过", other);
+                    }
+                }
+            }
+        }
+
+        let bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
+            "bounce_back"              => 1_i32,
+            "interpolated_bounce_back" | "ibb" | "bouzidi" => 2_i32,
+            _ => 0_i32,  // "none" 或未知
+        };
+        lbm_bindings::mark_solid_bc(&mut solver, bc_mode);
+        if rank == 0 {
+            let scheme_name = match bc_mode {
+                1 => "BounceBack（半步长反弹，Ladd 1994，一阶精度）",
+                2 => "InterpolatedBounceBack（Bouzidi 插值反弹，2001，二阶精度）",
+                _ => "None（固体节点已标记，但不施加反弹，仅用于调试）",
+            };
+            println!("  [solid] 反弹方案: {}", scheme_name);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Register boundary conditions
     // -----------------------------------------------------------------------
     // Collect per-rank BC log lines; printed in rank order after registration to

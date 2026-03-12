@@ -12,6 +12,9 @@ pub struct Config {
     pub fluid: FluidConfig,
     pub structure: Option<StructureConfig>,
     pub ibm: Option<IbmConfig>,
+    /// 可选固体体配置（BB / IBB 反弹方案；圆柱、矩形等几何标记）
+    #[serde(default)]
+    pub solid: SolidConfig,
     pub output: OutputConfig,
     /// 可选 Python 集成（子进程脚本 + FFI 绘图）
     #[serde(default)]
@@ -88,6 +91,56 @@ pub struct StructureConfig {
     pub length: f64,
     /// 有限元单元数
     pub n_elements: u32,
+}
+
+// ---------------------------------------------------------------------------
+// 固体体配置（BB / IBB 固体边界）
+// ---------------------------------------------------------------------------
+
+/// 顶层固体配置（`[solid]`）
+///
+/// 包含反弹方案选择（`bc_type`）和若干固体几何体的列表（`[[solid.bodies]]`）。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SolidConfig {
+    /// 反弹方案：`"none"`（默认）| `"bounce_back"` | `"interpolated_bounce_back"`
+    #[serde(default = "default_solid_bc_type")]
+    pub bc_type: String,
+    /// 固体几何体列表（可以有零或多个）
+    #[serde(default)]
+    pub bodies: Vec<SolidBodyConfig>,
+}
+
+fn default_solid_bc_type() -> String { "none".to_string() }
+
+/// 单个固体几何体描述
+///
+/// ```toml
+/// [[solid.bodies]]
+/// shape  = "cylinder"   # "cylinder" | "rectangle"
+/// cx     = 100.0        # 圆心 x（圆柱）
+/// cy     = 50.0         # 圆心 y（圆柱）
+/// radius = 20.0         # 半径（圆柱）
+///
+/// [[solid.bodies]]
+/// shape  = "rectangle"
+/// i0     = 10           # 西南角 x
+/// j0     = 5            # 西南角 y
+/// i1     = 30           # 东北角 x
+/// j1     = 25           # 东北角 y
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolidBodyConfig {
+    /// 几何形状：`"cylinder"` 或 `"rectangle"`
+    pub shape: String,
+    // ---- 圆柱参数 ----
+    #[serde(default)] pub cx: f64,
+    #[serde(default)] pub cy: f64,
+    #[serde(default)] pub radius: f64,
+    // ---- 矩形参数 ----
+    #[serde(default)] pub i0: i32,
+    #[serde(default)] pub j0: i32,
+    #[serde(default)] pub i1: i32,
+    #[serde(default)] pub j1: i32,
 }
 
 #[derive(Debug, Deserialize, Clone)]

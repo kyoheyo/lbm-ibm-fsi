@@ -799,6 +799,54 @@ void lbm_solver_attach_mpi3d(lbm::Solver* s, MpiDecomp3DHandle* h)
 } // extern "C"
 
 // ===========================================================================
+// 固体边界（BB / IBB）接口
+// ===========================================================================
+// 这些函数封装 lbm::mark_solid_cylinder / mark_solid_rectangle 以及
+// Solver::set_solid_bc_type()，供 Rust orchestrator 通过 C ABI 调用。
+// ===========================================================================
+#include "lbm/solid.hpp"
+
+extern "C" {
+
+/// 将半径为 radius 的圆柱标记为固体，并计算 IBB 壁面距离分数 q。
+/// 同时自动对所有流-固方向对填充 q_ibb 数组（精确圆柱射线求交）。
+///
+/// @param g       LatticeGrid 指针
+/// @param cx, cy  圆柱中心（格子单位）
+/// @param radius  圆柱半径（格子单位）
+void lbm_mark_solid_cylinder(lbm::LatticeGrid* g, double cx, double cy, double radius)
+{
+    if (!g) return;
+    lbm::mark_solid_cylinder(*g, cx, cy, radius);
+}
+
+/// 将矩形区域 [i0,i1] × [j0,j1] 标记为固体（q=0.5，退化为标准 halfway BB）。
+///
+/// @param g           LatticeGrid 指针
+/// @param i0,j0       西南角格子坐标（含）
+/// @param i1,j1       东北角格子坐标（含）
+void lbm_mark_solid_rectangle(lbm::LatticeGrid* g, int i0, int j0, int i1, int j1)
+{
+    if (!g) return;
+    lbm::mark_solid_rectangle(*g, i0, j0, i1, j1);
+}
+
+/// 设置求解器使用的固体反弹方案。
+///
+/// @param s        Solver 指针
+/// @param bc_mode  0 = None（禁用）| 1 = BounceBack（半步长）| 2 = InterpolatedBounceBack（Bouzidi）
+void lbm_solver_set_solid_bc(lbm::Solver* s, int bc_mode)
+{
+    if (!s) return;
+    lbm::SolidBCType t = lbm::SolidBCType::None;
+    if      (bc_mode == 1) t = lbm::SolidBCType::BounceBack;
+    else if (bc_mode == 2) t = lbm::SolidBCType::InterpolatedBounceBack;
+    s->set_solid_bc_type(t);
+}
+
+} // extern "C" (solid)
+
+// ===========================================================================
 // GPU（CUDA）接口
 // ===========================================================================
 extern "C" {

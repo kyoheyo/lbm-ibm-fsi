@@ -215,6 +215,17 @@ mod ffi {
         pub fn lbm_cuda_enabled()       -> c_int;
         pub fn lbm_mpi_enabled()        -> c_int;
 
+        // --- 固体边界（BB / IBB）—— 实现于 core/src/capi/lbm_capi.cpp ---
+        /// 将圆柱标记为固体并计算 IBB 距离分数 q。
+        pub fn lbm_mark_solid_cylinder(g: *mut LatticeGridHandle,
+                                       cx: f64, cy: f64, radius: f64);
+        /// 将矩形区域标记为固体（q=0.5）。
+        pub fn lbm_mark_solid_rectangle(g: *mut LatticeGridHandle,
+                                        i0: c_int, j0: c_int,
+                                        i1: c_int, j1: c_int);
+        /// 设置固体反弹方案：0=None, 1=BB, 2=IBB。
+        pub fn lbm_solver_set_solid_bc(s: *mut SolverHandle, bc_mode: c_int);
+
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
         // Rust 安全封装: register_plugins()（见本文件底部）
@@ -882,6 +893,37 @@ unsafe impl Send for LbmMgTree {}
 pub fn set_omp_num_threads(n: i32) {
     unsafe { ffi::lbm_omp_set_num_threads(n) };
 }
+
+// ---------------------------------------------------------------------------
+// 固体边界（BB / IBB）安全封装
+// ---------------------------------------------------------------------------
+
+/// 将圆柱（圆心 `(cx, cy)`，半径 `radius`）内部节点标记为固体，
+/// 并精确计算每个流-固链接方向的 IBB 壁面距离分数 `q`。
+///
+/// 必须在创建 `LbmGrid` 之后、开始时间步循环之前调用。
+/// 之后需调用 [`mark_solid_bc`] 设置反弹方案。
+pub fn mark_solid_cylinder(grid: &mut LbmGrid, cx: f64, cy: f64, radius: f64) {
+    unsafe { ffi::lbm_mark_solid_cylinder(grid.ptr, cx, cy, radius) };
+}
+
+/// 将矩形区域 `[i0,i1] × [j0,j1]`（格子坐标，含端点）标记为固体。
+/// 矩形面上的 `q` 默认为 0.5（退化为标准半步长反弹）。
+pub fn mark_solid_rectangle(grid: &mut LbmGrid, i0: i32, j0: i32, i1: i32, j1: i32) {
+    unsafe { ffi::lbm_mark_solid_rectangle(grid.ptr, i0, j0, i1, j1) };
+}
+
+/// 设置求解器使用的固体反弹方案。
+///
+/// | `bc_mode` | 方案 | 说明 |
+/// |-----------|------|------|
+/// | `0` | `None` | 禁用固体边界（默认，全流体模式） |
+/// | `1` | `BounceBack` | 半步长反弹（Ladd 1994；q=0.5，一阶精度） |
+/// | `2` | `InterpolatedBounceBack` | Bouzidi 插值反弹（2001；精确 q，二阶精度） |
+pub fn mark_solid_bc(solver: &mut LbmSolver, bc_mode: i32) {
+    unsafe { ffi::lbm_solver_set_solid_bc(solver.ptr, bc_mode) };
+}
+
 
 // ---------------------------------------------------------------------------
 /// GPU（CUDA）求解器封装
