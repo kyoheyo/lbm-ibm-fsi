@@ -364,10 +364,31 @@ fn run() -> Result<()> {
     //   "none" / 其他               → 不施加固体反弹（仅标记，用于调试）
     // -----------------------------------------------------------------------
     if !cfg.solid.bodies.is_empty() {
+        // MPI 模式下全局坐标到本地网格坐标的转换参数：
+        //   local_i = global_i - x_start + phys_x0
+        //   local_j = global_j - y_start + phys_y0
+        //
+        // phys_x0/phys_y0 表示本地网格中物理区域的起始偏移（幽灵层宽度，0 或 1）。
+        // 非 MPI 模式下 x_start=y_start=0, phys_x0=phys_y0=0，变换退化为恒等。
+        let (x_start, y_start, phys_x0, phys_y0): (i32, i32, i32, i32) =
+            if let Some(ref d) = _decomp3d {
+                (d.x_start(), d.y_start(), d.phys_x0(), d.phys_y0())
+            } else if let Some(ref d) = _decomp2d {
+                (d.x_start(), d.y_start(), d.phys_x0(), d.phys_y0())
+            } else {
+                (0, 0, 0, 0)
+            };
+        // 整数列/行坐标转换（整型版本，用于矩形坐标）
+        let to_local_i = |gi: i32| gi - x_start + phys_x0;
+        let to_local_j = |gj: i32| gj - y_start + phys_y0;
+
         for body in &cfg.solid.bodies {
             match body.shape.to_lowercase().as_str() {
                 "cylinder" => {
-                    lbm_bindings::mark_solid_cylinder(&mut grid, body.cx, body.cy, body.radius);
+                    // 将全局圆心坐标平移到本地网格坐标系
+                    let local_cx = body.cx - x_start as f64 + phys_x0 as f64;
+                    let local_cy = body.cy - y_start as f64 + phys_y0 as f64;
+                    lbm_bindings::mark_solid_cylinder(&mut grid, local_cx, local_cy, body.radius);
                     if rank == 0 {
                         println!(
                             "  [solid] 圆柱标记: center=({:.2}, {:.2}), radius={:.2}",
@@ -376,7 +397,12 @@ fn run() -> Result<()> {
                     }
                 }
                 "rectangle" => {
-                    lbm_bindings::mark_solid_rectangle(&mut grid, body.i0, body.j0, body.i1, body.j1);
+                    // 将全局矩形坐标平移到本地网格坐标系
+                    lbm_bindings::mark_solid_rectangle(
+                        &mut grid,
+                        to_local_i(body.i0), to_local_j(body.j0),
+                        to_local_i(body.i1), to_local_j(body.j1),
+                    );
                     if rank == 0 {
                         println!(
                             "  [solid] 矩形标记: [{}, {}] × [{}, {}]",
