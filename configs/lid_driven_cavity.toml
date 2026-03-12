@@ -42,6 +42,9 @@ area          = 0.01
 length        = 0.3
 n_elements    = 10
 
+[fsi]
+coupling = "ibm"   # ② 纯 IBM 浸入边界法
+
 [ibm]
 geometry     = "filament"
 x0           = 50.0

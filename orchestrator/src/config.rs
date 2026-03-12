@@ -15,6 +15,11 @@ pub struct Config {
     /// 可选固体体配置（BB / IBB 反弹方案；圆柱、矩形等几何标记）
     #[serde(default)]
     pub solid: SolidConfig,
+    /// 流固耦合方案显式选择（`[fsi]`，可选）
+    ///
+    /// 不提供时退化为根据 `[solid]`/`[ibm]` 段的存在自动推断（向后兼容）。
+    #[serde(default)]
+    pub fsi: FsiConfig,
     pub output: OutputConfig,
     /// 可选 Python 集成（子进程脚本 + FFI 绘图）
     #[serde(default)]
@@ -91,6 +96,114 @@ pub struct StructureConfig {
     pub length: f64,
     /// 有限元单元数
     pub n_elements: u32,
+}
+
+// ---------------------------------------------------------------------------
+// 流固耦合方案配置（FSI coupling）
+// ---------------------------------------------------------------------------
+
+/// 流固耦合方案选择配置（`[fsi]`，可选）
+///
+/// 允许用户**显式**指定流固耦合模式，而无需依赖 `[solid]`/`[ibm]` 段的存在
+/// 来隐式推断耦合模式。显式指定能够使配置意图更加清晰，并在配置不一致时
+/// 提前报错（例如声明了 `coupling="ibm"` 但未提供 `[ibm]` 段时报错）。
+///
+/// ## 三种耦合模式
+///
+/// | `coupling` 值 | 说明 | 必须提供的段 |
+/// |---------------|------|-------------|
+/// | `"bounce_back"` / `"bb"` / `"ibb"` | 反弹格式（BB 或 IBB） | `[solid]` |
+/// | `"ibm"` | 浸入边界法（IBM） | `[ibm]` |
+/// | `"hybrid"` / `"bb_ibm"` | 反弹 + IBM 混合 | `[solid]` 和 `[ibm]` |
+/// | `"auto"`（默认） | 根据配置段自动推断（向后兼容） | 视 `[solid]`/`[ibm]` 而定 |
+///
+/// ## TOML 示例
+///
+/// ```toml
+/// # ① 纯反弹格式
+/// [fsi]
+/// coupling = "bounce_back"
+///
+/// [solid]
+/// bc_type = "interpolated_bounce_back"
+/// [[solid.bodies]]
+/// shape = "cylinder"
+/// cx = 150.0  cy = 50.0  radius = 10.0
+/// ```
+///
+/// ```toml
+/// # ② 纯 IBM 浸入边界法
+/// [fsi]
+/// coupling = "ibm"
+///
+/// [ibm]
+/// geometry = "circle"
+/// x0 = 150.0  y0 = 50.0  size = 10.0  n_markers = 64
+/// ```
+///
+/// ```toml
+/// # ③ 混合耦合（反弹 + IBM）
+/// [fsi]
+/// coupling = "hybrid"
+///
+/// [solid]
+/// bc_type = "bounce_back"
+/// [[solid.bodies]]
+/// shape = "cylinder"  cx = 100.0  cy = 50.0  radius = 8.0
+///
+/// [ibm]
+/// geometry = "circle"
+/// x0 = 250.0  y0 = 50.0  size = 10.0  n_markers = 64
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct FsiConfig {
+    /// 流固耦合模式：
+    /// - `"bounce_back"` / `"bb"` / `"ibb"`：反弹格式（需要 `[solid]` 段）
+    /// - `"ibm"`：浸入边界法（需要 `[ibm]` 段）
+    /// - `"hybrid"` / `"bb_ibm"`：反弹 + IBM 混合（需要 `[solid]` 和 `[ibm]` 段）
+    /// - `"auto"`（默认）：根据 `[solid]`/`[ibm]` 段的存在自动推断（向后兼容）
+    #[serde(default = "default_fsi_coupling")]
+    pub coupling: String,
+}
+
+fn default_fsi_coupling() -> String { "auto".to_string() }
+
+impl Default for FsiConfig {
+    fn default() -> Self {
+        FsiConfig { coupling: default_fsi_coupling() }
+    }
+}
+
+impl FsiConfig {
+    /// 将耦合模式字符串归一化为规范形式。
+    ///
+    /// | 输入 | 规范形式 |
+    /// |------|---------|
+    /// | `"bb"` / `"ibb"` | `"bounce_back"` |
+    /// | `"bb_ibm"` | `"hybrid"` |
+    /// | 其他（含 `"auto"` / `"ibm"` / `"bounce_back"` / `"hybrid"`）| 原值 |
+    pub fn normalized_coupling(&self) -> &str {
+        match self.coupling.to_lowercase().as_str() {
+            "bb" | "ibb" => "bounce_back",
+            "bb_ibm"     => "hybrid",
+            _            => self.coupling.as_str(),
+        }
+    }
+
+    /// 根据哪些 FSI 配置段存在自动推断耦合模式（仅在 `coupling="auto"` 时使用）。
+    ///
+    /// - 两段都有 → `"hybrid"`
+    /// - 仅 `[ibm]` → `"ibm"`
+    /// - 仅 `[solid]`（且非 none）→ `"bounce_back"`
+    /// - 否则 → `"none"`（无 FSI 耦合）
+    pub fn infer_coupling(has_solid: bool, has_ibm: bool) -> &'static str {
+        match (has_solid, has_ibm) {
+            (true, true)  => "hybrid",
+            (false, true) => "ibm",
+            (true, false) => "bounce_back",
+            _             => "none",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -860,5 +973,93 @@ mod tests {
         assert_eq!(cfg.plugins.motion,   "");
         assert_eq!(cfg.plugins.flexible, "");
         assert!(!cfg.plugins.any_active());
+    }
+
+    #[test]
+    fn test_fsi_config_default() {
+        // [fsi] 段缺失时，coupling 应默认为 "auto"
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.coupling, "auto");
+        assert_eq!(cfg.fsi.normalized_coupling(), "auto");
+    }
+
+    #[test]
+    fn test_fsi_config_explicit() {
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+
+            [fsi]
+            coupling = "ibm"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.coupling, "ibm");
+        assert_eq!(cfg.fsi.normalized_coupling(), "ibm");
+    }
+
+    #[test]
+    fn test_fsi_config_aliases() {
+        // bb / ibb → bounce_back
+        let c1 = FsiConfig { coupling: "bb".to_string() };
+        assert_eq!(c1.normalized_coupling(), "bounce_back");
+
+        let c2 = FsiConfig { coupling: "ibb".to_string() };
+        assert_eq!(c2.normalized_coupling(), "bounce_back");
+
+        // bb_ibm → hybrid
+        let c3 = FsiConfig { coupling: "bb_ibm".to_string() };
+        assert_eq!(c3.normalized_coupling(), "hybrid");
+    }
+
+    #[test]
+    fn test_fsi_infer_coupling() {
+        assert_eq!(FsiConfig::infer_coupling(true, true),   "hybrid");
+        assert_eq!(FsiConfig::infer_coupling(false, true),  "ibm");
+        assert_eq!(FsiConfig::infer_coupling(true, false),  "bounce_back");
+        assert_eq!(FsiConfig::infer_coupling(false, false), "none");
+    }
+
+    #[test]
+    fn test_fsi_config_hybrid() {
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+
+            [fsi]
+            coupling = "hybrid"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.normalized_coupling(), "hybrid");
     }
 }

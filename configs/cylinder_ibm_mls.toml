@@ -64,6 +64,9 @@ face    = "north"
 # method = "mls" 使用 mls_interpolate_velocity() 替代标准 Peskin δ 插值
 # 力展布仍使用标准 Peskin δ spread_force（保持力守恒）
 # -----------------------------------------------------------------------------
+[fsi]
+coupling = "ibm"   # ② 纯 IBM 浸入边界法
+
 [ibm]
 geometry     = "circle"
 x0           = 150.0

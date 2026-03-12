@@ -1,4 +1,5 @@
 mod config;
+mod fsi;
 mod output;
 mod python_bridge;
 
@@ -354,28 +355,34 @@ fn run() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // 流固耦合模式解析与校验
+    // -----------------------------------------------------------------------
+    let has_solid = !cfg.solid.bodies.is_empty()
+        && cfg.solid.bc_type.to_lowercase() != "none";
+    let has_ibm   = cfg.ibm.is_some();
+
+    let coupling_mode = fsi::resolve_coupling_mode(&cfg.fsi, has_solid, has_ibm);
+    fsi::validate_coupling_mode(
+        coupling_mode,
+        has_solid,
+        has_ibm,
+        cfg.fsi.normalized_coupling(),
+    )?;
+
+    // -----------------------------------------------------------------------
     // 固体标记与反弹方案设置（读取 [solid] 配置段）
     //
-    // 执行顺序：
+    // 由 fsi::setup_solid_bodies() 统一处理：
     //   1. 遍历 [[solid.bodies]] 列表，依次调用对应几何标记函数
     //   2. 根据 solid.bc_type 设置求解器的固体反弹方案
     //      "bounce_back"             → SolidBCType::BounceBack（半步长，一阶）
     //      "interpolated_bounce_back"→ SolidBCType::InterpolatedBounceBack（Bouzidi，二阶）
     //      其他 / "none"             → 不施加固体边界（仅标记，不反弹）
     //
-    // 注意：圆柱标记会同时计算精确的 IBB 距离分数 q，矩形标记使用默认 q=0.5。
-    // bc_type 别名一览（均等价）：
-    //   "bounce_back"               → BounceBack（半步长，Ladd 1994，一阶精度）
-    //   "interpolated_bounce_back"  → IBB（Bouzidi 2001，二阶精度；别名 "ibb" / "bouzidi"）
-    //   "none" / 其他               → 不施加固体反弹（仅标记，用于调试）
+    // MPI 坐标转换：全局坐标通过 (x_start, y_start, phys_x0, phys_y0) 映射到本地坐标系。
+    // 非 MPI 模式下四个参数均为 0，变换退化为恒等。
     // -----------------------------------------------------------------------
-    if !cfg.solid.bodies.is_empty() {
-        // MPI 模式下全局坐标到本地网格坐标的转换参数：
-        //   local_i = global_i - x_start + phys_x0
-        //   local_j = global_j - y_start + phys_y0
-        //
-        // phys_x0/phys_y0 表示本地网格中物理区域的起始偏移（幽灵层宽度，0 或 1）。
-        // 非 MPI 模式下 x_start=y_start=0, phys_x0=phys_y0=0，变换退化为恒等。
+    if coupling_mode.needs_solid() {
         let (x_start, y_start, phys_x0, phys_y0): (i32, i32, i32, i32) =
             if let Some(ref d) = _decomp3d {
                 (d.x_start(), d.y_start(), d.phys_x0(), d.phys_y0())
@@ -384,88 +391,12 @@ fn run() -> Result<()> {
             } else {
                 (0, 0, 0, 0)
             };
-        // 整数列/行坐标转换（整型版本，用于矩形坐标）
-        let to_local_i = |gi: i32| gi - x_start + phys_x0;
-        let to_local_j = |gj: i32| gj - y_start + phys_y0;
 
-        for body in &cfg.solid.bodies {
-            match body.shape.to_lowercase().as_str() {
-                "cylinder" => {
-                    // 将全局圆心坐标平移到本地网格坐标系
-                    let local_cx = body.cx - x_start as f64 + phys_x0 as f64;
-                    let local_cy = body.cy - y_start as f64 + phys_y0 as f64;
-                    lbm_bindings::mark_solid_cylinder(&mut grid, local_cx, local_cy, body.radius);
-                    if rank == 0 {
-                        println!(
-                            "  [solid] 圆柱标记: center=({:.2}, {:.2}), radius={:.2}",
-                            body.cx, body.cy, body.radius
-                        );
-                    }
-                }
-                "rectangle" => {
-                    // 将全局矩形坐标平移到本地网格坐标系
-                    lbm_bindings::mark_solid_rectangle(
-                        &mut grid,
-                        to_local_i(body.i0), to_local_j(body.j0),
-                        to_local_i(body.i1), to_local_j(body.j1),
-                    );
-                    if rank == 0 {
-                        println!(
-                            "  [solid] 矩形标记: [{}, {}] × [{}, {}]",
-                            body.i0, body.i1, body.j0, body.j1
-                        );
-                    }
-                }
-                "mesh" => {
-                    // 从外部 CSV 网格文件加载固体边界（第三方网格接口）
-                    // 文件中的坐标须为本进程本地坐标（含幽灵层）；
-                    // 若文件坐标为全局坐标，须由用户预处理转换为本地坐标，
-                    // 或使用 to_local_i/to_local_j 在外部预处理脚本中完成转换。
-                    if body.mesh_file.is_empty() {
-                        if rank == 0 {
-                            eprintln!("  [warn] solid.bodies shape=\"mesh\" 但 mesh_file 为空，跳过");
-                        }
-                    } else {
-                        lbm_bindings::mark_solid_from_mesh_file(&mut grid, &body.mesh_file);
-                        if rank == 0 {
-                            println!(
-                                "  [solid] 网格文件标记: file={:?}",
-                                body.mesh_file
-                            );
-                        }
-                    }
-                }
-                other => {
-                    if rank == 0 {
-                        eprintln!("  [warn] 未知固体形状 {:?}，跳过", other);
-                    }
-                }
-            }
-        }
-
-        let bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
-            "bounce_back"              => 1_i32,
-            "interpolated_bounce_back" | "ibb" | "bouzidi" => 2_i32,
-            _ => 0_i32,  // "none" 或未知
-        };
-        lbm_bindings::mark_solid_bc(&mut solver, bc_mode);
-        if rank == 0 {
-            let scheme_name = match bc_mode {
-                1 => "BounceBack（半步长反弹，Ladd 1994，一阶精度）",
-                2 => "InterpolatedBounceBack（Bouzidi 插值反弹，2001，二阶精度）",
-                _ => "None（固体节点已标记，但不施加反弹，仅用于调试）",
-            };
-            println!("  [solid] 反弹方案: {}", scheme_name);
-            if cfg.solid.force_output.enabled {
-                println!("  [solid] 受力统计: 每 {} 步输出到 {}/{}.csv（动量交换法，MEA）",
-                    cfg.solid.force_output.interval,
-                    cfg.output.directory,
-                    cfg.solid.force_output.filename);
-                if nprocs > 1 {
-                    println!("  [solid] MPI 受力统计: 各进程局部贡献通过 MPI_Allreduce 求和");
-                }
-            }
-        }
+        fsi::setup_solid_bodies(
+            &cfg, &mut grid, &mut solver,
+            x_start, y_start, phys_x0, phys_y0,
+            rank,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -679,138 +610,20 @@ fn run() -> Result<()> {
     // -----------------------------------------------------------------------
     // IBM 标记点集（在时间循环外创建，在循环内每步调用对应 IBM 方案）
     //
-    // 支持三种耦合模式（可通过 TOML 配置组合使用）：
-    //   ①仅 BB/IBB  — 只配置 [solid] 段（无 [ibm] 段）
-    //   ②仅 IBM     — 只配置 [ibm] 段（无 [solid] 段或 solid.bc_type="none"）
-    //   ③混合 BB+IBM — 同时配置 [solid] 和 [ibm] 段
-    //
-    // 多体 IBM：在 [ibm] 下用 [[ibm.bodies]] 列表描述每个 IBM 固体体；
-    //   若 bodies 为空则回退到顶层单体字段（向后兼容）。
+    // 由 fsi::setup_ibm_bodies() 统一处理（支持多体 IBM 和单体向后兼容）：
+    //   ①仅 BB/IBB  — coupling_mode=BounceBack，ibm_entries 为空
+    //   ②仅 IBM     — coupling_mode=Ibm，ibm_entries 包含全部 IBM 体
+    //   ③混合 BB+IBM — coupling_mode=Hybrid，固体标记 + ibm_entries 均有效
     // -----------------------------------------------------------------------
+    let mut ibm_entries: Vec<fsi::IbmEntry> = if coupling_mode.needs_ibm() {
+        fsi::setup_ibm_bodies(&cfg, rank)?
+    } else {
+        Vec::new()
+    };
 
-    // 每个 IBM 体的运行时状态（标记点集 + 受力输出配置）
-    struct IbmEntry {
-        ms:        lbm_bindings::LbmIbmMarkerSet,
-        label:     String,
-        force_cfg: config::SolidForceOutputConfig,
-    }
-
-    let mut ibm_entries: Vec<IbmEntry> = Vec::new();
-
-    if let Some(ref ibm_cfg) = cfg.ibm {
-        // 确定使用的体列表（多体优先，否则退化为顶层单体字段）
-        let single_body_list: Vec<config::IbmBodyConfig>;
-        let effective_bodies: &[config::IbmBodyConfig] = if ibm_cfg.bodies.is_empty() {
-            if !ibm_cfg.geometry.is_empty() {
-                single_body_list = vec![config::IbmBodyConfig {
-                    geometry:     ibm_cfg.geometry.clone(),
-                    x0:           ibm_cfg.x0,
-                    y0:           ibm_cfg.y0,
-                    size:         ibm_cfg.size,
-                    n_markers:    ibm_cfg.n_markers,
-                    mesh_file:    ibm_cfg.mesh_file.clone(),
-                    label:        String::new(),
-                    force_output: None,
-                }];
-                &single_body_list
-            } else {
-                single_body_list = vec![];
-                &single_body_list
-            }
-        } else {
-            &ibm_cfg.bodies
-        };
-
-        // 打印 IBM 全局方案说明（rank-0 只打印一次）
-        if rank == 0 && !effective_bodies.is_empty() {
-            let method_name = match ibm_cfg.method.to_lowercase().as_str() {
-                "penalty" => format!(
-                    "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
-                    ibm_cfg.alpha, ibm_cfg.beta,
-                ),
-                "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
-                _     => format!("MDF-IBM（多重直接力，Luo 2007，n_iter={}）", ibm_cfg.n_iter),
-            };
-            println!("  [IBM] 方案: {}  δ核: {}  固体体数: {}",
-                     method_name, ibm_cfg.delta_kernel, effective_bodies.len());
-        }
-
-        // 逐体创建标记点集
-        for (body_idx, body) in effective_bodies.iter().enumerate() {
-            let ms = match body.geometry.to_lowercase().as_str() {
-                "file" => {
-                    if body.mesh_file.is_empty() {
-                        anyhow::bail!(
-                            "[IBM] 第 {} 体 geometry=\"file\" 但 mesh_file 未设置，\
-                             请在 [[ibm.bodies]] 中添加 mesh_file = \"path/to/markers.csv\"",
-                            body_idx
-                        );
-                    }
-                    lbm_bindings::LbmIbmMarkerSet::new_from_file(&body.mesh_file)
-                        .map_err(|e| anyhow::anyhow!("{}", e))?
-                }
-                "filament" => {
-                    lbm_bindings::LbmIbmMarkerSet::new_filament(
-                        body.x0, body.y0, body.size, body.n_markers,
-                    )
-                }
-                _ => {
-                    lbm_bindings::LbmIbmMarkerSet::new_circle(
-                        body.x0, body.y0, body.size, body.n_markers,
-                    )
-                }
-            };
-
-            let label = if body.label.is_empty() {
-                format!("ibm_body_{}", body_idx)
-            } else {
-                body.label.clone()
-            };
-
-            let force_cfg = body.force_output.clone()
-                .unwrap_or_else(|| ibm_cfg.force_output.clone());
-
-            if rank == 0 {
-                let geom_info = match body.geometry.to_lowercase().as_str() {
-                    "file"     => format!("file={:?}", body.mesh_file),
-                    "filament" => format!("起点: ({}, {})  长度: {}",
-                                         body.x0, body.y0, body.size),
-                    _          => format!("圆心: ({}, {})  半径: {}",
-                                         body.x0, body.y0, body.size),
-                };
-                println!(
-                    "  [IBM] 体[{}] 标签={:?}  标记点数: {}  几何: {}",
-                    body_idx, label, ms.len(), geom_info
-                );
-                if force_cfg.enabled {
-                    println!("  [IBM] 体[{}] 受力统计: 每 {} 步输出到 {}/{}.csv",
-                             body_idx, force_cfg.interval,
-                             cfg.output.directory, force_cfg.filename);
-                }
-            }
-
-            ibm_entries.push(IbmEntry {
-                ms,
-                label,
-                force_cfg,
-            });
-        }
-
-        // 打印耦合模式提示（rank-0）
-        if rank == 0 && !ibm_entries.is_empty() {
-            let has_solid_bb = !cfg.solid.bodies.is_empty()
-                && cfg.solid.bc_type.to_lowercase() != "none";
-            if has_solid_bb {
-                println!("  [FSI] 耦合模式: ③ 混合 BB/IBB + IBM（反弹格式 + 浸入边界法）");
-            } else {
-                println!("  [FSI] 耦合模式: ② 纯 IBM（浸入边界法）");
-            }
-        }
-    } else if rank == 0
-        && !cfg.solid.bodies.is_empty()
-        && cfg.solid.bc_type.to_lowercase() != "none"
-    {
-        println!("  [FSI] 耦合模式: ① 纯 BB/IBB（反弹格式）");
+    // 打印 FSI 耦合模式提示（rank-0）
+    if rank == 0 && coupling_mode != fsi::FsiCouplingMode::None {
+        println!("  [FSI] 耦合模式: {}", coupling_mode.description());
     }
 
     if rank == 0 {
