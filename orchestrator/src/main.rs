@@ -86,28 +86,28 @@ fn run() -> Result<()> {
         lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
     }
 
-    // 进程头部信息：仅 rank-0 打印（避免 MPI 多进程重复输出）。
+    // Print header from rank-0 only (avoid duplicate output in MPI mode).
     if rank == 0 {
-        println!("=== LBM-IBM-FSI 求解器 ===");
-        println!("配置文件 : {}", args.config.display());
-        println!("网格     : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
-        println!("步数     : {}", cfg.simulation.n_steps);
-        println!("模型     : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
-        println!("松弛频率 : ω = {:.6}", cfg.omega());
-        println!("输出格式 : {} → {}", cfg.output.format, {
+        println!("=== LBM-IBM-FSI Solver ===");
+        println!("Config   : {}", args.config.display());
+        println!("Grid     : {}x{}x{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
+        println!("Steps    : {}", cfg.simulation.n_steps);
+        println!("Model    : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
+        println!("Omega    : w = {:.6}", cfg.omega());
+        println!("Output   : {} -> {}", cfg.output.format, {
             match cfg.output.format.as_str() {
-                "tecplot_asc" => "fluid_NNNNNN.dat（ASCII Tecplot）",
-                "tecplot_bin" => "fluid_NNNNNN.plt（二进制 Tecplot TDV112）",
-                _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
+                "tecplot_asc" => "fluid_NNNNNN.dat (ASCII Tecplot)",
+                "tecplot_bin" => "fluid_NNNNNN.plt (binary Tecplot TDV112)",
+                _             => "fluid_NNNNNN.npz (NumPy compressed archive)",
             }
         });
         if cfg.parallel.omp_num_threads > 0 {
-            println!("OpenMP   : 线程数 = {}（由 [parallel].omp_num_threads 设置）",
+            println!("OpenMP   : threads = {} (set by [parallel].omp_num_threads)",
                      cfg.parallel.omp_num_threads);
         }
         lbm_bindings::print_parallel_status();
 
-        // 打印 MPI 模式信息
+        // Print MPI mode summary
         {
             let (norm_mode, _) = cfg.mpi.normalized_mode();
             match norm_mode {
@@ -115,18 +115,18 @@ fn run() -> Result<()> {
                     let (px, py) = cfg.mpi.effective_blocks(nprocs);
                     let pz = cfg.mpi.nz_blocks.max(1);
                     if pz > 1 {
-                        println!("MPI模式  : 三维块分解 {}×{}×{}", px, py, pz);
+                        println!("MPI mode : 3D block decomp {}x{}x{}", px, py, pz);
                     } else if px == 1 {
-                        println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
+                        println!("MPI mode : 1D Y-slice (ny_blocks={})", py);
                     } else if py == 1 {
-                        println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
+                        println!("MPI mode : 1D X-slice (nx_blocks={})", px);
                     } else {
-                        println!("MPI模式  : 二维块分解 {}×{}", px, py);
+                        println!("MPI mode : 2D block decomp {}x{}", px, py);
                     }
                 }
-                "multigrid"   => println!("MPI模式  : 嵌套多重网格（框架模式，当前退化为独立）"),
-                "independent" => println!("MPI模式  : 多进程独立（每进程独立仿真，无通信）"),
-                _             => println!("MPI模式  : {}", cfg.mpi.mode),
+                "multigrid"   => println!("MPI mode : nested multigrid (framework mode, currently degrades to independent)"),
+                "independent" => println!("MPI mode : independent (each rank runs its own full simulation, no communication)"),
+                _             => println!("MPI mode : {}", cfg.mpi.mode),
             }
         }
 
@@ -232,7 +232,7 @@ fn run() -> Result<()> {
     if mode_was_renamed && nprocs > 1 {
         eprintln!(
             "[info] mpi.mode {:?} is deprecated; using {:?}. \
-             See docs/MPI并行详解.md for the new mode names.",
+             See docs/MPI_parallel.md for the new mode names.",
             cfg.mpi.mode, effective_mode
         );
     }
@@ -295,9 +295,10 @@ fn run() -> Result<()> {
             // "multigrid" 当前版本退化为独立模式
             if effective_mode == "multigrid" && nprocs > 1 {
                 eprintln!(
-                    "[info] mode=\"multigrid\": MgTree 框架已就绪 \
-                     (LbmMgTree/MgNode)；本版本退化为独立模式（每进程运行完整网格）。\
-                     请通过 lbm_bindings::LbmMgTree API 配置嵌套关系。"
+                    "[info] mode=\"multigrid\": MgTree framework is ready \
+                     (LbmMgTree/MgNode); this version degrades to independent mode \
+                     (each rank runs the full grid). Configure nesting via the \
+                     lbm_bindings::LbmMgTree API."
                 );
             }
         }
@@ -324,7 +325,7 @@ fn run() -> Result<()> {
         use std::io::Write;
         for r in 0..nprocs {
             if rank == r {
-                print!("  rank {} 本地网格: {}×{}×{}\n", rank, grid_nx, grid_ny, grid_nz);
+                print!("  rank {} local grid: {}x{}x{}\n", rank, grid_nx, grid_ny, grid_nz);
                 let _ = std::io::stdout().flush();
             }
             lbm_bindings::mpi_barrier();
