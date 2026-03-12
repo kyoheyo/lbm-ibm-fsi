@@ -436,6 +436,28 @@ impl MpiRunConfig {
         };
         (px, py)
     }
+
+    /// 计算有效的 (nx_blocks, ny_blocks, nz_blocks)：
+    /// - `ny_blocks == 0` 且 `nz_blocks <= 1` 时，退化为 1D Y 切片
+    /// - 当 `nz_blocks > 1` 时启用三维分解（Z 方向切分）
+    ///
+    /// 注意：此函数仅按整除方式估算 py；调用方须在使用前验证
+    ///   px * py * pz == nprocs，不满足时应回退到兼容分解（参见 main.rs 中的检查）。
+    pub fn effective_blocks_3d(&self, nprocs: i32) -> (u32, u32, u32) {
+        let pz = self.nz_blocks.max(1);
+        let px = self.nx_blocks.max(1);
+        let py = if self.ny_blocks == 0 && pz == 1 {
+            // 2D 模式：均匀分配给 Y 方向
+            (nprocs as u32).max(1) / px
+        } else if self.ny_blocks == 0 {
+            // 3D 模式：剩余进程均匀分配给 Y 方向（nprocs / (px * pz)）
+            let rem = (nprocs as u32).max(1) / (px * pz);
+            rem.max(1)
+        } else {
+            self.ny_blocks.max(1)
+        };
+        (px, py, pz)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -718,6 +718,84 @@ int lbm_mpi_decomp3d_z_start(const MpiDecomp3DHandle* h) {
     return h ? reinterpret_cast<const lbm::MpiDecomp3D*>(h)->z_start : 0;
 }
 
+/// 返回三维分解中本进程的物理列数（不含幽灵列）
+int lbm_mpi_decomp3d_local_nx(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->local_nx;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回三维分解中本进程的物理行数（不含幽灵行）
+int lbm_mpi_decomp3d_local_ny(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->local_ny;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回三维分解中本进程的物理层数（不含幽灵层）
+int lbm_mpi_decomp3d_local_nz(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->local_nz;
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回物理区域在本地网格中的 X 偏移（0 或 1；存在西幽灵列时为 1）
+int lbm_mpi_decomp3d_phys_x0(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->phys_x0();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回物理区域在本地网格中的 Y 偏移（0 或 1；存在南幽灵行时为 1）
+int lbm_mpi_decomp3d_phys_y0(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->phys_y0();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 返回物理区域在本地网格中的 Z 偏移（0 或 1；存在底幽灵层时为 1）
+int lbm_mpi_decomp3d_phys_z0(const MpiDecomp3DHandle* h)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!h) return 0;
+    return reinterpret_cast<const lbm::MpiDecomp3D*>(h)->phys_z0();
+#else
+    (void)h; return 0;
+#endif
+}
+
+/// 将 MpiDecomp3D 绑定到求解器；之后每次 step() 自动执行三维幽灵层交换。
+/// Rust 封装: LbmSolver::attach_mpi3d() — bindings/src/lib.rs
+void lbm_solver_attach_mpi3d(lbm::Solver* s, MpiDecomp3DHandle* h)
+{
+    if (!s) return;
+#ifdef LBM_ENABLE_MPI
+    s->attach_mpi3d(reinterpret_cast<const lbm::MpiDecomp3D*>(h));
+#else
+    (void)h;
+#endif
+}
+
 } // extern "C"
 
 // ===========================================================================

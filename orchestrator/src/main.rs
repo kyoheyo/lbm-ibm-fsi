@@ -113,7 +113,10 @@ fn run() -> Result<()> {
             match norm_mode {
                 "block" => {
                     let (px, py) = cfg.mpi.effective_blocks(nprocs);
-                    if px == 1 {
+                    let pz = cfg.mpi.nz_blocks.max(1);
+                    if pz > 1 {
+                        println!("MPI模式  : 三维块分解 {}×{}×{}", px, py, pz);
+                    } else if px == 1 {
                         println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
                     } else if py == 1 {
                         println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
@@ -239,26 +242,52 @@ fn run() -> Result<()> {
     // 声明持有者以延长生命周期到仿真循环结束
     // -----------------------------------------------------------------------
     let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
+    let mut _decomp3d: Option<lbm_bindings::LbmMpiDecomp3D> = None;
+
+    // 是否启用三维 Z 方向分解（nz > 1 且 nz_blocks > 1）
+    let use_3d_decomp = cfg.fluid.nz > 1 && cfg.mpi.nz_blocks > 1;
 
     match effective_mode {
         "block" => {
-            // 旧模式 "1d_y" → nx_blocks=1, ny_blocks=nprocs（1D Y 切片）
-            let (px, py): (u32, u32) = if cfg.mpi.mode == "1d_y" {
-                (1, nprocs as u32)
+            if use_3d_decomp {
+                // 三维 XYZ 块分解
+                let (px, py, pz) = if cfg.mpi.mode == "1d_y" {
+                    (1, nprocs as u32, 1)
+                } else {
+                    cfg.mpi.effective_blocks_3d(nprocs)
+                };
+                if px as i32 * py as i32 * pz as i32 != nprocs {
+                    eprintln!(
+                        "[warn] mpi nx_blocks({}) * ny_blocks({}) * nz_blocks({}) = {} ≠ nprocs({}). \
+                         Falling back to 1D Y slice.",
+                        px, py, pz, px as i32 * py as i32 * pz as i32, nprocs
+                    );
+                    _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                        cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+                } else {
+                    _decomp3d = lbm_bindings::LbmMpiDecomp3D::new(
+                        cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32,
+                        px as i32, py as i32, pz as i32);
+                }
             } else {
-                cfg.mpi.effective_blocks(nprocs)
-            };
-            if px as i32 * py as i32 != nprocs {
-                eprintln!(
-                    "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
-                     Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).",
-                    px, py, px as i32 * py as i32, nprocs
-                );
-                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
-            } else {
-                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32);
+                // 旧模式 "1d_y" → nx_blocks=1, ny_blocks=nprocs（1D Y 切片）
+                let (px, py): (u32, u32) = if cfg.mpi.mode == "1d_y" {
+                    (1, nprocs as u32)
+                } else {
+                    cfg.mpi.effective_blocks(nprocs)
+                };
+                if px as i32 * py as i32 != nprocs {
+                    eprintln!(
+                        "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
+                         Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).",
+                        px, py, px as i32 * py as i32, nprocs
+                    );
+                    _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                        cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+                } else {
+                    _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
+                        cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32);
+                }
             }
         }
         "independent" | "multigrid" => {
@@ -280,15 +309,26 @@ fn run() -> Result<()> {
     }
 
     // 确定本进程实际使用的网格尺寸（从已创建的分解对象中读取）
-    let (grid_nx, grid_ny, grid_nz) = if let Some(ref d) = _decomp2d {
+    let (grid_nx, grid_ny, grid_nz) = if let Some(ref d) = _decomp3d {
+        (d.grid_nx(), d.grid_ny(), d.grid_nz())
+    } else if let Some(ref d) = _decomp2d {
         (d.grid_nx(), d.grid_ny(), cfg.fluid.nz as i32)
     } else {
         // "independent" / "multigrid" / 未启用 MPI：使用完整全局网格
         (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
     };
 
+    // 各进程依次顺序打印本地网格信息，避免并发写入 stdout 导致 UTF-8 序列损坏
+    // （MPI 并行时多进程同时写 stdout，多字节字符序列可能被截断/乱序）
     if nprocs > 1 {
-        println!("本地网格  : rank={} → {}×{}×{}", rank, grid_nx, grid_ny, grid_nz);
+        use std::io::Write;
+        for r in 0..nprocs {
+            if rank == r {
+                print!("  rank {} 本地网格: {}×{}×{}\n", rank, grid_nx, grid_ny, grid_nz);
+                let _ = std::io::stdout().flush();
+            }
+            lbm_bindings::mpi_barrier();
+        }
     }
 
     // 初始化流体格子网格
@@ -300,7 +340,9 @@ fn run() -> Result<()> {
     // -----------------------------------------------------------------------
     // MPI 域分解绑定：将已创建的分解对象绑定到求解器
     // -----------------------------------------------------------------------
-    if let Some(ref mut d) = _decomp2d {
+    if let Some(ref mut d) = _decomp3d {
+        solver.attach_mpi3d(Some(d));
+    } else if let Some(ref mut d) = _decomp2d {
         solver.attach_mpi2d(Some(d));
     }
 
@@ -354,9 +396,25 @@ fn run() -> Result<()> {
         };
 
         // MPI 块分解：仅在本进程持有该物理壁面时注册边界条件。
-        // 判断依据：x_start/y_start + local_nx/local_ny 是否触及全局边界。
+        // 判断依据：x_start/y_start/z_start + local_* 是否触及全局边界。
         let apply_bc = if effective_mode == "block" && nprocs > 1 {
-            if let Some(ref d) = _decomp2d {
+            if let Some(ref d) = _decomp3d {
+                let x_start  = d.x_start()  as u64;
+                let y_start  = d.y_start()  as u64;
+                let z_start  = d.z_start()  as u64;
+                let local_nx = d.local_nx() as u64;
+                let local_ny = d.local_ny() as u64;
+                let local_nz = d.local_nz() as u64;
+                let gnx = cfg.fluid.nx; let gny = cfg.fluid.ny; let gnz = cfg.fluid.nz;
+                match face {
+                    Face::South  => y_start == 0,
+                    Face::North  => y_start + local_ny == gny as u64,
+                    Face::West   => x_start == 0,
+                    Face::East   => x_start + local_nx == gnx as u64,
+                    Face::Bottom => z_start == 0,
+                    Face::Top    => z_start + local_nz == gnz as u64,
+                }
+            } else if let Some(ref d) = _decomp2d {
                 let x_start  = d.x_start()  as u64;
                 let y_start  = d.y_start()  as u64;
                 let local_nx = d.local_nx() as u64;
@@ -368,7 +426,7 @@ fn run() -> Result<()> {
                     Face::North  => y_start + local_ny == gny as u64,
                     Face::West   => x_start == 0,
                     Face::East   => x_start + local_nx == gnx as u64,
-                    // Bottom/Top 用于三维，非分解方向，所有进程均注册
+                    // Bottom/Top 用于三维，非 2D 分解方向，所有进程均注册
                     _            => true,
                 }
             } else {
@@ -384,11 +442,14 @@ fn run() -> Result<()> {
                 bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
                 bc_cfg.rho,
             );
-            println!(
-                "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
-                bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
-            );
-        } else {
+            // 仅 rank-0 打印，避免多进程并发写 stdout 导致 UTF-8 序列乱码
+            if rank == 0 {
+                println!(
+                    "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
+                    bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
+                );
+            }
+        } else if rank == 0 {
             println!(
                 "  BC skipped (not this rank's boundary): {:?} on {:?} face",
                 bc_type, face
@@ -400,16 +461,30 @@ fn run() -> Result<()> {
     // 构造 MPI 块分解分区信息（用于输出时剥离幽灵行/列并嵌入元数据）
     // -----------------------------------------------------------------------
     let partition: Option<PartitionInfo> = if effective_mode == "block" && nprocs > 1 {
-        _decomp2d.as_ref().map(|d| PartitionInfo {
-            phys_x0:   d.phys_x0()  as usize,
-            phys_y0:   d.phys_y0()  as usize,
-            local_nx:  d.local_nx() as usize,
-            local_ny:  d.local_ny() as usize,
-            x_start:   d.x_start()  as usize,
-            y_start:   d.y_start()  as usize,
-            global_nx: cfg.fluid.nx as usize,
-            global_ny: cfg.fluid.ny as usize,
-        })
+        // 3D 分解时，使用 3D decomp 的 x/y 分区信息（z 方向暂由合并层处理）
+        if let Some(ref d) = _decomp3d {
+            Some(PartitionInfo {
+                phys_x0:   d.phys_x0()  as usize,
+                phys_y0:   d.phys_y0()  as usize,
+                local_nx:  d.local_nx() as usize,
+                local_ny:  d.local_ny() as usize,
+                x_start:   d.x_start()  as usize,
+                y_start:   d.y_start()  as usize,
+                global_nx: cfg.fluid.nx as usize,
+                global_ny: cfg.fluid.ny as usize,
+            })
+        } else {
+            _decomp2d.as_ref().map(|d| PartitionInfo {
+                phys_x0:   d.phys_x0()  as usize,
+                phys_y0:   d.phys_y0()  as usize,
+                local_nx:  d.local_nx() as usize,
+                local_ny:  d.local_ny() as usize,
+                x_start:   d.x_start()  as usize,
+                y_start:   d.y_start()  as usize,
+                global_nx: cfg.fluid.nx as usize,
+                global_ny: cfg.fluid.ny as usize,
+            })
+        }
     } else {
         None
     };

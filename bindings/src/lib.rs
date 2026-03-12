@@ -141,7 +141,7 @@ mod ffi {
         /// 返回物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；1 = 有南幽灵行）。
         pub fn lbm_mpi_decomp2d_phys_y0(h: *const MpiDecomp2DHandle) -> c_int;
 
-        // --- MPI 三维块分解接口（预留，幽灵交换暂未实现）---
+        // --- MPI 三维块分解接口（Z 方向幽灵层交换已实现）---
         pub fn lbm_mpi_decomp3d_new(gnx: c_int, gny: c_int, gnz: c_int,
                                     px: c_int, py: c_int, pz: c_int) -> *mut MpiDecomp3DHandle;
         pub fn lbm_mpi_decomp3d_free(h: *mut MpiDecomp3DHandle);
@@ -151,6 +151,14 @@ mod ffi {
         pub fn lbm_mpi_decomp3d_x_start(h: *const MpiDecomp3DHandle) -> c_int;
         pub fn lbm_mpi_decomp3d_y_start(h: *const MpiDecomp3DHandle) -> c_int;
         pub fn lbm_mpi_decomp3d_z_start(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_local_nx(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_local_ny(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_local_nz(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_phys_x0(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_phys_y0(h: *const MpiDecomp3DHandle) -> c_int;
+        pub fn lbm_mpi_decomp3d_phys_z0(h: *const MpiDecomp3DHandle) -> c_int;
+        /// 将 MpiDecomp3D 绑定到求解器（启用 3D 幽灵层自动交换）。
+        pub fn lbm_solver_attach_mpi3d(s: *mut SolverHandle, h: *mut MpiDecomp3DHandle);
 
         // --- 多重网格树接口 — 实现于 core/src/capi/lbm_capi.cpp ---
         /// 创建多重网格树。x0..x1 × y0..y1 × z0..z1 为根节点（最粗网格）空间范围。
@@ -616,6 +624,13 @@ impl LbmSolver {
         let h = decomp.map_or(std::ptr::null_mut(), |d| d.as_mut_ptr());
         unsafe { ffi::lbm_solver_attach_mpi2d(self.ptr, h) };
     }
+
+    /// 绑定 MPI 三维（XYZ 方向）块分解：之后每次 `step()` 自动执行 3D 幽灵层交换。
+    /// 传入 `None` 可解除绑定。
+    pub fn attach_mpi3d(&mut self, decomp: Option<&mut LbmMpiDecomp3D>) {
+        let h = decomp.map_or(std::ptr::null_mut(), |d| d.as_mut_ptr());
+        unsafe { ffi::lbm_solver_attach_mpi3d(self.ptr, h) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,14 +708,13 @@ impl Drop for LbmMpiDecomp2D {
 }
 
 // ---------------------------------------------------------------------------
-/// 三维（XYZ 方向）MPI 块分解描述符（预留接口，幽灵交换暂未实现）
+/// 三维（XYZ 方向）MPI 块分解描述符（支持 D3Q19/D3Q27 幽灵层交换）
 ///
 /// 当 `pz=1` 时等价于 [`LbmMpiDecomp2D`]；当 `pz=1, py=1` 时等价于 1D X 切片。
 ///
 /// # 用途
-/// - 记录三维并行分解的空间范围和进程坐标
-/// - 可绑定到 [`MgNode::decomp`] 作为三维层次分解的并行描述
-/// - 幽灵层交换（6 方向）待 3D LBM 求解器实现后启用
+/// - 三维 LBM 并行域分解（D3Q19/D3Q27）
+/// - 绑定到求解器后，每步自动执行 6 方向幽灵层交换（Z/Y/X）
 ///
 /// # 示例（框架，无 MPI 时 px*py*pz 须为 1）
 /// ```no_run
@@ -737,6 +751,18 @@ impl LbmMpiDecomp3D {
     pub fn y_start(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_y_start(self.ptr) } }
     /// 本进程物理区域在全局坐标中的 Z 起始坐标
     pub fn z_start(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_z_start(self.ptr) } }
+    /// 本进程物理列数（不含幽灵列）
+    pub fn local_nx(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_local_nx(self.ptr) } }
+    /// 本进程物理行数（不含幽灵行）
+    pub fn local_ny(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_local_ny(self.ptr) } }
+    /// 本进程物理层数（不含幽灵层）
+    pub fn local_nz(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_local_nz(self.ptr) } }
+    /// 物理区域在本地网格中的 X 偏移（0 或 1）
+    pub fn phys_x0(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_phys_x0(self.ptr) } }
+    /// 物理区域在本地网格中的 Y 偏移（0 或 1）
+    pub fn phys_y0(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_phys_y0(self.ptr) } }
+    /// 物理区域在本地网格中的 Z 偏移（0 或 1）
+    pub fn phys_z0(&self) -> i32 { unsafe { ffi::lbm_mpi_decomp3d_phys_z0(self.ptr) } }
 
     #[doc(hidden)]
     pub fn as_mut_ptr(&mut self) -> *mut ffi::MpiDecomp3DHandle { self.ptr }
