@@ -102,9 +102,22 @@ void compute_ibb_distances(LatticeGrid& grid);
 // 应在 stream() 之后调用。
 // 内核：f[opp(a)](x_f) = f_tmp[a](x_f)（g.f_tmp 含碰后值）。
 //
-// @param grid  格子网格（须已设置 solid 标志）
+// @param grid         格子网格（须已设置 solid 标志）
+// @param phys_i0      物理列起始索引（本地坐标，含）；非 MPI 时为 0
+// @param phys_j0      物理行起始索引（本地坐标，含）；非 MPI 时为 0
+// @param phys_i1      物理列结束索引（本地坐标，含）；非 MPI 时为 nx-1
+// @param phys_j1      物理行结束索引（本地坐标，含）；非 MPI 时为 ny-1
+//
+// MPI 模式下须传入物理区域范围以跳过幽灵节点，否则传入全网格范围。
+// 无参版本（向后兼容）自动使用全网格范围 [0, nx-1] × [0, ny-1]。
 // ---------------------------------------------------------------------------
 void apply_solid_bounce_back(LatticeGrid& grid);
+
+/// MPI 适配版：仅对物理区域 [phys_i0, phys_i1] × [phys_j0, phys_j1] 内的节点施加 BB。
+/// 幽灵节点（超出物理范围的行/列）将被跳过，避免幽灵数据被错误覆盖。
+void apply_solid_bounce_back(LatticeGrid& grid,
+                              int phys_i0, int phys_j0,
+                              int phys_i1, int phys_j1);
 
 // ---------------------------------------------------------------------------
 // 对固体节点施加 Bouzidi 插值反弹（IBB）
@@ -113,7 +126,15 @@ void apply_solid_bounce_back(LatticeGrid& grid);
 // 若 q_ibb 未填充（仍为默认 0.5），则退化为标准半步长反弹。
 //
 // @param grid  格子网格（须已设置 solid 标志，且 q_ibb 已由 mark_solid_*() 填充）
+//
+// MPI 版本同 apply_solid_bounce_back，传入物理区域范围以跳过幽灵节点。
+// 上游节点的 f_tmp 值允许来自幽灵行（幽灵行在 halo_exchange 后含正确碰后值）。
 // ---------------------------------------------------------------------------
 void apply_solid_ibb(LatticeGrid& grid);
+
+/// MPI 适配版：仅对物理区域 [phys_i0, phys_i1] × [phys_j0, phys_j1] 内的节点施加 IBB。
+void apply_solid_ibb(LatticeGrid& grid,
+                     int phys_i0, int phys_j0,
+                     int phys_i1, int phys_j1);
 
 } // namespace lbm

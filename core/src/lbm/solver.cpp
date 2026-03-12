@@ -63,62 +63,61 @@ void Solver::step()
     collide();
     stream();
 
+    // -----------------------------------------------------------------------
+    // 计算本地物理区域范围（MPI 模式下跳过幽灵行/列）
+    //
+    // pb 同时供固体 BC（apply_solid_bounce_back / apply_solid_ibb）
+    // 和面 BC（apply_boundary_conditions）使用，避免重复计算。
+    // -----------------------------------------------------------------------
+    PhysicalBounds pb;
+    pb.j_s = 0;
+    pb.j_n = grid_.ny - 1;
+    pb.i_w = 0;
+    pb.i_e = grid_.nx - 1;
+#ifdef LBM_ENABLE_MPI
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        // 1D Y-切片：幽灵在 j=0（南）和 j=local_ny+1（北）
+        pb.j_s = 1;
+        pb.j_n = grid_.ny - 2;   // = local_ny
+        pb.has_south_wall = mpi_decomp_->has_south_wall();
+        pb.has_north_wall = mpi_decomp_->has_north_wall();
+        pb.has_west_wall  = true;
+        pb.has_east_wall  = true;
+    }
+    if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+        pb.j_s = mpi_decomp2d_->phys_y0();
+        pb.j_n = mpi_decomp2d_->phys_y0() + mpi_decomp2d_->local_ny - 1;
+        pb.i_w = mpi_decomp2d_->phys_x0();
+        pb.i_e = mpi_decomp2d_->phys_x0() + mpi_decomp2d_->local_nx - 1;
+        pb.has_south_wall = mpi_decomp2d_->has_south_wall();
+        pb.has_north_wall = mpi_decomp2d_->has_north_wall();
+        pb.has_west_wall  = mpi_decomp2d_->has_west_wall();
+        pb.has_east_wall  = mpi_decomp2d_->has_east_wall();
+    }
+    if (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1) {
+        pb.j_s = mpi_decomp3d_->phys_y0();
+        pb.j_n = mpi_decomp3d_->phys_y0() + mpi_decomp3d_->local_ny - 1;
+        pb.i_w = mpi_decomp3d_->phys_x0();
+        pb.i_e = mpi_decomp3d_->phys_x0() + mpi_decomp3d_->local_nx - 1;
+        pb.has_south_wall = mpi_decomp3d_->has_south_wall();
+        pb.has_north_wall = mpi_decomp3d_->has_north_wall();
+        pb.has_west_wall  = mpi_decomp3d_->has_west_wall();
+        pb.has_east_wall  = mpi_decomp3d_->has_east_wall();
+    }
+#endif
+
     // 施加固体节点反弹边界条件（BB 或 IBB）
     // 固体 BC 在面 BC 之前施加，以确保面 BC（Zou-He 等）具有更高优先级（最后写入）。
+    // MPI 模式下仅对物理区域 [pb.i_w, pb.i_e] × [pb.j_s, pb.j_n] 施加，
+    // 跳过幽灵节点，防止幽灵行的 f 被错误覆盖。
     if (solid_bc_type_ == SolidBCType::BounceBack) {
-        apply_solid_bounce_back(grid_);
+        apply_solid_bounce_back(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
     } else if (solid_bc_type_ == SolidBCType::InterpolatedBounceBack) {
-        apply_solid_ibb(grid_);
+        apply_solid_ibb(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
     }
 
     // 施加通过 add_boundary_condition() 注册的边界条件
     if (!bcs_.empty()) {
-        // 计算物理边界在本地网格中的行/列范围。
-        // MPI 模式下本地网格含幽灵层，须跳过幽灵行/列，否则 BC 会错误覆盖幽灵数据。
-        PhysicalBounds pb;
-        pb.j_s = 0;
-        pb.j_n = grid_.ny - 1;
-        pb.i_w = 0;
-        pb.i_e = grid_.nx - 1;
-#ifdef LBM_ENABLE_MPI
-        if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-            // 1D Y-切片：幽灵在 j=0（南）和 j=local_ny+1（北）
-            pb.j_s = 1;
-            pb.j_n = grid_.ny - 2;   // = local_ny（幽灵层已各占一行）
-            // 只有持有全局南/北壁的进程才应施加 South/North 面 BC；
-            // 内部进程 pb.j_s=1 是内部物理行，不是壁面——必须设为 false
-            // 以防 BounceBack/ZouHe 等 BC 错误施加并造成分块边界处速度阶跃。
-            pb.has_south_wall = mpi_decomp_->has_south_wall();
-            pb.has_north_wall = mpi_decomp_->has_north_wall();
-            // 1D Y 切片：所有进程均拥有完整 X 范围（西/东壁不受 Y 分解影响）
-            pb.has_west_wall  = true;
-            pb.has_east_wall  = true;
-        }
-        if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
-            pb.j_s = mpi_decomp2d_->phys_y0();
-            pb.j_n = mpi_decomp2d_->phys_y0() + mpi_decomp2d_->local_ny - 1;
-            pb.i_w = mpi_decomp2d_->phys_x0();
-            pb.i_e = mpi_decomp2d_->phys_x0() + mpi_decomp2d_->local_nx - 1;
-            pb.has_south_wall = mpi_decomp2d_->has_south_wall();
-            pb.has_north_wall = mpi_decomp2d_->has_north_wall();
-            pb.has_west_wall  = mpi_decomp2d_->has_west_wall();
-            pb.has_east_wall  = mpi_decomp2d_->has_east_wall();
-        }
-        if (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1) {
-            // 三维块分解：物理区域偏移由 phys_x0/y0/z0() 给出
-            pb.j_s = mpi_decomp3d_->phys_y0();
-            pb.j_n = mpi_decomp3d_->phys_y0() + mpi_decomp3d_->local_ny - 1;
-            pb.i_w = mpi_decomp3d_->phys_x0();
-            pb.i_e = mpi_decomp3d_->phys_x0() + mpi_decomp3d_->local_nx - 1;
-            pb.has_south_wall = mpi_decomp3d_->has_south_wall();
-            pb.has_north_wall = mpi_decomp3d_->has_north_wall();
-            pb.has_west_wall  = mpi_decomp3d_->has_west_wall();
-            pb.has_east_wall  = mpi_decomp3d_->has_east_wall();
-            // Bottom/Top 壁面在 Z 方向分解时也需要按进程判断
-            // （boundary.hpp 的 PhysicalBounds 尚未包含 has_bottom/top_wall；
-            //  Z 面 BC 当前由 apply_boundary_conditions 的 default: return true 处理）
-        }
-#endif
         apply_boundary_conditions(grid_, bcs_, pb);
         // BC 修正了边界节点的 f 值，需重新计算宏观量以供下次碰撞使用
         grid_.compute_macroscopic();

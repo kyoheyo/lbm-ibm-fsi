@@ -158,14 +158,19 @@ void compute_ibb_distances(LatticeGrid& grid)
 }
 
 // ===========================================================================
-// 半步长反弹（Halfway BounceBack，q = 0.5）
+// 半步长反弹（Halfway BounceBack，q = 0.5）—— 物理区域限定版（MPI 适配）
 //
 // 施加时机：stream() 之后
 // 公式：f[opp(a)](x_f, t+dt) = f_tmp[a](x_f, t)
 //
 // g.f_tmp 在 stream() 末尾（swap 之后）保存碰后（post-collision）f 值。
+//
+// 参数 phys_i0/phys_j0/phys_i1/phys_j1 指定物理区域（本地坐标，含端点），
+// 循环仅覆盖此范围，跳过幽灵行/列。非 MPI 模式下传入 0, 0, nx-1, ny-1。
 // ===========================================================================
-void apply_solid_bounce_back(LatticeGrid& grid)
+void apply_solid_bounce_back(LatticeGrid& grid,
+                              int phys_i0, int phys_j0,
+                              int phys_i1, int phys_j1)
 {
     if (grid.model != LatticeModel::D2Q9) return;
     if (grid.solid.empty()) return;
@@ -177,15 +182,15 @@ void apply_solid_bounce_back(LatticeGrid& grid)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static) collapse(2)
 #endif
-    for (int j = 0; j < ny; ++j) {
-        for (int i = 0; i < nx; ++i) {
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
             const int nf = grid.idx(i, j);
             if (grid.solid[nf]) continue;  // 跳过固体节点
 
             for (int a = 1; a < Q; ++a) {  // 静止方向 a=0 无需处理
                 const int ni = i + d2q9::C[a][0];
                 const int nj = j + d2q9::C[a][1];
-                // 边界检查：超出格子范围视为固体壁（周期格子以外不做反弹）
+                // 边界检查（邻居可为幽灵节点或网格外）
                 if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
                 if (!grid.solid[grid.idx(ni, nj)]) continue;  // 邻居非固体
 
@@ -197,8 +202,14 @@ void apply_solid_bounce_back(LatticeGrid& grid)
     }
 }
 
+// 向后兼容版：不限定物理区域，覆盖整个本地网格（适用于非 MPI 模式）。
+void apply_solid_bounce_back(LatticeGrid& grid)
+{
+    apply_solid_bounce_back(grid, 0, 0, grid.nx - 1, grid.ny - 1);
+}
+
 // ===========================================================================
-// Bouzidi 插值反弹（Interpolated BounceBack, IBB）
+// Bouzidi 插值反弹（Interpolated BounceBack, IBB）—— 物理区域限定版（MPI 适配）
 //
 // 施加时机：stream() 之后
 //
@@ -206,15 +217,21 @@ void apply_solid_bounce_back(LatticeGrid& grid)
 //
 //   q ≤ 0.5：
 //     f[opp(a)](x_f) = 2q · f_tmp[a](x_f) + (1-2q) · f_tmp[a](x_f - c_a)
-//     (x_f - c_a 为流体侧邻居；若为固体则退化为 halfway BB)
+//     (x_f - c_a 为上游流体侧邻居；若为固体则退化为 halfway BB)
+//     注意：x_f - c_a 可以是幽灵节点，此时 f_tmp 中已含正确幽灵碰后值（halo 交换后）。
 //
 //   q > 0.5：
 //     f[opp(a)](x_f) = (1/2q) · f_tmp[a](x_f) + (1-1/2q) · f_tmp[opp(a)](x_f)
 //     (使用本节点 opp(a) 方向的碰后值；来自 f_tmp)
 //
+// 参数 phys_i0/phys_j0/phys_i1/phys_j1 指定物理区域（本地坐标，含端点），
+// 循环仅写物理节点，但上游节点读取允许超出物理范围（幽灵行有效）。
+//
 // 参考：Bouzidi et al. (2001); Yu et al. (2003) 的改进版本。
 // ===========================================================================
-void apply_solid_ibb(LatticeGrid& grid)
+void apply_solid_ibb(LatticeGrid& grid,
+                     int phys_i0, int phys_j0,
+                     int phys_i1, int phys_j1)
 {
     if (grid.model != LatticeModel::D2Q9) return;
     if (grid.solid.empty()) return;
@@ -226,8 +243,8 @@ void apply_solid_ibb(LatticeGrid& grid)
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(static) collapse(2)
 #endif
-    for (int j = 0; j < ny; ++j) {
-        for (int i = 0; i < nx; ++i) {
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
             const int nf = grid.idx(i, j);
             if (grid.solid[nf]) continue;
 
@@ -243,7 +260,8 @@ void apply_solid_ibb(LatticeGrid& grid)
                 const double q  = static_cast<double>(grid.q_ibb[nf * Q + a]);
 
                 if (q <= 0.5) {
-                    // 尝试使用流体侧邻居 x_f - c_a = (i-ca, j-cb)
+                    // 上游流体侧邻居 x_f - c_a = (i-ca, j-cb)
+                    // 允许访问幽灵节点（halo_exchange 已填入正确碰后值）
                     const int nni = i - ca;
                     const int nnj = j - cb;
                     if (nni >= 0 && nni < nx && nnj >= 0 && nnj < ny) {
@@ -259,7 +277,6 @@ void apply_solid_ibb(LatticeGrid& grid)
                     grid.f[nf * Q + oa] = grid.f_tmp[nf * Q + a];
                 } else {
                     // q > 0.5：Yu et al. (2003) 高 q 分支
-                    // 使用本节点 opp(a) 方向的碰后值（来自 f_tmp）
                     const double inv2q = 1.0 / (2.0 * q);
                     grid.f[nf * Q + oa] = inv2q * grid.f_tmp[nf * Q + a]
                                         + (1.0 - inv2q) * grid.f_tmp[nf * Q + oa];
@@ -267,6 +284,12 @@ void apply_solid_ibb(LatticeGrid& grid)
             }
         }
     }
+}
+
+// 向后兼容版：不限定物理区域，覆盖整个本地网格（适用于非 MPI 模式）。
+void apply_solid_ibb(LatticeGrid& grid)
+{
+    apply_solid_ibb(grid, 0, 0, grid.nx - 1, grid.ny - 1);
 }
 
 } // namespace lbm
