@@ -372,7 +372,7 @@ fn run() -> Result<()> {
         } else {
             format!("x=[0, {}), y=[0, {})", cfg.fluid.nx, cfg.fluid.ny)
         };
-        bc_log.push(format!("  rank {:3}  region: {}", rank, region_str));
+        bc_log.push(format!("  *** rank {:3}  全局坐标范围: {} ***", rank, region_str));
     }
 
     for bc_cfg in &cfg.fluid.boundary_conditions {
