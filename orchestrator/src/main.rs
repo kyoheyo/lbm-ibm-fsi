@@ -128,6 +128,12 @@ fn run() -> Result<()> {
                 "independent" => println!("MPI mode : independent (each rank runs its own full simulation, no communication)"),
                 _             => println!("MPI mode : {}", cfg.mpi.mode),
             }
+            // IBM 幽灵层宽度提示（仅当 IBM 段存在且宽度 > 1 时打印）
+            let ibm_halo = cfg.mpi.ibm_halo_width.max(1);
+            if ibm_halo > 1 && cfg.ibm.is_some() {
+                println!("MPI IBM  : ibm_halo_width={} (extended ghost layer for FourPoint δ kernel)",
+                         ibm_halo);
+            }
         }
 
         // 插件启动日志
@@ -672,63 +678,140 @@ fn run() -> Result<()> {
 
     // -----------------------------------------------------------------------
     // IBM 标记点集（在时间循环外创建，在循环内每步调用对应 IBM 方案）
+    //
+    // 支持三种耦合模式（可通过 TOML 配置组合使用）：
+    //   ①仅 BB/IBB  — 只配置 [solid] 段（无 [ibm] 段）
+    //   ②仅 IBM     — 只配置 [ibm] 段（无 [solid] 段或 solid.bc_type="none"）
+    //   ③混合 BB+IBM — 同时配置 [solid] 和 [ibm] 段
+    //
+    // 多体 IBM：在 [ibm] 下用 [[ibm.bodies]] 列表描述每个 IBM 固体体；
+    //   若 bodies 为空则回退到顶层单体字段（向后兼容）。
     // -----------------------------------------------------------------------
-    let mut ibm_marker_set: Option<lbm_bindings::LbmIbmMarkerSet> =
-        if let Some(ref ibm_cfg) = cfg.ibm {
-            let ms = match ibm_cfg.geometry.to_lowercase().as_str() {
+
+    // 每个 IBM 体的运行时状态（标记点集 + 受力输出配置）
+    struct IbmEntry {
+        ms:        lbm_bindings::LbmIbmMarkerSet,
+        label:     String,
+        force_cfg: config::SolidForceOutputConfig,
+    }
+
+    let mut ibm_entries: Vec<IbmEntry> = Vec::new();
+
+    if let Some(ref ibm_cfg) = cfg.ibm {
+        // 确定使用的体列表（多体优先，否则退化为顶层单体字段）
+        let single_body_list: Vec<config::IbmBodyConfig>;
+        let effective_bodies: &[config::IbmBodyConfig] = if ibm_cfg.bodies.is_empty() {
+            if !ibm_cfg.geometry.is_empty() {
+                single_body_list = vec![config::IbmBodyConfig {
+                    geometry:     ibm_cfg.geometry.clone(),
+                    x0:           ibm_cfg.x0,
+                    y0:           ibm_cfg.y0,
+                    size:         ibm_cfg.size,
+                    n_markers:    ibm_cfg.n_markers,
+                    mesh_file:    ibm_cfg.mesh_file.clone(),
+                    label:        String::new(),
+                    force_output: None,
+                }];
+                &single_body_list
+            } else {
+                single_body_list = vec![];
+                &single_body_list
+            }
+        } else {
+            &ibm_cfg.bodies
+        };
+
+        // 打印 IBM 全局方案说明（rank-0 只打印一次）
+        if rank == 0 && !effective_bodies.is_empty() {
+            let method_name = match ibm_cfg.method.to_lowercase().as_str() {
+                "penalty" => format!(
+                    "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
+                    ibm_cfg.alpha, ibm_cfg.beta,
+                ),
+                "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
+                _     => format!("MDF-IBM（多重直接力，Luo 2007，n_iter={}）", ibm_cfg.n_iter),
+            };
+            println!("  [IBM] 方案: {}  δ核: {}  固体体数: {}",
+                     method_name, ibm_cfg.delta_kernel, effective_bodies.len());
+        }
+
+        // 逐体创建标记点集
+        for (body_idx, body) in effective_bodies.iter().enumerate() {
+            let ms = match body.geometry.to_lowercase().as_str() {
                 "file" => {
-                    // 从外部 CSV 文件加载标记点（第三方网格接口）
-                    if ibm_cfg.mesh_file.is_empty() {
-                        anyhow::bail!("[IBM] geometry=\"file\" 但 mesh_file 未设置，请在 [ibm] 中添加 mesh_file = \"path/to/markers.csv\"");
+                    if body.mesh_file.is_empty() {
+                        anyhow::bail!(
+                            "[IBM] 第 {} 体 geometry=\"file\" 但 mesh_file 未设置，\
+                             请在 [[ibm.bodies]] 中添加 mesh_file = \"path/to/markers.csv\"",
+                            body_idx
+                        );
                     }
-                    lbm_bindings::LbmIbmMarkerSet::new_from_file(&ibm_cfg.mesh_file)
+                    lbm_bindings::LbmIbmMarkerSet::new_from_file(&body.mesh_file)
                         .map_err(|e| anyhow::anyhow!("{}", e))?
                 }
                 "filament" => {
                     lbm_bindings::LbmIbmMarkerSet::new_filament(
-                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
-                        ibm_cfg.n_markers,
+                        body.x0, body.y0, body.size, body.n_markers,
                     )
                 }
                 _ => {
-                    // 默认 "circle"（以及未知几何类型均回退为圆形）
                     lbm_bindings::LbmIbmMarkerSet::new_circle(
-                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
-                        ibm_cfg.n_markers,
+                        body.x0, body.y0, body.size, body.n_markers,
                     )
                 }
             };
+
+            let label = if body.label.is_empty() {
+                format!("ibm_body_{}", body_idx)
+            } else {
+                body.label.clone()
+            };
+
+            let force_cfg = body.force_output.clone()
+                .unwrap_or_else(|| ibm_cfg.force_output.clone());
+
             if rank == 0 {
-                let method_name = match ibm_cfg.method.to_lowercase().as_str() {
-                    "penalty" => format!(
-                        "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
-                        ibm_cfg.alpha, ibm_cfg.beta,
-                    ),
-                    "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
-                    _     => "MDF-IBM（多重直接力，Luo 2007，n_iter=3）".to_string(),
-                };
-                let geom_info = match ibm_cfg.geometry.to_lowercase().as_str() {
-                    "file" => format!("file={:?}", ibm_cfg.mesh_file),
+                let geom_info = match body.geometry.to_lowercase().as_str() {
+                    "file"     => format!("file={:?}", body.mesh_file),
                     "filament" => format!("起点: ({}, {})  长度: {}",
-                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size),
-                    _ => format!("圆心: ({}, {})  半径: {}",
-                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size),
+                                         body.x0, body.y0, body.size),
+                    _          => format!("圆心: ({}, {})  半径: {}",
+                                         body.x0, body.y0, body.size),
                 };
                 println!(
-                    "  [IBM] 方案: {}  标记点数: {}  几何: {}",
-                    method_name, ms.len(), geom_info
+                    "  [IBM] 体[{}] 标签={:?}  标记点数: {}  几何: {}",
+                    body_idx, label, ms.len(), geom_info
                 );
-                if ibm_cfg.force_output.enabled {
-                    println!("  [IBM] 受力统计: 每 {} 步输出到 {}/{}.csv",
-                        ibm_cfg.force_output.interval,
-                        cfg.output.directory,
-                        ibm_cfg.force_output.filename);
+                if force_cfg.enabled {
+                    println!("  [IBM] 体[{}] 受力统计: 每 {} 步输出到 {}/{}.csv",
+                             body_idx, force_cfg.interval,
+                             cfg.output.directory, force_cfg.filename);
                 }
             }
-            Some(ms)
-        } else {
-            None
-        };
+
+            ibm_entries.push(IbmEntry {
+                ms,
+                label,
+                force_cfg,
+            });
+        }
+
+        // 打印耦合模式提示（rank-0）
+        if rank == 0 && !ibm_entries.is_empty() {
+            let has_solid_bb = !cfg.solid.bodies.is_empty()
+                && cfg.solid.bc_type.to_lowercase() != "none";
+            if has_solid_bb {
+                println!("  [FSI] 耦合模式: ③ 混合 BB/IBB + IBM（反弹格式 + 浸入边界法）");
+            } else {
+                println!("  [FSI] 耦合模式: ② 纯 IBM（浸入边界法）");
+            }
+        }
+    } else if rank == 0
+        && !cfg.solid.bodies.is_empty()
+        && cfg.solid.bc_type.to_lowercase() != "none"
+    {
+        println!("  [FSI] 耦合模式: ① 纯 BB/IBB（反弹格式）");
+    }
 
     if rank == 0 {
         println!("\nStarting time integration...");
@@ -747,14 +830,19 @@ fn run() -> Result<()> {
         // 注意：IBM 力写入 grid.force，需在下一步 step() 的 collide 阶段通过
         //       Guo 体力格式加入碰撞算子。current step 的 IBM 力已展布到 grid.force。
         // MPI 跨块：halo_exchange 在 step() 内部已调用，IBM 插值可安全读取幽灵层。
-        if let Some(ref mut ms) = ibm_marker_set {
+        // 多体 IBM：依次对每个 IBM 体调用对应方案；各体的展布力叠加在 grid.force 上。
+        if !ibm_entries.is_empty() {
             let ibm_cfg = cfg.ibm.as_ref().unwrap();
             let dx = 1.0_f64;
             let dt = cfg.simulation.dt;
-            match ibm_cfg.method.to_lowercase().as_str() {
-                "penalty" => ms.step_penalty(&mut grid, dx, dt, ibm_cfg.alpha, ibm_cfg.beta),
-                "mls"     => ms.step_mls(&mut grid, dx, dt),
-                _         => ms.step_mdf(&mut grid, dx, dt, ibm_cfg.n_iter),  // 默认 MDF
+            for entry in ibm_entries.iter_mut() {
+                match ibm_cfg.method.to_lowercase().as_str() {
+                    "penalty" => entry.ms.step_penalty(
+                        &mut grid, dx, dt, ibm_cfg.alpha, ibm_cfg.beta,
+                    ),
+                    "mls"     => entry.ms.step_mls(&mut grid, dx, dt),
+                    _         => entry.ms.step_mdf(&mut grid, dx, dt, ibm_cfg.n_iter),
+                }
             }
         }
 
@@ -896,30 +984,27 @@ fn run() -> Result<()> {
             }
         }
 
-        // -- IBM 固体受力输出（IBM 方案：合力统计）-----------------------------
+        // -- IBM 固体受力输出（IBM 方案：逐体合力统计）--------------------------
         // 通过对 Lagrangian 标记点的力密度加权求和计算固体所受合力。
         // 调用时机：IBM step_*() 已将 mk.fx/fy 更新到本步值。
-        if let Some(ref ms) = ibm_marker_set {
-            let ibm_cfg = cfg.ibm.as_ref().unwrap();
-            if ibm_cfg.force_output.enabled
-                && (step % ibm_cfg.force_output.interval == 0
+        // 多体 IBM：每个体独立写入对应 CSV 文件（文件名 = label.csv）。
+        for entry in ibm_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
                     || step == cfg.simulation.n_steps - 1)
             {
-                // IBM 合力：所有进程持有完整标记点集，无需 MPI 归约
-                let (ibm_fx, ibm_fy) = ms.compute_body_force();
-
-                // 固体受到流体合力 = (−ibm_fx, −ibm_fy)（牛顿第三定律）
-                // 此处写入 IBM 展布方向的力（与固体受力符号相反），由用户自行选择
+                let (ibm_fx, ibm_fy) = entry.ms.compute_body_force();
                 if rank == 0 {
                     let force_csv = format!("{}/{}.csv",
-                        output_dir, ibm_cfg.force_output.filename);
+                        output_dir, entry.force_cfg.filename);
                     output::append_monitor_csv(
                         &force_csv,
                         step + 1,
                         time,
                         &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
                     ).with_context(|| {
-                        format!("Failed to write IBM force CSV at step {}", step + 1)
+                        format!("Failed to write IBM force CSV ({}) at step {}",
+                                entry.label, step + 1)
                     })?;
                 }
             }

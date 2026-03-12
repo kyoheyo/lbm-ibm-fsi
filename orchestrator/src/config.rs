@@ -196,14 +196,58 @@ pub struct SolidBodyConfig {
     pub label: String,
 }
 
+/// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
+///
+/// 支持多个 IBM 固体体共存于同一仿真，每个体可独立设置几何形状和标签。
+/// 力计算方法（`method`/`alpha`/`beta`/`n_iter`）由顶层 `[ibm]` 全局设置统一控制。
+///
+/// ```toml
+/// [[ibm.bodies]]
+/// geometry  = "circle"
+/// x0        = 150.0
+/// y0        = 50.0
+/// size      = 10.0
+/// n_markers = 64
+/// label     = "cylinder_1"   # 可选；受力 CSV 文件名前缀
+///
+/// [[ibm.bodies]]
+/// geometry  = "file"
+/// mesh_file = "data/markers_ellipse.csv"
+/// label     = "ellipse"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct IbmBodyConfig {
+    /// 几何类型：`"circle"` | `"filament"` | `"file"`
+    pub geometry: String,
+    /// 中心 x（圆形）或起点 x（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub x0: f64,
+    /// 中心 y（圆形）或起点 y（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub y0: f64,
+    /// 半径（圆形）或长度（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub size: f64,
+    /// 标记点数量；`geometry="file"` 时忽略（由文件决定）
+    #[serde(default)] pub n_markers: u32,
+    /// CSV 标记点文件路径（仅 `geometry="file"` 时有效）
+    #[serde(default)] pub mesh_file: String,
+    /// 可选标签（用于区分多 IBM 固体输出；若空则自动编号）
+    #[serde(default)] pub label: String,
+    /// 该体的受力输出配置（可选；缺省继承顶层 `[ibm].force_output`）
+    #[serde(default)] pub force_output: Option<SolidForceOutputConfig>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbmConfig {
     /// IBM 几何类型：`"circle"` | `"filament"` | `"file"`
     ///
+    /// **单体简写**（向后兼容）：直接在 `[ibm]` 顶层指定几何参数时，
+    /// 等价于只有一个 `[[ibm.bodies]]` 条目。
+    ///
+    /// 若同时存在 `[[ibm.bodies]]`，则忽略此字段，以 `bodies` 列表为准。
+    ///
     /// - `"circle"`：均匀分布的圆形标记点环（需 x0/y0/size/n_markers）
     /// - `"filament"`：沿 x 轴均匀分布的直线丝状体（需 x0/y0/size/n_markers）
-    /// - `"file"`：从外部 CSV 文件加载标记点（需 mesh_file；
-    ///   x0/y0/size/n_markers 在此模式下被忽略）
+    /// - `"file"`：从外部 CSV 文件加载标记点（需 mesh_file）
+    #[serde(default)]
     pub geometry: String,
     /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）；`geometry="file"` 时忽略
     #[serde(default)] pub x0: f64,
@@ -221,10 +265,10 @@ pub struct IbmConfig {
     ///
     /// 【MPI 注意】`"four_point"` 核支撑宽度为 2 格；在 MPI 模式下，
     /// IBM 标记点应距 MPI 分区边界 ≥ 2 格，否则插值/展布会在分区边界处
-    /// 引入截断误差。
+    /// 引入截断误差。可通过 `[mpi] ibm_halo_width = 2` 启用双层幽灵交换。
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
-    /// IBM 力计算方法：
+    /// IBM 力计算方法（全局，对所有 IBM 体生效）：
     ///   `"mdf"`     — 多重直接力法（默认，推荐）
     ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
     ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
@@ -242,10 +286,19 @@ pub struct IbmConfig {
     /// MDF-IBM 子迭代次数（仅 `method="mdf"` 时有效；默认 3，建议范围 2–4）
     #[serde(default = "default_ibm_n_iter")]
     pub n_iter: i32,
-    /// IBM 固体受力输出配置（可选）。
+    /// IBM 固体受力输出配置（全局默认，对所有无独立配置的 IBM 体生效）。
     /// 启用后，每隔 `force_output.interval` 步将 IBM 合力写入 CSV 文件。
     #[serde(default)]
     pub force_output: SolidForceOutputConfig,
+    /// 多体 IBM 列表（`[[ibm.bodies]]`）。
+    ///
+    /// 若非空，则以此列表为准（顶层单体字段 `geometry/x0/y0/size/n_markers/mesh_file`
+    /// 将被忽略）。每个条目独立描述一个 IBM 固体体的几何。
+    ///
+    /// 向后兼容：若 `bodies` 为空且 `geometry` 非空，则自动将顶层单体字段
+    /// 当作包含一个条目的 `bodies` 列表处理（与旧版配置完全兼容）。
+    #[serde(default)]
+    pub bodies: Vec<IbmBodyConfig>,
 }
 
 fn default_ibm_method() -> String { "mdf".to_string() }
@@ -536,6 +589,20 @@ pub struct MpiRunConfig {
     /// Z 方向进程块数（3D 扩展预留；当前 2D 仿真时设 0 或 1；默认 1）
     #[serde(default = "default_one")]
     pub nz_blocks: u32,
+    /// IBM 幽灵层宽度（仅 IBM 方案时有效；默认 1）。
+    ///
+    /// 使用 `"four_point"` δ 函数核时，IBM 插值/展布的支撑宽度为 2 格；
+    /// 若 IBM 标记点距 MPI 块边界 < 2 格，需将此值设为 `2` 以启用双层幽灵交换，
+    /// 消除块边界处的截断误差。
+    ///
+    /// | 核函数 | 支撑宽度 | 建议值 |
+    /// |--------|----------|--------|
+    /// | `"two_point"` | 1 格 | 1（默认） |
+    /// | `"four_point"`（默认）| 2 格 | 2（标记点靠近块边界时）|
+    ///
+    /// 设置为 `0` 或省略时使用默认值 1。
+    #[serde(default = "default_one")]
+    pub ibm_halo_width: u32,
 }
 
 fn default_one()  -> u32 { 1 }
@@ -544,10 +611,11 @@ fn default_zero() -> u32 { 0 }
 impl Default for MpiRunConfig {
     fn default() -> Self {
         MpiRunConfig {
-            mode:      default_mpi_mode(),
-            nx_blocks: 1,
-            ny_blocks: 0,   // 0 = 自动：由 nprocs 决定
-            nz_blocks: 1,
+            mode:           default_mpi_mode(),
+            nx_blocks:      1,
+            ny_blocks:      0,   // 0 = 自动：由 nprocs 决定
+            nz_blocks:      1,
+            ibm_halo_width: 1,
         }
     }
 }

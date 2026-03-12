@@ -1,0 +1,122 @@
+# =============================================================================
+# 多圆柱绕流 IBM 算例（双圆柱，MDF-IBM，② 纯 IBM 耦合模式）
+# =============================================================================
+#
+# 耦合模式：② 纯 IBM（浸入边界法）— 多体 [[ibm.bodies]] 列表
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱 1   : 中心 (120, 35)，半径 R=8
+#   圆柱 2   : 中心 (120, 65)，半径 R=8
+#   入口速度 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01
+#   雷诺数   : Re = U_in · 2R / ν = 0.05 × 16 / 0.01 = 80
+#
+# IBM 方案：多重直接力法（MDF-IBM，Luo 2007），n_iter=3
+#
+# 多体说明：
+#   每个 [[ibm.bodies]] 条目独立描述一个 IBM 固体体：
+#   - geometry  ：几何类型（"circle" | "filament" | "file"）
+#   - x0, y0    ：圆心坐标
+#   - size      ：半径
+#   - n_markers ：Lagrangian 标记点数量（建议 ≥ 2π·R）
+#   - label     ：可选标签，用于受力 CSV 文件命名
+#   方法参数（method/n_iter/alpha/beta）由顶层 [ibm] 全局控制。
+#
+# 使用方法：
+#   单进程：./lbm-fsi configs/multi_cylinder_ibm.toml
+#   MPI（4进程）：mpirun -n 4 ./lbm-fsi configs/multi_cylinder_ibm.toml
+#
+# 输出：流场快照写入 output/multi_cylinder_ibm/（NPZ 格式）
+#       受力：output/multi_cylinder_ibm/cyl1_force.csv 和 cyl2_force.csv
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+# 西壁（进口）
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+# 东壁（出口）
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+# 南壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# IBM 浸入边界方案（多体配置，[[ibm.bodies]]）
+#
+# [ibm] 顶层字段控制所有体共用的方法参数；
+# [[ibm.bodies]] 列表中每个条目独立描述一个 IBM 固体体的几何。
+# -----------------------------------------------------------------------------
+[ibm]
+method       = "mdf"          # 多重直接力法（MDF-IBM，Luo 2007）
+n_iter       = 3              # 子迭代次数（推荐 2–4）
+delta_kernel = "four_point"   # Peskin 4 点核（支撑宽度 2 格）
+
+# 圆柱 1（下方）
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 120.0     # 圆心 x
+y0         = 35.0      # 圆心 y
+size       = 8.0       # 半径 R=8
+n_markers  = 51        # 标记点数（≈ 2π·R = 50）
+label      = "cyl1"    # 受力 CSV 文件前缀（→ cyl1_force.csv）
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 500
+filename = "cyl1_force"
+
+# 圆柱 2（上方）
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 120.0     # 圆心 x
+y0         = 65.0      # 圆心 y
+size       = 8.0       # 半径 R=8
+n_markers  = 51        # 标记点数
+label      = "cyl2"
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 500
+filename = "cyl2_force"
+
+[output]
+write_interval = 500
+directory      = "output/multi_cylinder_ibm"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
+
+# MPI 并行（可选）
+# [mpi]
+# mode      = "block"
+# nx_blocks = 1
+# ny_blocks = 0   # 0 = 自动
+# ibm_halo_width = 2   # 启用双层幽灵交换（当标记点距 MPI 块边界 < 2 格时需要）
