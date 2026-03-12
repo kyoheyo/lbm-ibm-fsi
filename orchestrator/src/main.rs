@@ -443,11 +443,6 @@ fn run() -> Result<()> {
                 "  rank {:3}, {:?}, {:?}  (ux={:.4}, uy={:.4}, rho={:.4})",
                 rank, face, bc_type, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
             ));
-        } else {
-            bc_log.push(format!(
-                "  rank {:3}, {:?}, {:?}  [skipped — not this rank's boundary]",
-                rank, face, bc_type
-            ));
         }
     }
 
