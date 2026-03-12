@@ -9,7 +9,7 @@
 // C ABI 声明
 // ---------------------------------------------------------------------------
 mod ffi {
-    use std::ffi::c_int;
+    use std::ffi::{c_int, c_char};
 
     #[repr(C)]
     pub enum LatticeModelC {
@@ -227,6 +227,10 @@ mod ffi {
         pub fn lbm_mark_solid_rectangle(g: *mut LatticeGridHandle,
                                         i0: c_int, j0: c_int,
                                         i1: c_int, j1: c_int);
+        /// 从外部 CSV 网格文件加载固体边界（第三方网格接口）。
+        /// 文件格式：每行 "x, y [, q]"；x/y 为格子坐标，q 为 IBB 距离分数（可选，缺省 0.5）。
+        pub fn lbm_mark_solid_from_mesh_file(g: *mut LatticeGridHandle,
+                                              filename: *const c_char);
         /// 设置固体反弹方案：0=None, 1=BB, 2=IBB。
         pub fn lbm_solver_set_solid_bc(s: *mut SolverHandle, bc_mode: c_int);
         /// 用动量交换法（MEA）计算固体受力。
@@ -241,6 +245,14 @@ mod ffi {
         // --- IBM 浸入边界法 — 实现于 core/src/capi/lbm_capi.cpp (IBM section) ---
         /// 创建圆柱表面标记点集（均匀分布）。
         pub fn lbm_ibm_marker_set_new_circle(cx: f64, cy: f64, radius: f64, n_markers: c_int)
+            -> *mut IbmMarkerSetHandle;
+        /// 创建直线丝状体标记点集（沿 x 轴均匀分布）。
+        pub fn lbm_ibm_marker_set_new_filament(x0: f64, y0: f64, length: f64, n_markers: c_int)
+            -> *mut IbmMarkerSetHandle;
+        /// 从 CSV 文件加载标记点（第三方网格接口）。
+        /// 文件格式：每行 "x, y [, z [, ds]]"；忽略 '#' 注释行和空行。
+        /// 返回 nullptr 若文件无法打开或格式错误。
+        pub fn lbm_ibm_marker_set_from_file(filename: *const c_char)
             -> *mut IbmMarkerSetHandle;
         /// 释放标记点集。
         pub fn lbm_ibm_marker_set_free(h: *mut IbmMarkerSetHandle);
@@ -265,6 +277,12 @@ mod ffi {
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
+        /// 计算 IBM 固体受力合力（力密度与弧长元素的加权和）。
+        ///   out_fx = Σ mk.fx * mk.ds,  out_fy = Σ mk.fy * mk.ds
+        /// 固体所受流体合力为其负值（牛顿第三定律）。
+        /// 调用时机：任一 IBM 力计算函数之后。
+        pub fn lbm_ibm_compute_body_force(ms: *const IbmMarkerSetHandle,
+                                           out_fx: *mut f64, out_fy: *mut f64);
 
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
@@ -953,6 +971,23 @@ pub fn mark_solid_rectangle(grid: &mut LbmGrid, i0: i32, j0: i32, i1: i32, j1: i
     unsafe { ffi::lbm_mark_solid_rectangle(grid.ptr, i0, j0, i1, j1) };
 }
 
+/// 从外部 CSV 网格文件加载固体边界（第三方网格接口）。
+///
+/// 文件格式（每行一个边界点，以逗号分隔）：
+/// ```text
+/// x, y [, q]
+/// ```
+/// - `x, y`：边界点坐标（浮点数，格子单位）
+/// - `q`：IBB 壁面距离分数（可选；缺省 0.5，退化为半步长反弹）
+///
+/// 注释行（以 `#` 开头）和空行会被忽略。
+///
+/// 若文件无法打开或内容为空，函数静默返回（不标记任何节点）。
+pub fn mark_solid_from_mesh_file(grid: &mut LbmGrid, filename: &str) {
+    let c_str = std::ffi::CString::new(filename).expect("mark_solid_from_mesh_file: invalid filename");
+    unsafe { ffi::lbm_mark_solid_from_mesh_file(grid.ptr, c_str.as_ptr()) };
+}
+
 /// 设置求解器使用的固体反弹方案。
 ///
 /// | `bc_mode` | 方案 | 说明 |
@@ -1062,6 +1097,58 @@ impl LbmIbmMarkerSet {
         }
     }
 
+    /// 创建沿 x 轴均匀分布的直线丝状体标记点集。
+    ///
+    /// # 参数
+    /// - `x0`, `y0`：起点格子坐标
+    /// - `length`：丝状体长度（格子单位）
+    /// - `n_markers`：标记点数量
+    pub fn new_filament(x0: f64, y0: f64, length: f64, n_markers: u32) -> Self {
+        let ptr = unsafe {
+            ffi::lbm_ibm_marker_set_new_filament(x0, y0, length, n_markers as i32)
+        };
+        assert!(!ptr.is_null(), "lbm_ibm_marker_set_new_filament returned null");
+        let n = n_markers as usize;
+        LbmIbmMarkerSet {
+            ptr,
+            n_markers: n,
+            integral_x: vec![0.0; n],
+            integral_y: vec![0.0; n],
+        }
+    }
+
+    /// 从外部 CSV 文件加载标记点集（第三方网格接口）。
+    ///
+    /// 文件格式（每行一个标记点，以逗号分隔）：
+    /// ```text
+    /// x, y [, z [, ds]]
+    /// ```
+    /// - `x, y`：标记点坐标（必需）
+    /// - `z`：z 坐标（可选，缺省 0.0）
+    /// - `ds`：弧长/面积元素（可选；缺省值为相邻标记点间距的平均值）
+    ///
+    /// 注释行（以 `#` 开头）和空行会被忽略。
+    ///
+    /// # 错误
+    /// 若文件无法打开或格式错误，返回 `Err`。
+    pub fn new_from_file(filename: &str) -> Result<Self, String> {
+        let c_str = std::ffi::CString::new(filename)
+            .map_err(|e| format!("new_from_file: invalid filename: {e}"))?;
+        let ptr = unsafe { ffi::lbm_ibm_marker_set_from_file(c_str.as_ptr()) };
+        if ptr.is_null() {
+            return Err(format!(
+                "LbmIbmMarkerSet::new_from_file: failed to load markers from {:?}", filename
+            ));
+        }
+        let n = unsafe { ffi::lbm_ibm_marker_set_size(ptr as *const _) } as usize;
+        Ok(LbmIbmMarkerSet {
+            ptr,
+            n_markers: n,
+            integral_x: vec![0.0; n],
+            integral_y: vec![0.0; n],
+        })
+    }
+
     /// 返回标记点数量。
     pub fn len(&self) -> usize { self.n_markers }
 
@@ -1132,6 +1219,27 @@ impl LbmIbmMarkerSet {
     pub fn reset_penalty_integrals(&mut self) {
         self.integral_x.fill(0.0);
         self.integral_y.fill(0.0);
+    }
+
+    /// 计算 IBM 固体受力合力（第三方网格接口）。
+    ///
+    /// 对所有 Lagrangian 标记点执行加权求和：
+    ///   `F_x = Σ mk.fx * mk.ds`,  `F_y = Σ mk.fy * mk.ds`
+    ///
+    /// 固体所受流体合力 = `(-F_x, -F_y)`（牛顿第三定律）。
+    ///
+    /// 调用时机：任一 `step_*()` 方法调用之后。
+    ///
+    /// # MPI 说明
+    /// 若所有进程持有相同的完整标记点集（当前实现），此函数返回完整合力，
+    /// 无需额外的 MPI 归约。若将来改为按进程分配标记点，则需 `mpi_allreduce_sum_f64`。
+    pub fn compute_body_force(&self) -> (f64, f64) {
+        let mut fx = 0.0_f64;
+        let mut fy = 0.0_f64;
+        unsafe {
+            ffi::lbm_ibm_compute_body_force(self.ptr as *const _, &mut fx, &mut fy);
+        }
+        (fx, fy)
     }
 }
 

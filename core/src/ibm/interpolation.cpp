@@ -424,4 +424,38 @@ void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
     spread_force(fluid, ms, dx, kernel);
 }
 
+// ===========================================================================
+// IBM 固体受力统计：合力计算
+//
+// F_x = Σ_m  mk.fx * mk.ds
+// F_y = Σ_m  mk.fy * mk.ds
+//
+// IBM 力作用于流体（流体得到 +F），因此固体所受合力为 -F_fluid，
+// 即固体受力 = -(Σ mk.fx * mk.ds)，方向与 IBM 力相反。
+// 但为了与 MEA 方法（compute_solid_body_force）的符号约定一致，
+// 此处返回的是施加到流体上的 IBM 力（即固体受到的反作用力为其负值）。
+//
+// 物理说明：
+//   在 IBM 中，力 mk.fx/fy 施加到流体上（阻止流体穿越边界）。
+//   由牛顿第三定律，固体所受流体合力 = Σ(-mk.fx * mk.ds)。
+//   本函数返回 +Σ(mk.fx * mk.ds)（IBM 方向），调用方可根据需要取反。
+// ===========================================================================
+void compute_ibm_body_force(const MarkerSet& ms,
+                             double& out_fx, double& out_fy)
+{
+    double fx = 0.0, fy = 0.0;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) reduction(+:fx,fy)
+#endif
+    for (int m = 0; m < ms.size(); ++m) {
+        const auto& mk = ms.markers[m];
+        fx += mk.fx * mk.ds;
+        fy += mk.fy * mk.ds;
+    }
+
+    out_fx = fx;
+    out_fy = fy;
+}
+
 } // namespace ibm

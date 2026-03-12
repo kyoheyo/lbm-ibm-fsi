@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <string>
 
 namespace ibm {
 
@@ -32,6 +33,21 @@ struct MarkerSet {
     /// 在二维中生成沿 x 轴均匀分布的直线丝状体标记点
     static MarkerSet make_filament(double x0, double y0,
                                    double length, int n_markers);
+
+    /// 从 CSV 文件加载标记点（第三方网格接口）。
+    ///
+    /// 文件格式（每行一个标记点，以逗号分隔）：
+    ///   x, y [, z [, ds]]
+    ///   - x, y：标记点坐标（必需）
+    ///   - z：z 坐标（可选，缺省 0.0）
+    ///   - ds：弧长/面积元素（可选；缺省值为相邻标记点间距的平均值）
+    ///
+    /// 忽略空行和以 '#' 开头的注释行。
+    ///
+    /// 若文件无法打开或格式错误，抛出 std::runtime_error。
+    ///
+    /// @param filename  CSV 文件路径
+    static MarkerSet make_from_file(const std::string& filename);
 };
 
 } // namespace ibm

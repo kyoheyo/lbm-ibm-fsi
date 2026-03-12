@@ -880,6 +880,24 @@ void lbm_compute_solid_force(const lbm::LatticeGrid* g,
                                    phys_i0, phys_j0, phys_i1, phys_j1);
 }
 
+/// @brief 从外部 CSV 网格文件加载固体边界（第三方网格接口）。
+///
+/// 文件格式（每行一个边界点，逗号分隔）：
+///   x, y [, q]
+///   - x, y：边界点坐标（格子单位）
+///   - q：IBB 壁面距离分数（可选，缺省 0.5）
+///
+/// 标记结果写入 grid.solid[] 和 grid.q_ibb[]，
+/// 后续调用 lbm_solver_set_solid_bc() 以设置反弹方案。
+///
+/// @param g        格子网格句柄（须已构造）
+/// @param filename CSV 文件路径（null 终止字符串）
+void lbm_mark_solid_from_mesh_file(lbm::LatticeGrid* g, const char* filename)
+{
+    if (!g || !filename) return;
+    lbm::mark_solid_from_mesh_file(*g, filename);
+}
+
 } // extern "C" (solid)
 
 // ===========================================================================
@@ -1140,6 +1158,21 @@ IbmMarkerSetHandle* lbm_ibm_marker_set_new_circle(double cx, double cy,
     return reinterpret_cast<IbmMarkerSetHandle*>(ms);
 }
 
+/// @brief 创建直线丝状体标记点集（沿 x 轴均匀分布）。
+///
+/// @param x0        起点 x 坐标（格子单位）
+/// @param y0        起点 y 坐标
+/// @param length    丝状体长度
+/// @param n_markers 标记点数量
+/// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
+IbmMarkerSetHandle* lbm_ibm_marker_set_new_filament(double x0, double y0,
+                                                      double length, int n_markers)
+{
+    auto* ms = new ibm::MarkerSet(
+        ibm::MarkerSet::make_filament(x0, y0, length, n_markers));
+    return reinterpret_cast<IbmMarkerSetHandle*>(ms);
+}
+
 /// 释放 MarkerSet 句柄。
 void lbm_ibm_marker_set_free(IbmMarkerSetHandle* h)
 {
@@ -1265,6 +1298,49 @@ void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* ou
         out_fx[i] = marker_set->markers[i].fx;
         out_fy[i] = marker_set->markers[i].fy;
     }
+}
+
+/// @brief 从 CSV 文件加载标记点（第三方网格接口）。
+///
+/// 文件格式（每行一个标记点，以逗号分隔）：
+///   x, y [, z [, ds]]
+///   - x, y：标记点坐标（必需）
+///   - z：z 坐标（可选，缺省 0.0）
+///   - ds：弧长/面积元素（可选；缺省平均间距）
+///
+/// 忽略以 '#' 开头的注释行和空行。
+///
+/// @param filename  CSV 文件路径（null 终止字符串）
+/// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
+///         若文件无法打开或格式错误，返回 nullptr（不抛异常穿越 C ABI）。
+IbmMarkerSetHandle* lbm_ibm_marker_set_from_file(const char* filename)
+{
+    if (!filename) return nullptr;
+    try {
+        auto* ms = new ibm::MarkerSet(ibm::MarkerSet::make_from_file(filename));
+        return reinterpret_cast<IbmMarkerSetHandle*>(ms);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+/// @brief 计算 IBM 固体受力合力（力密度与弧长元素的加权和）。
+///
+///   out_fx = Σ_m  mk.fx * mk.ds
+///   out_fy = Σ_m  mk.fy * mk.ds
+///
+/// 调用时机：任一 IBM 力计算函数（lbm_ibm_compute_mdf / penalty / mls）之后。
+/// 固体所受流体合力为 (−out_fx, −out_fy)（牛顿第三定律）。
+///
+/// @param ms      IBM 标记点集句柄
+/// @param out_fx  输出 x 方向合力
+/// @param out_fy  输出 y 方向合力
+void lbm_ibm_compute_body_force(const IbmMarkerSetHandle* ms,
+                                  double* out_fx, double* out_fy)
+{
+    if (!ms || !out_fx || !out_fy) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    ibm::compute_ibm_body_force(*marker_set, *out_fx, *out_fy);
 }
 
 } // extern "C" (IBM)

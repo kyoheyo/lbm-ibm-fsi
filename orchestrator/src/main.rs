@@ -410,6 +410,25 @@ fn run() -> Result<()> {
                         );
                     }
                 }
+                "mesh" => {
+                    // 从外部 CSV 网格文件加载固体边界（第三方网格接口）
+                    // 文件中的坐标须为本进程本地坐标（含幽灵层）；
+                    // 若文件坐标为全局坐标，须由用户预处理转换为本地坐标，
+                    // 或使用 to_local_i/to_local_j 在外部预处理脚本中完成转换。
+                    if body.mesh_file.is_empty() {
+                        if rank == 0 {
+                            eprintln!("  [warn] solid.bodies shape=\"mesh\" 但 mesh_file 为空，跳过");
+                        }
+                    } else {
+                        lbm_bindings::mark_solid_from_mesh_file(&mut grid, &body.mesh_file);
+                        if rank == 0 {
+                            println!(
+                                "  [solid] 网格文件标记: file={:?}",
+                                body.mesh_file
+                            );
+                        }
+                    }
+                }
                 other => {
                     if rank == 0 {
                         eprintln!("  [warn] 未知固体形状 {:?}，跳过", other);
@@ -656,10 +675,29 @@ fn run() -> Result<()> {
     // -----------------------------------------------------------------------
     let mut ibm_marker_set: Option<lbm_bindings::LbmIbmMarkerSet> =
         if let Some(ref ibm_cfg) = cfg.ibm {
-            let ms = lbm_bindings::LbmIbmMarkerSet::new_circle(
-                ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
-                ibm_cfg.n_markers,
-            );
+            let ms = match ibm_cfg.geometry.to_lowercase().as_str() {
+                "file" => {
+                    // 从外部 CSV 文件加载标记点（第三方网格接口）
+                    if ibm_cfg.mesh_file.is_empty() {
+                        anyhow::bail!("[IBM] geometry=\"file\" 但 mesh_file 未设置，请在 [ibm] 中添加 mesh_file = \"path/to/markers.csv\"");
+                    }
+                    lbm_bindings::LbmIbmMarkerSet::new_from_file(&ibm_cfg.mesh_file)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?
+                }
+                "filament" => {
+                    lbm_bindings::LbmIbmMarkerSet::new_filament(
+                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
+                        ibm_cfg.n_markers,
+                    )
+                }
+                _ => {
+                    // 默认 "circle"（以及未知几何类型均回退为圆形）
+                    lbm_bindings::LbmIbmMarkerSet::new_circle(
+                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
+                        ibm_cfg.n_markers,
+                    )
+                }
+            };
             if rank == 0 {
                 let method_name = match ibm_cfg.method.to_lowercase().as_str() {
                     "penalty" => format!(
@@ -669,11 +707,23 @@ fn run() -> Result<()> {
                     "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
                     _     => "MDF-IBM（多重直接力，Luo 2007，n_iter=3）".to_string(),
                 };
+                let geom_info = match ibm_cfg.geometry.to_lowercase().as_str() {
+                    "file" => format!("file={:?}", ibm_cfg.mesh_file),
+                    "filament" => format!("起点: ({}, {})  长度: {}",
+                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size),
+                    _ => format!("圆心: ({}, {})  半径: {}",
+                        ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size),
+                };
                 println!(
-                    "  [IBM] 方案: {}  标记点数: {}  圆心: ({}, {})  半径: {}",
-                    method_name, ibm_cfg.n_markers,
-                    ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size
+                    "  [IBM] 方案: {}  标记点数: {}  几何: {}",
+                    method_name, ms.len(), geom_info
                 );
+                if ibm_cfg.force_output.enabled {
+                    println!("  [IBM] 受力统计: 每 {} 步输出到 {}/{}.csv",
+                        ibm_cfg.force_output.interval,
+                        cfg.output.directory,
+                        ibm_cfg.force_output.filename);
+                }
             }
             Some(ms)
         } else {
@@ -843,6 +893,35 @@ fn run() -> Result<()> {
                 ).with_context(|| {
                     format!("Failed to write solid force CSV at step {}", step + 1)
                 })?;
+            }
+        }
+
+        // -- IBM 固体受力输出（IBM 方案：合力统计）-----------------------------
+        // 通过对 Lagrangian 标记点的力密度加权求和计算固体所受合力。
+        // 调用时机：IBM step_*() 已将 mk.fx/fy 更新到本步值。
+        if let Some(ref ms) = ibm_marker_set {
+            let ibm_cfg = cfg.ibm.as_ref().unwrap();
+            if ibm_cfg.force_output.enabled
+                && (step % ibm_cfg.force_output.interval == 0
+                    || step == cfg.simulation.n_steps - 1)
+            {
+                // IBM 合力：所有进程持有完整标记点集，无需 MPI 归约
+                let (ibm_fx, ibm_fy) = ms.compute_body_force();
+
+                // 固体受到流体合力 = (−ibm_fx, −ibm_fy)（牛顿第三定律）
+                // 此处写入 IBM 展布方向的力（与固体受力符号相反），由用户自行选择
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv",
+                        output_dir, ibm_cfg.force_output.filename);
+                    output::append_monitor_csv(
+                        &force_csv,
+                        step + 1,
+                        time,
+                        &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                    ).with_context(|| {
+                        format!("Failed to write IBM force CSV at step {}", step + 1)
+                    })?;
+                }
             }
         }
 

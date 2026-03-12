@@ -171,7 +171,12 @@ impl Default for SolidForceOutputConfig {
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct SolidBodyConfig {
-    /// 几何形状：`"cylinder"` 或 `"rectangle"`
+    /// 几何形状：`"cylinder"` | `"rectangle"` | `"mesh"`
+    ///
+    /// - `"mesh"`：从外部 CSV 文件加载固体边界（第三方网格接口）。
+    ///   须同时设置 `mesh_file` 字段，指定 CSV 文件路径。
+    ///   文件格式：每行 `x, y [, q]`（格子坐标）；
+    ///   `q` 为 IBB 壁面距离分数（可选，缺省 0.5）。
     pub shape: String,
     // ---- 圆柱参数 ----
     #[serde(default)] pub cx: f64,
@@ -182,6 +187,10 @@ pub struct SolidBodyConfig {
     #[serde(default)] pub j0: i32,
     #[serde(default)] pub i1: i32,
     #[serde(default)] pub j1: i32,
+    /// 外部网格文件路径（仅 `shape="mesh"` 时有效）。
+    /// CSV 文件格式：每行 `x, y [, q]`（格子坐标；q 为 IBB 壁面距离分数，可选）。
+    #[serde(default)]
+    pub mesh_file: String,
     /// 可选标签（用于区分多固体输出；若为空则自动编号）
     #[serde(default)]
     pub label: String,
@@ -189,17 +198,30 @@ pub struct SolidBodyConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbmConfig {
-    /// `"circle"` 或 `"filament"`
+    /// IBM 几何类型：`"circle"` | `"filament"` | `"file"`
+    ///
+    /// - `"circle"`：均匀分布的圆形标记点环（需 x0/y0/size/n_markers）
+    /// - `"filament"`：沿 x 轴均匀分布的直线丝状体（需 x0/y0/size/n_markers）
+    /// - `"file"`：从外部 CSV 文件加载标记点（需 mesh_file；
+    ///   x0/y0/size/n_markers 在此模式下被忽略）
     pub geometry: String,
-    /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）
-    pub x0: f64,
-    /// 中心 y 坐标（圆形）或起点 y 坐标（丝状体）
-    pub y0: f64,
-    /// 半径（圆形）或长度（丝状体）
-    pub size: f64,
-    /// 拉格朗日标记点数量
-    pub n_markers: u32,
+    /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub x0: f64,
+    /// 中心 y 坐标（圆形）或起点 y 坐标（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub y0: f64,
+    /// 半径（圆形）或长度（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub size: f64,
+    /// 拉格朗日标记点数量；`geometry="file"` 时忽略（由文件决定）
+    #[serde(default)] pub n_markers: u32,
+    /// 外部标记点 CSV 文件路径（仅 `geometry="file"` 时有效）。
+    /// 文件格式：每行 `x, y [, z [, ds]]`；忽略 `#` 注释行和空行。
+    #[serde(default)]
+    pub mesh_file: String,
     /// Delta 核函数：`"two_point"` 或 `"four_point"`
+    ///
+    /// 【MPI 注意】`"four_point"` 核支撑宽度为 2 格；在 MPI 模式下，
+    /// IBM 标记点应距 MPI 分区边界 ≥ 2 格，否则插值/展布会在分区边界处
+    /// 引入截断误差。
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
     /// IBM 力计算方法：
@@ -220,11 +242,16 @@ pub struct IbmConfig {
     /// MDF-IBM 子迭代次数（仅 `method="mdf"` 时有效；默认 3，建议范围 2–4）
     #[serde(default = "default_ibm_n_iter")]
     pub n_iter: i32,
+    /// IBM 固体受力输出配置（可选）。
+    /// 启用后，每隔 `force_output.interval` 步将 IBM 合力写入 CSV 文件。
+    #[serde(default)]
+    pub force_output: SolidForceOutputConfig,
 }
 
 fn default_ibm_method() -> String { "mdf".to_string() }
 fn default_ibm_alpha() -> f64 { 8.0 }
 fn default_ibm_n_iter() -> i32 { 3 }
+fn default_delta_kernel() -> String { "four_point".to_string() }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
@@ -390,7 +417,6 @@ fn default_lattice_model()      -> String { "D2Q9".to_string() }
 fn default_collision_model()    -> String { "BGK".to_string() }
 fn default_nz()                 -> u32    { 1 }
 fn default_rho()                -> f64    { 1.0 }
-fn default_delta_kernel()       -> String { "four_point".to_string() }
 fn default_output_dir()         -> String { "output".to_string() }
 fn default_output_format()      -> String { "npz".to_string() }
 fn default_python_interpreter() -> String { "python3".to_string() }

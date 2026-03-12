@@ -15,6 +15,9 @@
 #include "lbm/solid.hpp"
 #include <cmath>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
 #ifdef LBM_ENABLE_OPENMP
 #include <omp.h>
@@ -361,6 +364,113 @@ void compute_solid_body_force(const LatticeGrid& grid,
 {
     compute_solid_body_force(grid, out_fx, out_fy,
                               0, 0, grid.nx - 1, grid.ny - 1);
+}
+
+// ===========================================================================
+// 从外部 CSV 网格文件加载固体边界（第三方网格接口）
+//
+// 文件格式（每行一个边界点，以逗号分隔）：
+//   x, y [, q]
+//   - x, y：边界点坐标（浮点数，格子单位）
+//   - q：IBB 壁面距离分数（可选；缺省 0.5）
+//
+// 实现：
+//   1. 解析文件中所有边界采样点
+//   2. 对每个采样点，将最近格子节点标记为固体
+//   3. 对每个 (流体节点, 方向) 对指向固体节点时，设定 q_ibb 值
+//      若 q 列存在，使用文件中最近采样点的 q；否则使用 0.5。
+//
+// MPI 说明：
+//   本函数使用本地网格坐标（含幽灵层）。在 MPI 模式下，
+//   调用方需先将全局坐标转换为本地坐标后再调用本函数（与
+//   mark_solid_cylinder() 相同的约定）。
+// ===========================================================================
+void mark_solid_from_mesh_file(LatticeGrid& grid, const std::string& filename)
+{
+    if (grid.model != LatticeModel::D2Q9) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int Q  = d2q9::Q;
+    const int n  = grid.size();
+
+    // 确保数组已分配
+    if (static_cast<int>(grid.solid.size()) != n) {
+        grid.solid.assign(n, 0);
+        grid.q_ibb.assign(n * Q, 0.5f);
+    }
+
+    // ---- 1. 解析 CSV 文件 ----
+    std::ifstream ifs(filename);
+    if (!ifs.is_open()) {
+        throw std::runtime_error(
+            "mark_solid_from_mesh_file: cannot open file: " + filename);
+    }
+
+    struct BoundaryPoint { double x, y, q; };
+    std::vector<BoundaryPoint> pts;
+
+    std::string line;
+    int line_no = 0;
+    while (std::getline(ifs, line)) {
+        ++line_no;
+        const auto tp = line.find_first_not_of(" \t\r\n");
+        if (tp == std::string::npos) continue;
+        if (line[tp] == '#') continue;
+
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::istringstream iss(line);
+        double x = 0.0, y = 0.0, q = 0.5;
+        if (!(iss >> x >> y)) {
+            throw std::runtime_error(
+                "mark_solid_from_mesh_file: parse error at line " +
+                std::to_string(line_no) + " in " + filename);
+        }
+        double q_tmp;
+        if (iss >> q_tmp) q = q_tmp;
+        pts.push_back({x, y, q});
+    }
+
+    if (pts.empty()) {
+        throw std::runtime_error(
+            "mark_solid_from_mesh_file: no boundary points loaded from " + filename);
+    }
+
+    // ---- 2. 将采样点标记为固体节点（最近格子节点）----
+    // 同时记录每个节点关联的最小 q（用于后续 IBB 距离设定）
+    std::vector<double> node_q(n, 0.5);
+
+    for (const auto& pt : pts) {
+        // 最近格子节点（四舍五入）
+        const int i = static_cast<int>(std::round(pt.x));
+        const int j = static_cast<int>(std::round(pt.y));
+        if (i < 0 || i >= nx || j < 0 || j >= ny) continue;
+        const int idx = grid.idx(i, j);
+        grid.solid[idx] = 1;
+        node_q[idx] = pt.q;  // 记录该节点关联的 q 值
+    }
+
+    // ---- 3. 对流体节点的流-固方向对设定 q_ibb ----
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int nf = grid.idx(i, j);
+            if (grid.solid[nf]) continue;
+
+            for (int a = 1; a < Q; ++a) {
+                const int ca = d2q9::C[a][0];
+                const int cb = d2q9::C[a][1];
+                const int ni = i + ca;
+                const int nj = j + cb;
+                if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
+                const int ns = grid.idx(ni, nj);
+                if (!grid.solid[ns]) continue;
+
+                // 使用固体节点关联的 q（文件中提供的距离分数）
+                const double q = std::min(std::max(node_q[ns], 1e-5), 1.0);
+                grid.q_ibb[nf * Q + a] = static_cast<float>(q);
+            }
+        }
+    }
 }
 
 } // namespace lbm

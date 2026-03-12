@@ -14,11 +14,19 @@
 //   填充了邻居进程的 f 值，故 macroscopic 计算后幽灵节点速度也是正确的。
 //   因此，标记点的支撑域只要不超出幽灵层宽度（1 格），插值就是正确的。
 //
+//   【重要】当使用 FourPoint 核（support=2）时，支撑宽度为 2 格；
+//   若标记点距分区边界 < 2 格，插值将遗漏超出幽灵层的贡献，引入误差。
+//   建议：FourPoint 核下，IBM 标记点应距 MPI 分区边界 ≥ 2 格，
+//   或在配置中启用 2 层幽灵交换（设置 [mpi] ibm_halo_width = 2）。
+//
 // spread_force()：
 //   向本地网格（含幽灵层）写入体力。写入幽灵层的贡献在下一次 halo_exchange()
 //   时不会自动传递给邻居进程——调用方需在 spread_force() 后显式执行力场的
 //   幽灵层归并（reduce-scatter）。若 IBM 力仅用于 Guo 体力格式，且标记点始终
 //   位于物理区域内部（距块边界 ≥ 2 格），则可安全忽略此项。
+//
+//   spread_force_with_halo_reduce() 提供了自动 MPI 幽灵层力场归并功能：
+//   展布后对幽灵层力贡献执行 MPI_Allreduce，将跨块力正确累加到邻居物理层。
 
 #include "marker.hpp"
 #include "../lbm/lattice.hpp"
@@ -171,5 +179,31 @@ void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
 void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
                                MarkerSet& ms,
                                double dx);
+
+// ===========================================================================
+// IBM 固体受力统计：合力计算
+//
+// 通过对 Lagrangian 标记点的力密度加权求和，计算浸入固体所受的总合力：
+//
+//   F_x = Σ_m  mk.fx * mk.ds
+//   F_y = Σ_m  mk.fy * mk.ds
+//
+// 其中 mk.fx/fy 为 IBM 力计算（compute_ibm_forces_mdf / compute_ibm_forces_penalty
+// / MLS 方案）在各标记点处得到的力密度，mk.ds 为该标记点对应的弧长/面积元素。
+//
+// 调用时机：任一 IBM 力计算函数（compute_ibm_forces_mdf/penalty 或 MLS 方案）之后。
+// 此时 mk.fx/mk.fy 已包含本步的 IBM 力密度值。
+//
+// MPI 说明：
+//   在 MPI 模式下，若标记点已按进程分配（每进程仅持有部分标记），
+//   本函数仅统计本进程持有的标记点贡献；调用方需通过 MPI_Allreduce 求全局和。
+//   若所有进程持有完整标记点集（复制模式），则调用方无需额外归约。
+//
+// @param ms      拉格朗日标记点集
+// @param out_fx  输出 x 方向合力（格子单位）
+// @param out_fy  输出 y 方向合力（格子单位）
+// ===========================================================================
+void compute_ibm_body_force(const MarkerSet& ms,
+                             double& out_fx, double& out_fy);
 
 } // namespace ibm

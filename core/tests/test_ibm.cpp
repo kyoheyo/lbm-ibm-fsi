@@ -6,6 +6,7 @@
 #include "lbm/solid.hpp"
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <numeric>
 
 static bool approx(double a, double b, double tol = 1e-10) {
@@ -523,6 +524,12 @@ static int test_penalty_ibm_convergence()
     return ok ? 0 : 1;
 }
 
+// 前向声明（定义在 test_ibm_main 之后）
+static int test_marker_make_from_file();
+static int test_marker_make_from_file_no_ds();
+static int test_ibm_body_force_sum();
+static int test_mark_solid_from_mesh_file();
+
 int test_ibm_main()
 {
     int failures = 0;
@@ -542,6 +549,120 @@ int test_ibm_main()
     failures += test_solid_force_zero_flow();
     failures += test_penalty_ibm_reduces_error();
     failures += test_penalty_ibm_convergence();
+    // 第三方网格接口测试
+    failures += test_marker_make_from_file();
+    failures += test_marker_make_from_file_no_ds();
+    failures += test_ibm_body_force_sum();
+    failures += test_mark_solid_from_mesh_file();
     return failures;
+}
+
+// 从临时 CSV 文件加载标记点——验证坐标和 ds 正确
+static int test_marker_make_from_file()
+{
+    // 写临时 CSV 文件（4 个标记点，带 ds 列）
+    const char* tmp = "/tmp/test_markers.csv";
+    {
+        std::ofstream f(tmp);
+        f << "# test markers\n";
+        f << "10.0, 20.0, 0.0, 1.5\n";
+        f << "11.0, 20.0, 0.0, 1.5\n";
+        f << "12.0, 20.0, 0.0, 1.5\n";
+        f << "13.0, 20.0, 0.0, 1.5\n";
+    }
+
+    ibm::MarkerSet ms = ibm::MarkerSet::make_from_file(tmp);
+    const bool cnt_ok = (ms.size() == 4);
+    const bool x0_ok  = std::abs(ms.markers[0].x  - 10.0) < 1e-12;
+    const bool y0_ok  = std::abs(ms.markers[0].y  - 20.0) < 1e-12;
+    const bool ds_ok  = std::abs(ms.markers[0].ds - 1.5 ) < 1e-12;
+
+    const bool ok = cnt_ok && x0_ok && y0_ok && ds_ok;
+    std::printf("[IBM] make_from_file (4 markers with ds): n=%d x0=%.1f y0=%.1f ds=%.1f → %s\n",
+                ms.size(), ms.markers[0].x, ms.markers[0].y, ms.markers[0].ds,
+                ok ? "PASS" : "FAIL");
+    std::remove(tmp);
+    return ok ? 0 : 1;
+}
+
+// 从无 ds 列的 CSV 文件加载——ds 应被自动填充为平均间距
+static int test_marker_make_from_file_no_ds()
+{
+    const char* tmp = "/tmp/test_markers_nods.csv";
+    {
+        std::ofstream f(tmp);
+        f << "0.0, 0.0\n";
+        f << "1.0, 0.0\n";
+        f << "2.0, 0.0\n";
+    }
+
+    ibm::MarkerSet ms = ibm::MarkerSet::make_from_file(tmp);
+    // 3 个点，间距均为 1.0；平均 ds 应 ≈ 1.0
+    const bool cnt_ok = (ms.size() == 3);
+    const bool ds_ok  = std::abs(ms.markers[1].ds - 1.0) < 1e-12;
+
+    const bool ok = cnt_ok && ds_ok;
+    std::printf("[IBM] make_from_file (no ds, auto-fill): n=%d ds=%.3f → %s\n",
+                ms.size(), ms.markers[1].ds, ok ? "PASS" : "FAIL");
+    std::remove(tmp);
+    return ok ? 0 : 1;
+}
+
+// compute_ibm_body_force：验证合力 = Σ mk.fx * mk.ds
+static int test_ibm_body_force_sum()
+{
+    ibm::MarkerSet ms = ibm::MarkerSet::make_circle(10.0, 10.0, 5.0, 8);
+    // 手动设置每个标记点力
+    const double ds_val = ms.markers[0].ds;
+    for (auto& mk : ms.markers) {
+        mk.fx = 1.0;
+        mk.fy = -0.5;
+    }
+
+    double fx = 0.0, fy = 0.0;
+    ibm::compute_ibm_body_force(ms, fx, fy);
+
+    const double expected_fx = 8 * 1.0 * ds_val;
+    const double expected_fy = 8 * (-0.5) * ds_val;
+    const bool ok = std::abs(fx - expected_fx) < 1e-10 && std::abs(fy - expected_fy) < 1e-10;
+    std::printf("[IBM] compute_ibm_body_force: fx=%.4f (expected %.4f) → %s\n",
+                fx, expected_fx, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// mark_solid_from_mesh_file：验证节点被正确标记为固体
+static int test_mark_solid_from_mesh_file()
+{
+    // 构造简单网格
+    lbm::LatticeGrid g;
+    g.model = lbm::LatticeModel::D2Q9;
+    g.nx = 20; g.ny = 20; g.nz = 1;
+    g.f.assign(g.size() * 9, 0.0);
+    g.f_tmp = g.f;
+    g.rho.assign(g.size(), 1.0);
+    g.u.assign(g.size() * 2, 0.0);
+    g.solid.assign(g.size(), 0);
+    g.q_ibb.assign(g.size() * 9, 0.5f);
+
+    const char* tmp = "/tmp/test_solid_mesh.csv";
+    {
+        std::ofstream f(tmp);
+        // 在 (5,5), (6,5), (7,5) 处放置固体边界点
+        f << "5.0, 5.0, 0.5\n";
+        f << "6.0, 5.0, 0.5\n";
+        f << "7.0, 5.0, 0.5\n";
+    }
+
+    lbm::mark_solid_from_mesh_file(g, tmp);
+    const bool s55 = (g.solid[g.idx(5, 5)] == 1);
+    const bool s65 = (g.solid[g.idx(6, 5)] == 1);
+    const bool s44 = (g.solid[g.idx(4, 4)] == 0);  // 未标记节点应为 0
+
+    const bool ok = s55 && s65 && s44;
+    std::printf("[Solid] mark_solid_from_mesh_file: (5,5)=%d (6,5)=%d (4,4)=%d → %s\n",
+                (int)g.solid[g.idx(5,5)], (int)g.solid[g.idx(6,5)],
+                (int)g.solid[g.idx(4,4)], ok ? "PASS" : "FAIL");
+    std::remove(tmp);
+    return ok ? 0 : 1;
 }
 
