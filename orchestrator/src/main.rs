@@ -353,6 +353,28 @@ fn run() -> Result<()> {
     // Collect per-rank BC log lines; printed in rank order after registration to
     // avoid stdout interleaving when running under MPI.
     let mut bc_log: Vec<String> = Vec::new();
+
+    // Prepend a header showing this rank's global coordinate range.
+    if effective_mode == "block" && nprocs > 1 {
+        let region_str = if let Some(ref d) = _decomp3d {
+            format!(
+                "x=[{}, {}), y=[{}, {}), z=[{}, {})",
+                d.x_start(), d.x_start() + d.local_nx(),
+                d.y_start(), d.y_start() + d.local_ny(),
+                d.z_start(), d.z_start() + d.local_nz(),
+            )
+        } else if let Some(ref d) = _decomp2d {
+            format!(
+                "x=[{}, {}), y=[{}, {})",
+                d.x_start(), d.x_start() + d.local_nx(),
+                d.y_start(), d.y_start() + d.local_ny(),
+            )
+        } else {
+            format!("x=[0, {}), y=[0, {})", cfg.fluid.nx, cfg.fluid.ny)
+        };
+        bc_log.push(format!("  rank {:3}  region: {}", rank, region_str));
+    }
+
     for bc_cfg in &cfg.fluid.boundary_conditions {
         let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
             // 反弹类
