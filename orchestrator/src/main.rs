@@ -348,15 +348,11 @@ fn run() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // 注册边界条件（将 TOML 配置中的 [[fluid.boundary_conditions]] 传入 C++ 核心）
-    //
-    // 这是流场结果正确的关键步骤：若跳过此步骤，边界条件将不会被施加，
-    // 所有节点保持初始平衡态（u=0），流场云图值均为零。
-    //
-    // MPI 块分解注意事项（mode = "block"）：
-    // 每个进程只持有全局域的一个分区。物理壁面边界条件（South/North/West/East）
-    // 只应注册到持有对应物理边界的进程，避免内部进程将边界条件误施加到幽灵行/列上。
+    // Register boundary conditions
     // -----------------------------------------------------------------------
+    // Collect per-rank BC log lines; printed in rank order after registration to
+    // avoid stdout interleaving when running under MPI.
+    let mut bc_log: Vec<String> = Vec::new();
     for bc_cfg in &cfg.fluid.boundary_conditions {
         let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
             // 反弹类
@@ -443,18 +439,33 @@ fn run() -> Result<()> {
                 bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
                 bc_cfg.rho,
             );
-            // 仅 rank-0 打印，避免多进程并发写 stdout 导致 UTF-8 序列乱码
-            if rank == 0 {
-                println!(
-                    "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
-                    bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
-                );
+            bc_log.push(format!(
+                "  rank {:3}, {:?}, {:?}  (ux={:.4}, uy={:.4}, rho={:.4})",
+                rank, face, bc_type, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
+            ));
+        } else {
+            bc_log.push(format!(
+                "  rank {:3}, {:?}, {:?}  [skipped — not this rank's boundary]",
+                rank, face, bc_type
+            ));
+        }
+    }
+
+    // Print BC log for every rank in rank order to avoid interleaving
+    if nprocs > 1 {
+        use std::io::Write;
+        for r in 0..nprocs {
+            if rank == r {
+                for line in &bc_log {
+                    println!("{}", line);
+                }
+                let _ = std::io::stdout().flush();
             }
-        } else if rank == 0 {
-            println!(
-                "  BC skipped (not this rank's boundary): {:?} on {:?} face",
-                bc_type, face
-            );
+            lbm_bindings::mpi_barrier();
+        }
+    } else {
+        for line in &bc_log {
+            println!("{}", line);
         }
     }
 
