@@ -1,10 +1,24 @@
 #pragma once
 // core/include/ibm/interpolation.hpp — IBM 速度插值与力展布
 //
-// 提供三种 IBM 方案：
+// 提供四种 IBM 方案：
 //   1. 标准 Peskin δ 函数插值 + 直接力法（Uhlmann 2005）
 //   2. 多重直接力法（MDF-IBM，Luo et al. 2007）：迭代修正，提高无滑移精度
 //   3. 移动最小二乘插值（MLS-IBM）：高阶速度重构，适用于非均匀标记点分布
+//   4. 罚函数法（Penalty-IBM）：Goldstein 反馈力 + 积分项，稳定性好
+//
+// MPI 跨块注意事项
+// ----------------
+// interpolate_velocity() / mls_interpolate_velocity()：
+//   读取本地网格（含幽灵层）的速度值。幽灵层在 stream() 前由 halo_exchange()
+//   填充了邻居进程的 f 值，故 macroscopic 计算后幽灵节点速度也是正确的。
+//   因此，标记点的支撑域只要不超出幽灵层宽度（1 格），插值就是正确的。
+//
+// spread_force()：
+//   向本地网格（含幽灵层）写入体力。写入幽灵层的贡献在下一次 halo_exchange()
+//   时不会自动传递给邻居进程——调用方需在 spread_force() 后显式执行力场的
+//   幽灵层归并（reduce-scatter）。若 IBM 力仅用于 Guo 体力格式，且标记点始终
+//   位于物理区域内部（距块边界 ≥ 2 格），则可安全忽略此项。
 
 #include "marker.hpp"
 #include "../lbm/lattice.hpp"
@@ -75,6 +89,66 @@ void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
                              double dt   = 1.0,
                              int    n_iter  = 3,
                              DeltaKernel kernel = DeltaKernel::FourPoint);
+
+// ===========================================================================
+// 罚函数法 IBM（Penalty-IBM / Feedback Forcing）
+//
+// 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
+//       Fadlun E.A. et al. (2000) J. Comput. Phys. 161:35-60.
+//
+// 物理原理：
+//   通过在 Lagrangian 标记点处施加刚度反馈力，强迫流体速度趋向目标速度
+//   u_target（对静止边界 = 0）。力由两部分组成：
+//
+//   原始形式（令 e = u_target − u_IB 为无滑移残差，α、β 均为正数）：
+//   F(X, t) = α · e(t) + β · ∫₀ᵗ e(τ) dτ
+//
+//   等价展开（验证符号一致性）：
+//   F(X, t) = −α · (u_IB − u_target) − β · ∫₀ᵗ (u_IB − u_target) dτ
+//
+//   当 u_IB > u_target（流体速度超过目标），e < 0，F < 0，力阻减流体：
+//   例：α=8, u_IB=0.05, u_target=0 → F = 8·(-0.05) = -0.4（正确方向）。
+//
+//   其中 α 为比例增益（应为大正数，推荐 2/dt² 至 10/dt²），
+//   β 为积分增益（可选，可设 0；β > 0 时收敛更稳定）。
+//
+// 算法（每步调用）：
+//   1. 插值流体速度 → u_IB
+//   2. 计算残差 e = u_target − u_IB
+//   3. 更新积分 integral += dt · e（含抗饱和限幅）
+//   4. F = α · e + β · integral
+//   5. 展布力 F 到欧拉网格（写入 grid.force）
+//
+// 参数选择：
+//   α = K_p（"比例系数"，正数，通常取 K_p = O(1/dt²)）
+//   β = K_i（"积分系数"，非负数，通常取 K_i = 0 或 K_i ≈ K_p/100）
+//
+//   对 dt=1（格子单位），推荐 α ∈ [2, 10]。
+//   过大的 α 可能导致数值不稳定。
+//
+// @param fluid      Eulerian 流体网格（grid.force 被覆盖）
+// @param ms         Lagrangian 标记点集（mk.fx/fy 被写入最终力；mk.ux/uy 写入插值速度）
+// @param dx         格子间距
+// @param dt         时间步长（格子单位通常 = 1）
+// @param alpha      比例增益（大正数，如 8.0/dt/dt）
+// @param beta       积分增益（非负数，可设 0；mk.fz 被临时征用存储积分）
+// @param integral_x 各标记点 x 方向速度误差积分（长度 = ms.size()，需在外部持久化）
+// @param integral_y 各标记点 y 方向速度误差积分（长度 = ms.size()，需在外部持久化）
+// @param kernel     δ 函数核
+// @param u_target_x  目标 x 速度（如刚体壁面速度；常取 0.0）
+// @param u_target_y  目标 y 速度
+// ===========================================================================
+void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
+                                 MarkerSet& ms,
+                                 double dx,
+                                 double dt,
+                                 double alpha,
+                                 double beta,
+                                 std::vector<double>& integral_x,
+                                 std::vector<double>& integral_y,
+                                 DeltaKernel kernel = DeltaKernel::FourPoint,
+                                 double u_target_x = 0.0,
+                                 double u_target_y = 0.0);
 
 // ===========================================================================
 // 移动最小二乘速度插值（MLS-IBM）

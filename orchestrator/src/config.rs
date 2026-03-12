@@ -108,9 +108,50 @@ pub struct SolidConfig {
     /// 固体几何体列表（可以有零或多个）
     #[serde(default)]
     pub bodies: Vec<SolidBodyConfig>,
+    /// 固体受力输出配置（可选）。启用后，每隔 `force_output_interval` 步将
+    /// 所有固体所受的动量交换力写入 `<output.directory>/solid_force.csv`。
+    #[serde(default)]
+    pub force_output: SolidForceOutputConfig,
 }
 
 fn default_solid_bc_type() -> String { "none".to_string() }
+
+/// 固体受力输出配置
+///
+/// ```toml
+/// [solid]
+/// bc_type = "bounce_back"
+///
+/// [solid.force_output]
+/// enabled  = true          # 是否输出受力（默认 false）
+/// interval = 100           # 每隔多少步输出一次（默认 1，即每步）
+/// filename = "solid_force" # CSV 文件名前缀（默认 "solid_force"）
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolidForceOutputConfig {
+    /// 是否启用固体受力输出（默认 `false`）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 每隔多少步输出一次（默认 1，即每步）
+    #[serde(default = "default_force_interval")]
+    pub interval: u64,
+    /// 输出 CSV 文件名（不含扩展名；默认 `"solid_force"`）
+    #[serde(default = "default_force_filename")]
+    pub filename: String,
+}
+
+fn default_force_interval() -> u64  { 1 }
+fn default_force_filename() -> String { "solid_force".to_string() }
+
+impl Default for SolidForceOutputConfig {
+    fn default() -> Self {
+        SolidForceOutputConfig {
+            enabled:  false,
+            interval: default_force_interval(),
+            filename: default_force_filename(),
+        }
+    }
+}
 
 /// 单个固体几何体描述
 ///
@@ -141,6 +182,9 @@ pub struct SolidBodyConfig {
     #[serde(default)] pub j0: i32,
     #[serde(default)] pub i1: i32,
     #[serde(default)] pub j1: i32,
+    /// 可选标签（用于区分多固体输出；若为空则自动编号）
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -158,7 +202,29 @@ pub struct IbmConfig {
     /// Delta 核函数：`"two_point"` 或 `"four_point"`
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
+    /// IBM 力计算方法：
+    ///   `"mdf"`     — 多重直接力法（默认，推荐）
+    ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
+    ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
+    #[serde(default = "default_ibm_method")]
+    pub method: String,
+    /// 罚函数法比例增益（仅 `method="penalty"` 时有效）
+    ///
+    /// 正大数，推荐范围 `[2/dt², 10/dt²]`。对格子单位 dt=1，推荐 `[2, 10]`。
+    /// 值 8.0 是经验值，适合 Ma≤0.1 的低速流。过大值（>20）会引起数值振荡。
+    #[serde(default = "default_ibm_alpha")]
+    pub alpha: f64,
+    /// 罚函数法积分增益（仅 `method="penalty"` 时有效；非负数，可设 0.0）
+    #[serde(default)]
+    pub beta: f64,
+    /// MDF-IBM 子迭代次数（仅 `method="mdf"` 时有效；默认 3，建议范围 2–4）
+    #[serde(default = "default_ibm_n_iter")]
+    pub n_iter: i32,
 }
+
+fn default_ibm_method() -> String { "mdf".to_string() }
+fn default_ibm_alpha() -> f64 { 8.0 }
+fn default_ibm_n_iter() -> i32 { 3 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {

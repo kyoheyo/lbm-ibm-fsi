@@ -355,4 +355,73 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
     }
 }
 
+// ===========================================================================
+// 罚函数法 IBM（Penalty-IBM / Feedback Forcing）
+//
+// 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
+//
+// 每步调用：
+//   1. 插值 u_IBM（δ 函数加权插值）
+//   2. e = u_target − u_IBM
+//   3. integral += dt · e
+//   4. F = α·e + β·integral
+//   5. 展布 F 到欧拉力场
+//
+// integral_x / integral_y 必须在外部持久化（每步传入同一 vector）。
+// 调用方在仿真开始前将 integral_x/y 初始化为全零（std::vector<double>(ms.size(), 0.0)）。
+// ===========================================================================
+void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
+                                 MarkerSet& ms,
+                                 double dx,
+                                 double dt,
+                                 double alpha,
+                                 double beta,
+                                 std::vector<double>& integral_x,
+                                 std::vector<double>& integral_y,
+                                 DeltaKernel kernel,
+                                 double u_target_x,
+                                 double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Penalty-IBM: only D2Q9 supported currently");
+    }
+
+    const int nm = ms.size();
+
+    // 确保积分向量长度足够（自动扩展，填充 0）
+    if (static_cast<int>(integral_x.size()) < nm) integral_x.assign(nm, 0.0);
+    if (static_cast<int>(integral_y.size()) < nm) integral_y.assign(nm, 0.0);
+
+    // 1. 插值流体速度 → mk.ux, mk.uy
+    interpolate_velocity(fluid, ms, dx, kernel);
+
+    // 2-4. 计算每标记点的罚函数力
+    // 积分抗饱和上限：|integral| ≤ max_integral = 10/|beta| （若 beta > 0）
+    // 防止长时间积分项无限增大（"积分饱和"，integrator wind-up）。
+    const double max_integral = (beta > 1e-15) ? (10.0 / beta) : 1e10;
+
+    for (int m = 0; m < nm; ++m) {
+        auto& mk = ms.markers[m];
+
+        const double ex = u_target_x - mk.ux;
+        const double ey = u_target_y - mk.uy;
+
+        // 3. 更新积分（简单 Euler 积分）+ 抗饱和限幅
+        integral_x[m] += dt * ex;
+        integral_y[m] += dt * ey;
+        // 抗饱和（integrator anti-windup）：防止 beta>0 时积分无限增长
+        if (integral_x[m] >  max_integral) integral_x[m] =  max_integral;
+        if (integral_x[m] < -max_integral) integral_x[m] = -max_integral;
+        if (integral_y[m] >  max_integral) integral_y[m] =  max_integral;
+        if (integral_y[m] < -max_integral) integral_y[m] = -max_integral;
+
+        // 4. 罚函数力：F = α·e + β·integral
+        mk.fx = alpha * ex + beta * integral_x[m];
+        mk.fy = alpha * ey + beta * integral_y[m];
+    }
+
+    // 5. 展布力到欧拉网格
+    spread_force(fluid, ms, dx, kernel);
+}
+
 } // namespace ibm

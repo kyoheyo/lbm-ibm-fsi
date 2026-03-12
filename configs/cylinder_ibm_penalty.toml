@@ -1,0 +1,92 @@
+# =============================================================================
+# 圆柱绕流 IBM 算例 — 罚函数法（Penalty-IBM，Goldstein et al. 1993）
+# =============================================================================
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10 格点（直径 D = 20）
+#   入口速度 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01（格子单位）
+#   雷诺数   : Re = U_in · D / ν = 100
+#
+# IBM 方案：罚函数反馈力法（Penalty-IBM）
+#   参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
+#   原理：通过比例-积分（PI）反馈控制将标记点速度驱向目标值（0）。
+#
+#   罚函数力：F = α·(u_target − u_IBM) + β·∫(u_target − u_IBM)dt
+#     α = 8.0（比例增益，大正数）
+#     β = 0.1（积分增益，可选）
+#
+# 与 MDF-IBM 的对比：
+#   ─ MDF-IBM：子迭代直接消除无滑移误差，每步计算成本稍高（n_iter=3），但精度更确定。
+#   ─ Penalty-IBM：参数 α/β 依赖 dt 选择，稳定性边界较窄；优点是实现简单，
+#     适合理解 IBM 基本原理或快速原型验证。
+#
+# 参数说明（针对格子单位 dt=1）：
+#   α 推荐范围：[2, 10]（过大导致振荡或不稳定）
+#   β 推荐范围：[0, 0.5]（β=0 即纯比例控制）
+#
+# 使用方法：
+#   ./lbm-fsi configs/cylinder_ibm_penalty.toml
+#
+# 输出：流场快照写入 output/cylinder_ibm_penalty/（NPZ 格式）
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# IBM 浸入边界方案（Penalty-IBM）
+#
+# 注意：当前 orchestrator 中 IBM 方案由 ibm.method 字段指定：
+#   "mdf"     — 多重直接力法（默认，推荐）
+#   "penalty" — 罚函数反馈力法（需配合 alpha/beta 参数）
+#   "mls"     — 移动最小二乘插值 + 直接力
+# -----------------------------------------------------------------------------
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "penalty"    # 选择罚函数法
+alpha        = 8.0          # 比例增益（正数；稳定范围约 [2, 10]，dt=1 格子单位）
+beta         = 0.1          # 积分增益（非负数；beta=0 为纯比例控制；建议 ≤ 0.5）
+
+[output]
+write_interval = 500
+directory      = "output/cylinder_ibm_penalty"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

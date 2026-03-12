@@ -137,4 +137,55 @@ void apply_solid_ibb(LatticeGrid& grid,
                      int phys_i0, int phys_j0,
                      int phys_i1, int phys_j1);
 
+// ---------------------------------------------------------------------------
+// 固体受力统计：动量交换法（Momentum Exchange Algorithm, MEA）
+//
+// 参考：Ladd A.J.C. (1994) J. Fluid Mech. 271, 285-309.
+//       Aidun C.K. & Lu Y. (1995) J. Stat. Phys. 81(1-2):49-61.
+//
+// 原理：在每个流-固界面链接 (x_f, a) 处，流体传递给固体的动量为：
+//
+//   ΔP_a = 2 · f_post[a](x_f) · c_a
+//
+// 其中 f_post[a] 为 f_tmp 中存储的碰后（post-collision）分布函数值，
+// c_a 为该方向的格子速度向量。
+//
+// 总力（格子单位，ρ_0=1）：
+//   F_x = Σ_{所有流-固链接 (n_f, a)} 2 · f_tmp[n_f·Q+a] · c_a[x]
+//   F_y = Σ_{所有流-固链接 (n_f, a)} 2 · f_tmp[n_f·Q+a] · c_a[y]
+//
+// 调用时机：apply_solid_bounce_back() 或 apply_solid_ibb() 之后（两者均在
+//   stream() 之后调用），此时 f_tmp 中仍保存碰后分布函数。
+//
+// 注意：在 MPI 模式下，本函数仅统计本进程物理区域内的贡献，
+//   调用方需通过 MPI_Allreduce 将各进程的 (fx, fy) 求和，以得到全局力。
+//
+// @param grid    格子网格（须已完成 mark_solid_*() + stream() + apply_solid_*()）
+// @param out_fx  输出 x 方向合力（格子单位）
+// @param out_fy  输出 y 方向合力（格子单位）
+// @param phys_i0  物理区域起始列（含）；非 MPI 模式传 0
+// @param phys_j0  物理区域起始行（含）；非 MPI 模式传 0
+// @param phys_i1  物理区域结束列（含）；非 MPI 模式传 nx-1
+// @param phys_j1  物理区域结束行（含）；非 MPI 模式传 ny-1
+// ---------------------------------------------------------------------------
+void compute_solid_body_force(const LatticeGrid& grid,
+                               double& out_fx, double& out_fy,
+                               int phys_i0, int phys_j0,
+                               int phys_i1, int phys_j1);
+
+/// 非 MPI 版本（覆盖整个本地网格）。
+void compute_solid_body_force(const LatticeGrid& grid,
+                               double& out_fx, double& out_fy);
+
+// ---------------------------------------------------------------------------
+// MPI 模式下固体幽灵层标记的设计说明
+//
+// 在 MPI 块分解中，mark_solid_cylinder() / mark_solid_rectangle() 以本地坐标
+// （含幽灵行/列）完整迭代，因此幽灵层的 solid[] 和 q_ibb[] 已被正确设置——
+// 无需额外的 MPI 通信即可处理固体跨块边界的情况。
+//
+// 若将来引入运动固体（每步更新几何位置），需在每步更新几何后重新调用标记函数。
+// 此时标记函数本身不需要 MPI 通信，因为几何参数通过广播在所有进程保持一致。
+// ---------------------------------------------------------------------------
+
 } // namespace lbm

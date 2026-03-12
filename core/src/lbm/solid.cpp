@@ -292,4 +292,75 @@ void apply_solid_ibb(LatticeGrid& grid)
     apply_solid_ibb(grid, 0, 0, grid.nx - 1, grid.ny - 1);
 }
 
+// ===========================================================================
+// 固体受力统计：动量交换法（Momentum Exchange Algorithm）—— 物理区域限定版
+//
+// 调用时机：apply_solid_bounce_back() / apply_solid_ibb() 之后，
+// 此时 f_tmp 中保存碰后（post-collision）分布函数值。
+//
+// 动量交换公式（静止固体，Ladd 1994 / Aidun 1995）：
+//   F_x = Σ_{流-固链接 (n_f, a)} 2 · f_tmp[n_f·Q+a] · c_a[x]
+//   F_y = Σ_{流-固链接 (n_f, a)} 2 · f_tmp[n_f·Q+a] · c_a[y]
+//
+// MPI 模式下仅统计本进程物理区域内的贡献，调用方需在所有进程上对结果求和。
+// ===========================================================================
+void compute_solid_body_force(const LatticeGrid& grid,
+                               double& out_fx, double& out_fy,
+                               int phys_i0, int phys_j0,
+                               int phys_i1, int phys_j1)
+{
+    out_fx = 0.0;
+    out_fy = 0.0;
+
+    if (grid.model != LatticeModel::D2Q9) return;
+    if (grid.solid.empty() || grid.f_tmp.empty()) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int Q  = d2q9::Q;
+
+    double fx = 0.0, fy = 0.0;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) collapse(2) reduction(+:fx,fy)
+#endif
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
+            const int nf = grid.idx(i, j);
+            if (grid.solid[nf]) continue;  // 跳过固体节点
+
+            for (int a = 1; a < Q; ++a) {
+                const int ca = d2q9::C[a][0];
+                const int cb = d2q9::C[a][1];
+                const int ni = i + ca;
+                const int nj = j + cb;
+                if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
+                if (!grid.solid[grid.idx(ni, nj)]) continue;  // 邻居非固体
+
+                // 动量交换法（MEA）：固体受力 = 流体在流-固链接上传递的动量之和
+                // 推导：在位置 x_f（流体节点），方向 a 指向固体。
+                //   f_tmp[a](x_f)：碰后沿 +c_a 方向（流体→固体）的分布函数
+                //   标准 MEA 力分量：Δp_a = 2 · f_tmp[a] · c_a
+                //   （因为 f[a] 被固体"反射"，流体失去动量 2·f·c_a，固体得到 +2·f·c_a）
+                // 符号验证：来流 ux > 0，a 沿 +x 方向时 ca>0，f_tmp[a] > 0 → fx > 0。
+                //   这表示固体在来流方向受正力（阻力，流体推动固体）。
+                const double f_post = grid.f_tmp[nf * Q + a];
+                fx += 2.0 * f_post * ca;
+                fy += 2.0 * f_post * cb;
+            }
+        }
+    }
+
+    out_fx = fx;
+    out_fy = fy;
+}
+
+// 向后兼容版：覆盖整个本地网格（适用于非 MPI 模式）。
+void compute_solid_body_force(const LatticeGrid& grid,
+                               double& out_fx, double& out_fy)
+{
+    compute_solid_body_force(grid, out_fx, out_fy,
+                              0, 0, grid.nx - 1, grid.ny - 1);
+}
+
 } // namespace lbm

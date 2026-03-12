@@ -431,6 +431,15 @@ fn run() -> Result<()> {
                 _ => "None（固体节点已标记，但不施加反弹，仅用于调试）",
             };
             println!("  [solid] 反弹方案: {}", scheme_name);
+            if cfg.solid.force_output.enabled {
+                println!("  [solid] 受力统计: 每 {} 步输出到 {}/{}.csv（动量交换法，MEA）",
+                    cfg.solid.force_output.interval,
+                    cfg.output.directory,
+                    cfg.solid.force_output.filename);
+                if nprocs > 1 {
+                    println!("  [solid] MPI 受力统计: 各进程局部贡献通过 MPI_Allreduce 求和");
+                }
+            }
         }
     }
 
@@ -642,6 +651,35 @@ fn run() -> Result<()> {
 
     let csv_path = format!("{}/monitor.csv", output_dir);
 
+    // -----------------------------------------------------------------------
+    // IBM 标记点集（在时间循环外创建，在循环内每步调用对应 IBM 方案）
+    // -----------------------------------------------------------------------
+    let mut ibm_marker_set: Option<lbm_bindings::LbmIbmMarkerSet> =
+        if let Some(ref ibm_cfg) = cfg.ibm {
+            let ms = lbm_bindings::LbmIbmMarkerSet::new_circle(
+                ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size,
+                ibm_cfg.n_markers,
+            );
+            if rank == 0 {
+                let method_name = match ibm_cfg.method.to_lowercase().as_str() {
+                    "penalty" => format!(
+                        "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
+                        ibm_cfg.alpha, ibm_cfg.beta,
+                    ),
+                    "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
+                    _     => "MDF-IBM（多重直接力，Luo 2007，n_iter=3）".to_string(),
+                };
+                println!(
+                    "  [IBM] 方案: {}  标记点数: {}  圆心: ({}, {})  半径: {}",
+                    method_name, ibm_cfg.n_markers,
+                    ibm_cfg.x0, ibm_cfg.y0, ibm_cfg.size
+                );
+            }
+            Some(ms)
+        } else {
+            None
+        };
+
     if rank == 0 {
         println!("\nStarting time integration...");
     }
@@ -654,6 +692,21 @@ fn run() -> Result<()> {
 
     for step in 0..cfg.simulation.n_steps {
         solver.step(&mut grid);
+
+        // -- IBM：每步在 solver.step() 之后执行 IBM 方案（施加 Lagrangian 力）--------
+        // 注意：IBM 力写入 grid.force，需在下一步 step() 的 collide 阶段通过
+        //       Guo 体力格式加入碰撞算子。current step 的 IBM 力已展布到 grid.force。
+        // MPI 跨块：halo_exchange 在 step() 内部已调用，IBM 插值可安全读取幽灵层。
+        if let Some(ref mut ms) = ibm_marker_set {
+            let ibm_cfg = cfg.ibm.as_ref().unwrap();
+            let dx = 1.0_f64;
+            let dt = cfg.simulation.dt;
+            match ibm_cfg.method.to_lowercase().as_str() {
+                "penalty" => ms.step_penalty(&mut grid, dx, dt, ibm_cfg.alpha, ibm_cfg.beta),
+                "mls"     => ms.step_mls(&mut grid, dx, dt),
+                _         => ms.step_mdf(&mut grid, dx, dt, ibm_cfg.n_iter),  // 默认 MDF
+            }
+        }
 
         let time = (step + 1) as f64 * cfg.simulation.dt;
 
@@ -752,6 +805,45 @@ fn run() -> Result<()> {
                 * 0.5;
             output::append_monitor_csv(&csv_path, step + 1, time, &[("ke", ke)])
                 .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))?;
+        }
+
+        // -- 固体受力输出（动量交换法，BB / IBB 方案）--------------------------
+        // 须在 step() 之后立即调用（f_tmp 中仍保存碰后分布函数）。
+        // MPI 模式下：各进程统计本地物理区域贡献，再通过 MPI_Allreduce 求和。
+        if cfg.solid.force_output.enabled
+            && (step % cfg.solid.force_output.interval == 0
+                || step == cfg.simulation.n_steps - 1)
+        {
+            // 本进程物理区域范围
+            let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                (p.phys_x0 as i32,
+                 p.phys_y0 as i32,
+                 (p.phys_x0 + p.local_nx - 1) as i32,
+                 (p.phys_y0 + p.local_ny - 1) as i32)
+            } else {
+                (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+            };
+
+            let (local_fx, local_fy) =
+                lbm_bindings::compute_solid_force(&grid, pi0, pj0, pi1, pj1);
+
+            // MPI 模式：各进程贡献通过 Allreduce 求和
+            let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+            let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+
+            // 仅 rank-0 负责写文件
+            if rank == 0 {
+                let force_csv = format!("{}/{}.csv",
+                    output_dir, cfg.solid.force_output.filename);
+                output::append_monitor_csv(
+                    &force_csv,
+                    step + 1,
+                    time,
+                    &[("fx", global_fx), ("fy", global_fy)],
+                ).with_context(|| {
+                    format!("Failed to write solid force CSV at step {}", step + 1)
+                })?;
+            }
         }
 
         // -- 低频：Python FFI 等值线图（python-ffi 特性）-----------------------

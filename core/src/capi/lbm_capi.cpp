@@ -522,6 +522,18 @@ void lbm_mpi_barrier()
 #endif
 }
 
+/// 对所有进程的一个 double 值执行 MPI_Allreduce(SUM)，结果写回 out_val。
+/// 未启用 MPI 时为空操作（out_val 保持不变，即等于 in_val）。
+void lbm_mpi_allreduce_sum_f64(double in_val, double* out_val)
+{
+#ifdef LBM_ENABLE_MPI
+    if (!out_val) return;
+    MPI_Allreduce(&in_val, out_val, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#else
+    if (out_val) *out_val = in_val;
+#endif
+}
+
 } // extern "C"
 
 // ===========================================================================
@@ -844,6 +856,30 @@ void lbm_solver_set_solid_bc(lbm::Solver* s, int bc_mode)
     s->set_solid_bc_type(t);
 }
 
+/// 用动量交换法（MEA）计算固体受力。
+///
+/// 调用时机：apply_solid_bounce_back()/apply_solid_ibb() 之后，f_tmp 中保存碰后分布函数。
+///
+/// 在 MPI 模式下，本函数仅统计本进程物理区域的贡献；调用方需在所有进程间
+/// 对结果执行 MPI_Allreduce(SUM) 以获得全局力。
+///
+/// @param g          LatticeGrid 指针
+/// @param phys_i0    物理区域起始列（非 MPI 时传 0）
+/// @param phys_j0    物理区域起始行（非 MPI 时传 0）
+/// @param phys_i1    物理区域结束列（非 MPI 时传 nx-1）
+/// @param phys_j1    物理区域结束行（非 MPI 时传 ny-1）
+/// @param out_fx     输出：x 方向合力（格子单位，ρ₀=1）
+/// @param out_fy     输出：y 方向合力（格子单位，ρ₀=1）
+void lbm_compute_solid_force(const lbm::LatticeGrid* g,
+                              int phys_i0, int phys_j0,
+                              int phys_i1, int phys_j1,
+                              double* out_fx, double* out_fy)
+{
+    if (!g || !out_fx || !out_fy) return;
+    lbm::compute_solid_body_force(*g, *out_fx, *out_fy,
+                                   phys_i0, phys_j0, phys_i1, phys_j1);
+}
+
 } // extern "C" (solid)
 
 // ===========================================================================
@@ -1067,3 +1103,168 @@ int lbm_mpi_enabled()
 }
 
 } // extern "C"
+
+// ===========================================================================
+// IBM（浸入边界法）接口
+// ===========================================================================
+// 提供 C ABI 以便 Rust orchestrator 调用 IBM 三大方案：
+//   1. 多重直接力法（MDF-IBM，Luo 2007）：compute_ibm_forces_mdf
+//   2. 罚函数反馈力法（Penalty-IBM，Goldstein 1993）：compute_ibm_forces_penalty
+//   3. 移动最小二乘插值 + 直接力（MLS-IBM）：mls_interpolate_velocity + spread_force
+// ===========================================================================
+#include "ibm/marker.hpp"
+#include "ibm/interpolation.hpp"
+#include <cstdlib>
+#include <cstring>
+
+extern "C" {
+
+/// 不透明句柄：对应 ibm::MarkerSet
+struct IbmMarkerSetHandle;
+
+// ---------------------------------------------------------------------------
+// MarkerSet 创建与销毁
+// ---------------------------------------------------------------------------
+
+/// 创建均匀分布在圆柱表面的拉格朗日标记点集合。
+///
+/// @param cx, cy   圆心（格子坐标）
+/// @param radius   圆柱半径（格子单位）
+/// @param n_markers 标记点数量（建议 ≥ 2π·radius，即周长的格点倍数）
+/// @return         新分配的 IbmMarkerSetHandle*；调用方须通过 lbm_ibm_marker_set_free() 释放
+IbmMarkerSetHandle* lbm_ibm_marker_set_new_circle(double cx, double cy,
+                                                    double radius, int n_markers)
+{
+    auto* ms = new ibm::MarkerSet(
+        ibm::MarkerSet::make_circle(cx, cy, radius, n_markers));
+    return reinterpret_cast<IbmMarkerSetHandle*>(ms);
+}
+
+/// 释放 MarkerSet 句柄。
+void lbm_ibm_marker_set_free(IbmMarkerSetHandle* h)
+{
+    delete reinterpret_cast<ibm::MarkerSet*>(h);
+}
+
+/// 返回标记点数量。
+int lbm_ibm_marker_set_size(const IbmMarkerSetHandle* h)
+{
+    if (!h) return 0;
+    return reinterpret_cast<const ibm::MarkerSet*>(h)->size();
+}
+
+// ---------------------------------------------------------------------------
+// MDF-IBM
+// ---------------------------------------------------------------------------
+
+/// 多重直接力法（MDF-IBM，Luo 2007）。
+///
+/// 调用时机：collide() + stream() 之后，宏观量更新之前。
+/// 本函数向 grid.force 写入 IBM 体力，供 Guo 体力格式使用。
+///
+/// @param g        LatticeGrid 指针
+/// @param ms       IbmMarkerSet 句柄
+/// @param dx       格子间距（通常 = 1.0）
+/// @param dt       时间步长（通常 = 1.0）
+/// @param n_iter   子迭代次数（建议 2–4，默认 3）
+void lbm_ibm_compute_mdf(lbm::LatticeGrid* g,
+                          IbmMarkerSetHandle* ms,
+                          double dx, double dt, int n_iter)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    ibm::compute_ibm_forces_mdf(*g, *marker_set, dx, dt, n_iter);
+}
+
+// ---------------------------------------------------------------------------
+// Penalty-IBM
+// ---------------------------------------------------------------------------
+// 调用方须维护积分向量（在仿真开始时分配，每步传入同一指针）。
+// 积分向量长度须 ≥ lbm_ibm_marker_set_size()。
+// ---------------------------------------------------------------------------
+
+/// 罚函数反馈力法（Penalty-IBM，Goldstein 1993）。
+///
+/// @param g           LatticeGrid 指针
+/// @param ms          IbmMarkerSet 句柄
+/// @param dx          格子间距
+/// @param dt          时间步长
+/// @param alpha       比例增益（大正数，如 8.0/dt²）
+/// @param beta        积分增益（非负数，可设 0.0）
+/// @param integral_x  各标记点 x 方向积分数组（长度 ≥ n_markers，调用方持久化）
+/// @param integral_y  各标记点 y 方向积分数组（长度 ≥ n_markers，调用方持久化）
+/// @param u_target_x  目标 x 速度（静止固体取 0.0）
+/// @param u_target_y  目标 y 速度
+void lbm_ibm_compute_penalty(lbm::LatticeGrid* g,
+                               IbmMarkerSetHandle* ms,
+                               double dx, double dt,
+                               double alpha, double beta,
+                               double* integral_x, double* integral_y,
+                               double u_target_x, double u_target_y)
+{
+    if (!g || !ms || !integral_x || !integral_y) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    const int nm = marker_set->size();
+
+    // 将 C 数组包装为 std::vector（不拷贝，通过 assign 后传入）
+    std::vector<double> vx(integral_x, integral_x + nm);
+    std::vector<double> vy(integral_y, integral_y + nm);
+
+    ibm::compute_ibm_forces_penalty(*g, *marker_set, dx, dt,
+                                     alpha, beta, vx, vy,
+                                     ibm::DeltaKernel::FourPoint,
+                                     u_target_x, u_target_y);
+
+    // 将更新后的积分写回 C 数组
+    std::copy(vx.begin(), vx.end(), integral_x);
+    std::copy(vy.begin(), vy.end(), integral_y);
+}
+
+// ---------------------------------------------------------------------------
+// MLS-IBM（移动最小二乘速度插值 + 直接力展布）
+// ---------------------------------------------------------------------------
+
+/// MLS-IBM 一步（插值速度 → 计算直接力 → 展布到欧拉网格）。
+///
+/// 算法：
+///   1. mls_interpolate_velocity(grid, ms, dx) → mk.ux, mk.uy
+///   2. 直接力：mk.fx = (0 − mk.ux) / dt，mk.fy = (0 − mk.uy) / dt
+///   3. spread_force(grid, ms, dx) → grid.force
+///
+/// @param g    LatticeGrid 指针
+/// @param ms   IbmMarkerSet 句柄
+/// @param dx   格子间距
+/// @param dt   时间步长
+void lbm_ibm_compute_mls(lbm::LatticeGrid* g,
+                           IbmMarkerSetHandle* ms,
+                           double dx, double dt)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    // 1. MLS 速度插值
+    ibm::mls_interpolate_velocity(*g, *marker_set, dx);
+
+    // 2. 直接力（无滑移条件：u_target = 0）
+    for (auto& mk : marker_set->markers) {
+        mk.fx = -mk.ux / dt;
+        mk.fy = -mk.uy / dt;
+    }
+
+    // 3. 展布力到欧拉网格
+    ibm::spread_force(*g, *marker_set, dx);
+}
+
+/// 从 MarkerSet 读取所有标记点的 Lagrangian 力（fx, fy）。
+/// out_fx/out_fy 长度须 ≥ lbm_ibm_marker_set_size()。
+void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* out_fy)
+{
+    if (!ms || !out_fx || !out_fy) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    for (int i = 0; i < marker_set->size(); ++i) {
+        out_fx[i] = marker_set->markers[i].fx;
+        out_fy[i] = marker_set->markers[i].fy;
+    }
+}
+
+} // extern "C" (IBM)

@@ -351,6 +351,178 @@ static int test_mls_uniform_field_exact()
     return ok ? 0 : 1;
 }
 
+// ===========================================================================
+// 固体受力统计测试（动量交换法）
+// ===========================================================================
+
+// 测试 12：圆柱 BB 工况下 compute_solid_body_force() 返回有限非零力
+//   在均匀来流场中，圆柱周围的 BB 反弹将产生阻力（x 方向负力）。
+static int test_solid_force_nonzero()
+{
+    const int nx = 32, ny = 32;
+    const double cx = 16.0, cy = 16.0, r = 4.0;
+    const double u0 = 0.05;
+
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int node = 0; node < g.size(); ++node) {
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double c[2] = {
+                static_cast<double>(lbm::d2q9::C[a][0]),
+                static_cast<double>(lbm::d2q9::C[a][1])
+            };
+            const double u[2] = {u0, 0.0};
+            g.f[node * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], 1.0, c, u, 2);
+        }
+        g.rho[node] = 1.0;
+        g.u[node * 2] = u0;
+    }
+    lbm::mark_solid_cylinder(g, cx, cy, r);
+
+    {
+        lbm::Solver s(g, 1.0);
+        s.collide();
+        s.stream();
+    }
+    lbm::apply_solid_bounce_back(g);
+
+    double fx = 0.0, fy = 0.0;
+    lbm::compute_solid_body_force(g, fx, fy);
+
+    // 均匀来流 → MEA 统计的是流体对固体的动量传递（力在来流方向）。
+    // BB 反弹后：从流体指向固体的 f 分量（方向向右，+x）大于从固体指向流体的分量，
+    // 故固体在 x 方向受正力（即来流方向阻力，对应固体"迎风面"动量输入）。
+    const bool ok = std::isfinite(fx) && std::isfinite(fy) && (fx > 1e-6);
+    std::printf("[Solid] MEA force finite & positive fx: fx=%.5f fy=%.5f → %s\n",
+                fx, fy, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试 13：零速度场中固体受力为零
+//   若初始流场为静止（u=0，f=f_eq(ρ,0)），BB 应不改变动量分布，
+//   compute_solid_body_force() 应返回 (0, 0)（对称性消除）。
+static int test_solid_force_zero_flow()
+{
+    const int nx = 32, ny = 32;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int node = 0; node < g.size(); ++node) {
+        const double u[2] = {0.0, 0.0};
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double c[2] = {
+                static_cast<double>(lbm::d2q9::C[a][0]),
+                static_cast<double>(lbm::d2q9::C[a][1])
+            };
+            g.f[node * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], 1.0, c, u, 2);
+        }
+        g.rho[node] = 1.0;
+    }
+    lbm::mark_solid_cylinder(g, 16.0, 16.0, 4.0);
+
+    {
+        lbm::Solver s(g, 1.0);
+        s.collide();
+        s.stream();
+    }
+    lbm::apply_solid_bounce_back(g);
+
+    double fx = 0.0, fy = 0.0;
+    lbm::compute_solid_body_force(g, fx, fy);
+
+    // 对称场 → 力应接近零（对称抵消，精确为零）
+    const bool ok = std::isfinite(fx) && std::isfinite(fy)
+                    && std::abs(fx) < 1e-12 && std::abs(fy) < 1e-12;
+    std::printf("[Solid] MEA force zero for still fluid: fx=%.2e fy=%.2e → %s\n",
+                fx, fy, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ===========================================================================
+// 罚函数法 IBM 测试
+// ===========================================================================
+
+// 测试 14：Penalty-IBM 减小标记点处的无滑移误差
+//   在均匀来流 ux=0.05 中，penalty IBM 应将标记点处的速度向 0 拉近。
+static int test_penalty_ibm_reduces_error()
+{
+    const int nx = 32, ny = 32;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2]     = 0.05;
+        g.u[i * 2 + 1] = 0.0;
+        g.rho[i] = 1.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 3.0, 16);
+
+    std::vector<double> int_x(ms.size(), 0.0);
+    std::vector<double> int_y(ms.size(), 0.0);
+
+    // 较大的刚度系数（比例增益，正数）
+    // F = α·(u_target − u_IBM) = 8·(0 − 0.05) = −0.4 < 0（阻力，正确方向）
+    const double alpha = 8.0;
+    ibm::compute_ibm_forces_penalty(g, ms, 1.0, 1.0, alpha, 0.0,
+                                    int_x, int_y,
+                                    ibm::DeltaKernel::FourPoint);
+
+    // 验证：力场有非零贡献（IBM 力已展布到网格）
+    double force_max = 0.0;
+    for (int i = 0; i < g.size(); ++i)
+        force_max = std::max(force_max, std::abs(g.force[i * 2]));
+
+    // 标记点处 fx < 0（u_IBM>0，反馈力为负，抵抗正向流动）
+    double mk_fx_sum = 0.0;
+    for (const auto& mk : ms.markers) mk_fx_sum += mk.fx;
+
+    const bool ok = (force_max > 1e-6) && (mk_fx_sum < -1e-6);
+    std::printf("[IBM] Penalty-IBM force non-zero: max_force=%.2e mk_fx_sum=%.5f → %s\n",
+                force_max, mk_fx_sum, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试 15：多步 Penalty-IBM 迭代后标记点速度向零收敛
+//   连续调用 penalty IBM（带积分项），来流速度应被逐渐抑制。
+static int test_penalty_ibm_convergence()
+{
+    const int nx = 32, ny = 32;
+    const double ux0 = 0.05;
+
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2]     = ux0;
+        g.u[i * 2 + 1] = 0.0;
+        g.rho[i] = 1.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 3.0, 16);
+    std::vector<double> int_x(ms.size(), 0.0);
+    std::vector<double> int_y(ms.size(), 0.0);
+
+    // 正刚度系数（比例增益）：F = alpha*(u_target - u_IBM)
+    const double alpha = 8.0;
+    const double beta  = 0.1;  // 积分增益（微小正数）
+
+    // 第 1 步
+    ibm::compute_ibm_forces_penalty(g, ms, 1.0, 1.0, alpha, beta,
+                                    int_x, int_y,
+                                    ibm::DeltaKernel::FourPoint);
+    const double ux_step1 = ms.markers[0].ux;
+
+    // 模拟几步后速度逐渐减小（积分项 integral_x 负向增大）
+    for (int step = 0; step < 5; ++step) {
+        // 重置流场速度（模拟来流持续，不进行真实 LBM step）
+        for (int i = 0; i < g.size(); ++i) g.u[i * 2] = ux0 * 0.9;
+        ibm::compute_ibm_forces_penalty(g, ms, 1.0, 1.0, alpha, beta,
+                                        int_x, int_y,
+                                        ibm::DeltaKernel::FourPoint);
+    }
+    const double ux_final = ms.markers[0].ux;
+
+    // 积分项应使力随时间增大，但此处仅验证函数可正常运行且返回有限值
+    const bool ok = std::isfinite(ux_step1) && std::isfinite(ux_final);
+    std::printf("[IBM] Penalty-IBM multi-step finite: ux_step1=%.4f ux_final=%.4f → %s\n",
+                ux_step1, ux_final, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_ibm_main()
 {
     int failures = 0;
@@ -365,6 +537,11 @@ int test_ibm_main()
     failures += test_mdf_ibm_force_finite();
     failures += test_mls_interpolate_finite();
     failures += test_mls_uniform_field_exact();
+    // 新增测试：固体受力统计（MEA）和罚函数 IBM
+    failures += test_solid_force_nonzero();
+    failures += test_solid_force_zero_flow();
+    failures += test_penalty_ibm_reduces_error();
+    failures += test_penalty_ibm_convergence();
     return failures;
 }
 

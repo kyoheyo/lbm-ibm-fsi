@@ -1,0 +1,106 @@
+# =============================================================================
+# 圆柱绕流算例 — BB/IBB + 固体受力统计输出
+# =============================================================================
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10（直径 D = 20）
+#   入口速度 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01（格子单位）
+#   雷诺数   : Re = U_in · D / ν = 100
+#
+# 固体边界方案：Bouzidi 插值反弹（IBB，二阶精度）
+#
+# 受力统计：动量交换法（Momentum Exchange Algorithm, MEA）
+#   参考：Ladd A.J.C. (1994) J. Fluid Mech. 271, 285-309.
+#   每 200 步将圆柱所受合力 (Fx, Fy) 写入 solid_force.csv。
+#
+#   无量纲化：阻力系数 Cd = 2·Fx / (ρ·U²·D·L)，其中 L=1（单位深度）。
+#   格子单位：Cd_lattice = 2·Fx / (ρ_0·U²·D)
+#             ≈ 2·Fx / (1.0·0.05²·20) = Fx / 0.025
+#
+#   对于 Re=100 圆柱绕流，期望 Cd ≈ 1.3–1.5（文献基准值）。
+#
+# MPI 跨块说明：
+#   在 MPI 模式下，各进程仅统计本地物理区域内的 MEA 贡献，
+#   全局合力通过 MPI_Allreduce 在所有进程间求和。
+#   solid 数组（固体节点标志）在每个进程独立设置，包含幽灵层，
+#   因此跨块边界的固体节点已被正确标记，无需额外同步。
+#
+# 使用方法：
+#   单进程：./lbm-fsi configs/cylinder_force_output.toml
+#   MPI（4进程）：mpirun -n 4 ./lbm-fsi configs/cylinder_force_output.toml
+#
+# 输出：
+#   output/cylinder_force_output/fluid_*.npz    — 流场快照
+#   output/cylinder_force_output/solid_force.csv — 固体受力时间序列
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# [solid] 圆柱固体体（IBB 曲线边界反弹）+ 受力统计
+# -----------------------------------------------------------------------------
+[solid]
+bc_type = "interpolated_bounce_back"
+
+[[solid.bodies]]
+shape  = "cylinder"
+cx     = 150.0
+cy     = 50.0
+radius = 10.0
+label  = "cylinder"    # 可选标签（用于区分多固体时的输出标识）
+
+# 受力统计：启用后写 solid_force.csv
+[solid.force_output]
+enabled  = true          # 启用受力输出
+interval = 200           # 每 200 步输出一次（对 50000 步 → 250 个数据点）
+filename = "solid_force" # 输出文件名：output/cylinder_force_output/solid_force.csv
+
+# 输出格式（CSV 列）：step, time, fx, fy
+#   fx > 0 : 固体受到正 x 方向的合力（压差阻力 + 粘性阻力）
+#   fy     : 升力（Re=100 Kármán 涡街时随时间周期振荡）
+
+[output]
+write_interval = 500
+directory      = "output/cylinder_force_output"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
+
+# MPI 并行
+# [mpi]
+# mode      = "block"
+# nx_blocks = 1
+# ny_blocks = 0

@@ -39,6 +39,8 @@ mod ffi {
     pub enum MpiDecomp2DHandle {}
     /// 指向堆上 `lbm::MpiDecomp3D` 的不透明句柄（三维 XYZ 块分解，预留接口）。
     pub enum MpiDecomp3DHandle {}
+    /// 指向堆上 `ibm::MarkerSet` 的不透明句柄（Lagrangian 标记点集）。
+    pub enum IbmMarkerSetHandle {}
     /// 指向堆上 `lbm::GpuSolver` 的不透明句柄（CUDA 加速）。
     pub enum GpuSolverHandle {}
     /// 指向堆上 `lbm::MgTree` 的不透明句柄（多重网格嵌套关系树）。
@@ -116,6 +118,8 @@ mod ffi {
                                     root: c_int);
         /// MPI 屏障同步；未启用 MPI 时为空操作。
         pub fn lbm_mpi_barrier();
+        /// 对所有进程的一个 f64 执行 MPI_Allreduce(SUM)；未启用 MPI 时将 in_val 复制到 *out_val。
+        pub fn lbm_mpi_allreduce_sum_f64(in_val: f64, out_val: *mut f64);
 
         // --- MPI 二维块分解接口 — 实现于 core/src/capi/lbm_capi.cpp ---
         /// 创建 2D 块分解（px×py）；px*py 必须等于 MPI 进程数，否则返回 null。
@@ -225,6 +229,42 @@ mod ffi {
                                         i1: c_int, j1: c_int);
         /// 设置固体反弹方案：0=None, 1=BB, 2=IBB。
         pub fn lbm_solver_set_solid_bc(s: *mut SolverHandle, bc_mode: c_int);
+        /// 用动量交换法（MEA）计算固体受力。
+        /// 调用时机：apply_solid_bounce_back()/apply_solid_ibb() 之后（即 step() 之后）。
+        /// phys_i0/j0/i1/j1：本进程物理区域范围（非 MPI 时传 0/0/nx-1/ny-1）。
+        /// MPI 模式下本函数仅统计本进程贡献，调用方需额外通过 MPI_Allreduce 求全局和。
+        pub fn lbm_compute_solid_force(g: *const LatticeGridHandle,
+                                       phys_i0: c_int, phys_j0: c_int,
+                                       phys_i1: c_int, phys_j1: c_int,
+                                       out_fx: *mut f64, out_fy: *mut f64);
+
+        // --- IBM 浸入边界法 — 实现于 core/src/capi/lbm_capi.cpp (IBM section) ---
+        /// 创建圆柱表面标记点集（均匀分布）。
+        pub fn lbm_ibm_marker_set_new_circle(cx: f64, cy: f64, radius: f64, n_markers: c_int)
+            -> *mut IbmMarkerSetHandle;
+        /// 释放标记点集。
+        pub fn lbm_ibm_marker_set_free(h: *mut IbmMarkerSetHandle);
+        /// 返回标记点数量。
+        pub fn lbm_ibm_marker_set_size(h: *const IbmMarkerSetHandle) -> c_int;
+        /// MDF-IBM 一步：多重直接力法（n_iter 子迭代）。
+        pub fn lbm_ibm_compute_mdf(g: *mut LatticeGridHandle,
+                                   ms: *mut IbmMarkerSetHandle,
+                                   dx: f64, dt: f64, n_iter: c_int);
+        /// Penalty-IBM 一步：罚函数反馈力。integral_x/y 调用方管理（每步传入同一指针）。
+        pub fn lbm_ibm_compute_penalty(g: *mut LatticeGridHandle,
+                                       ms: *mut IbmMarkerSetHandle,
+                                       dx: f64, dt: f64,
+                                       alpha: f64, beta: f64,
+                                       integral_x: *mut f64,
+                                       integral_y: *mut f64,
+                                       u_target_x: f64, u_target_y: f64);
+        /// MLS-IBM 一步：移动最小二乘速度插值 + 直接力展布。
+        pub fn lbm_ibm_compute_mls(g: *mut LatticeGridHandle,
+                                   ms: *mut IbmMarkerSetHandle,
+                                   dx: f64, dt: f64);
+        /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
+        pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
+                                  out_fx: *mut f64, out_fy: *mut f64);
 
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
@@ -924,6 +964,189 @@ pub fn mark_solid_bc(solver: &mut LbmSolver, bc_mode: i32) {
     unsafe { ffi::lbm_solver_set_solid_bc(solver.ptr, bc_mode) };
 }
 
+/// 用动量交换法（Momentum Exchange Algorithm，MEA）计算固体所受的合力。
+///
+/// 调用时机：`solver.step()` 之后（即 BB/IBB 已施加、`f_tmp` 保存碰后分布函数时）。
+///
+/// # MPI 模式
+/// 在 MPI 块分解中，本函数仅统计本进程物理区域内的贡献。调用方需将
+/// 所有进程的 `(fx, fy)` 通过 `MPI_Allreduce(SUM)` 求和，才能得到全局力。
+/// 可通过 [`mpi_allreduce_sum_f64`] 完成此操作。
+///
+/// # 参数
+/// - `grid`：格子网格引用（须已调用 `mark_solid_cylinder/rectangle`）
+/// - `phys_i0/j0/i1/j1`：本进程物理区域范围（非 MPI 时传 `0/0/nx-1/ny-1`）
+///
+/// # 返回值
+/// `(fx, fy)`：固体受到的 x / y 方向合力（格子单位，ρ₀=1）
+pub fn compute_solid_force(grid: &LbmGrid,
+                            phys_i0: i32, phys_j0: i32,
+                            phys_i1: i32, phys_j1: i32) -> (f64, f64) {
+    let mut fx = 0.0_f64;
+    let mut fy = 0.0_f64;
+    unsafe {
+        ffi::lbm_compute_solid_force(
+            grid.ptr as *const _,
+            phys_i0, phys_j0, phys_i1, phys_j1,
+            &mut fx, &mut fy,
+        );
+    }
+    (fx, fy)
+}
+
+/// MPI 全局归约：对所有进程的一个 `f64` 值求和，结果广播到所有进程。
+///
+/// 未启用 MPI 时直接返回输入值（无操作）。
+/// 用于将各 MPI 进程的固体受力局部值归约为全局力：
+/// ```ignore
+/// let (local_fx, local_fy) = compute_solid_force(&grid, i0, j0, i1, j1);
+/// let fx = mpi_allreduce_sum_f64(local_fx);
+/// let fy = mpi_allreduce_sum_f64(local_fy);
+/// ```
+pub fn mpi_allreduce_sum_f64(local_val: f64) -> f64 {
+    let mut result = local_val;
+    unsafe { ffi::lbm_mpi_allreduce_sum_f64(local_val, &mut result) };
+    result
+}
+
+// ---------------------------------------------------------------------------
+/// IBM（浸入边界法）Lagrangian 标记点集封装
+// ---------------------------------------------------------------------------
+
+/// `ibm::MarkerSet` 的安全封装（Lagrangian 标记点集）。
+///
+/// 封装了 IBM 三大方案的步进函数：
+/// - [`LbmIbmMarkerSet::step_mdf`]：多重直接力法（MDF-IBM，Luo 2007）
+/// - [`LbmIbmMarkerSet::step_penalty`]：罚函数反馈力法（Goldstein 1993）
+/// - [`LbmIbmMarkerSet::step_mls`]：移动最小二乘 + 直接力（Wang 2009）
+///
+/// # 典型用法（MDF-IBM 圆柱绕流）
+/// ```ignore
+/// use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet};
+///
+/// let mut ms = LbmIbmMarkerSet::new_circle(150.0, 50.0, 10.0, 64);
+///
+/// for _ in 0..n_steps {
+///     solver.collide(&mut grid);
+///     solver.stream(&mut grid);
+///     ms.step_mdf(&mut grid, 1.0, 1.0, 3);   // IBM 力写入 grid.force
+///     solver.apply_guo_force(&mut grid);       // 用体力更新宏观量
+/// }
+/// ```
+pub struct LbmIbmMarkerSet {
+    ptr:        *mut ffi::IbmMarkerSetHandle,
+    n_markers:  usize,
+    /// 用于 Penalty-IBM 的 x/y 方向速度误差积分（调用方无需直接访问）
+    integral_x: Vec<f64>,
+    integral_y: Vec<f64>,
+}
+
+impl LbmIbmMarkerSet {
+    /// 创建均匀分布在圆柱表面的标记点集。
+    ///
+    /// # 参数
+    /// - `cx`, `cy`：圆心格子坐标
+    /// - `radius`：半径（格子单位）
+    /// - `n_markers`：标记点数量（建议 ≥ `(2π·radius).ceil() as u32`）
+    pub fn new_circle(cx: f64, cy: f64, radius: f64, n_markers: u32) -> Self {
+        let ptr = unsafe {
+            ffi::lbm_ibm_marker_set_new_circle(cx, cy, radius, n_markers as i32)
+        };
+        assert!(!ptr.is_null(), "lbm_ibm_marker_set_new_circle returned null");
+        let n = n_markers as usize;
+        LbmIbmMarkerSet {
+            ptr,
+            n_markers: n,
+            integral_x: vec![0.0; n],
+            integral_y: vec![0.0; n],
+        }
+    }
+
+    /// 返回标记点数量。
+    pub fn len(&self) -> usize { self.n_markers }
+
+    /// MDF-IBM 一步（多重直接力法，Luo 2007）。
+    ///
+    /// 调用时机：`collide()` + `stream()` 之后，宏观量更新之前。
+    /// 计算结果写入 `grid.force`，供 Guo 体力格式使用。
+    ///
+    /// # MPI 跨块处理
+    /// IBM 插值读取包含幽灵层的本地网格速度（halo_exchange 已填充幽灵层）。
+    /// 若标记点支撑域（4 格宽）不超出幽灵层，则跨块计算自动正确。
+    /// 若需要跨块力展布，须在本函数后执行力场幽灵层归并。
+    ///
+    /// @param grid    格子网格（读写 force 字段）
+    /// @param dx      格子间距
+    /// @param dt      时间步长
+    /// @param n_iter  子迭代次数（推荐 2–4）
+    pub fn step_mdf(&mut self, grid: &mut LbmGrid, dx: f64, dt: f64, n_iter: i32) {
+        unsafe {
+            ffi::lbm_ibm_compute_mdf(grid.ptr, self.ptr, dx, dt, n_iter)
+        }
+    }
+
+    /// Penalty-IBM 一步（罚函数反馈力法，Goldstein 1993）。
+    ///
+    /// 内部维护积分向量（不需外部管理）。
+    ///
+    /// @param grid   格子网格
+    /// @param dx     格子间距
+    /// @param dt     时间步长
+    /// @param alpha  比例增益（大正数，如 8.0/dt²）
+    /// @param beta   积分增益（非负数，可设 0.0）
+    pub fn step_penalty(&mut self, grid: &mut LbmGrid,
+                        dx: f64, dt: f64, alpha: f64, beta: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_penalty(
+                grid.ptr, self.ptr, dx, dt, alpha, beta,
+                self.integral_x.as_mut_ptr(),
+                self.integral_y.as_mut_ptr(),
+                0.0, 0.0,   // 静止固体：u_target = (0, 0)
+            )
+        }
+    }
+
+    /// MLS-IBM 一步（移动最小二乘插值 + 直接力，Wang 2009）。
+    ///
+    /// @param grid  格子网格
+    /// @param dx    格子间距
+    /// @param dt    时间步长
+    pub fn step_mls(&mut self, grid: &mut LbmGrid, dx: f64, dt: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls(grid.ptr, self.ptr, dx, dt)
+        }
+    }
+
+    /// 读取所有标记点的 Lagrangian 力 `(fx, fy)`。
+    /// 在 `step_*()` 调用后调用此函数以获取当前步的力值。
+    pub fn get_forces(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut fx = vec![0.0_f64; self.n_markers];
+        let mut fy = vec![0.0_f64; self.n_markers];
+        unsafe {
+            ffi::lbm_ibm_get_forces(self.ptr as *const _, fx.as_mut_ptr(), fy.as_mut_ptr())
+        }
+        (fx, fy)
+    }
+
+    /// 重置 Penalty-IBM 积分（用于重启仿真）。
+    pub fn reset_penalty_integrals(&mut self) {
+        self.integral_x.fill(0.0);
+        self.integral_y.fill(0.0);
+    }
+}
+
+impl Drop for LbmIbmMarkerSet {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::lbm_ibm_marker_set_free(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+// Safety: MarkerSet 内部无线程共享状态；Send/Sync 允许在线程间传递（同一时刻只能一个线程访问）。
+unsafe impl Send for LbmIbmMarkerSet {}
+unsafe impl Sync for LbmIbmMarkerSet {}
 
 // ---------------------------------------------------------------------------
 /// GPU（CUDA）求解器封装
