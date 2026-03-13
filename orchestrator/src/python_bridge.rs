@@ -22,7 +22,24 @@
 //! 仓库根目录下的 `python/` 目录必须在 `sys.path` 中，导入才能成功。
 //! 可在启动时调用 [`add_python_path`]，或在 TOML 的 `[python]` 段设置 `pythonpath`。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+/// 以子进程方式运行 Python 脚本并等待其结束。
+///
+/// 将 `interpreter script args...` 作为子进程启动，等待其完成，
+/// 并在返回非零退出码时返回 `Err`。
+pub fn run_subprocess(interpreter: &str, script: &str, args: &[&str]) -> Result<()> {
+    println!("  [python subprocess] {} {} {}", interpreter, script, args.join(" "));
+    let status = std::process::Command::new(interpreter)
+        .arg(script)
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to launch Python script: {script}"))?;
+    if !status.success() {
+        anyhow::bail!("Python script `{script}` exited with status: {status}");
+    }
+    Ok(())
+}
 
 /// 将 `extra_path` 前置到 `sys.path`，使 `lbm_pre` 和 `lbm_post`
 /// 在未通过 `pip` 安装时仍可导入。

@@ -76,6 +76,42 @@ pub struct PartitionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// 物理场提取辅助函数
+// ---------------------------------------------------------------------------
+
+/// 从 LBM 网格中提取物理节点的流场数据（ρ、ux、uy）。
+///
+/// 当 `partition` 为 `Some` 时，仅提取物理区域（跳过幽灵行/列）；
+/// 否则提取所有节点。
+///
+/// # 返回值
+///
+/// `(rho, ux, uy, nx, ny)` — 三个长度为 `nx × ny` 的行主序向量及网格尺寸。
+pub fn extract_physical_fields(
+    grid: &LbmGrid,
+    partition: Option<PartitionInfo>,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize, usize) {
+    let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+        (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+    } else {
+        (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+    };
+    let n = pnx * pny;
+    let mut rho = Vec::with_capacity(n);
+    let mut ux  = Vec::with_capacity(n);
+    let mut uy  = Vec::with_capacity(n);
+    for j in py0..(py0 + pny) {
+        for i in px0..(px0 + pnx) {
+            let idx = (j * gnx + i) as i32;
+            rho.push(grid.rho(idx));
+            ux .push(grid.ux (idx));
+            uy .push(grid.uy (idx));
+        }
+    }
+    (rho, ux, uy, pnx, pny)
+}
+
+// ---------------------------------------------------------------------------
 // NPZ 快照写出器
 // ---------------------------------------------------------------------------
 
