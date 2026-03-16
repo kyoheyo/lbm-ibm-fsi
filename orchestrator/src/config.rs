@@ -312,7 +312,8 @@ pub struct SolidBodyConfig {
 /// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
 ///
 /// 支持多个 IBM 固体体共存于同一仿真，每个体可独立设置几何形状和标签。
-/// 力计算方法（`method`/`alpha`/`beta`/`n_iter`）由顶层 `[ibm]` 全局设置统一控制。
+/// 力计算方法（`method`/`alpha`/`beta`/`n_iter`）默认继承顶层 `[ibm]` 全局设置，
+/// 也可在此处单独覆盖，从而在同一仿真中对比不同 IBM 力计算方案。
 ///
 /// ```toml
 /// [[ibm.bodies]]
@@ -321,12 +322,17 @@ pub struct SolidBodyConfig {
 /// y0        = 50.0
 /// size      = 10.0
 /// n_markers = 64
-/// label     = "cylinder_1"   # 可选；受力 CSV 文件名前缀
+/// label     = "cyl_mdf"      # 可选；受力 CSV 文件名前缀
+/// method    = "mdf"          # 可选；覆盖全局 [ibm].method
 ///
 /// [[ibm.bodies]]
-/// geometry  = "file"
-/// mesh_file = "data/markers_ellipse.csv"
-/// label     = "ellipse"
+/// geometry  = "circle"
+/// x0        = 150.0
+/// y0        = 200.0
+/// size      = 10.0
+/// n_markers = 64
+/// label     = "cyl_mls"
+/// method    = "mls"          # 与上一体不同的 IBM 方法
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbmBodyConfig {
@@ -346,6 +352,18 @@ pub struct IbmBodyConfig {
     #[serde(default)] pub label: String,
     /// 该体的受力输出配置（可选；缺省继承顶层 `[ibm].force_output`）
     #[serde(default)] pub force_output: Option<SolidForceOutputConfig>,
+    /// 该体的 IBM 力计算方法（可选；覆盖顶层 `[ibm].method`）：
+    ///   `"mdf"`     — 多重直接力法（Luo 2007）
+    ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
+    ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
+    /// 未设置时继承全局 `[ibm].method`。
+    #[serde(default)] pub method: Option<String>,
+    /// 该体的 MDF 子迭代次数（可选；覆盖顶层 `[ibm].n_iter`）
+    #[serde(default)] pub n_iter: Option<i32>,
+    /// 该体的罚函数比例增益（可选；覆盖顶层 `[ibm].alpha`）
+    #[serde(default)] pub alpha: Option<f64>,
+    /// 该体的罚函数积分增益（可选；覆盖顶层 `[ibm].beta`）
+    #[serde(default)] pub beta: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

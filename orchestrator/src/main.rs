@@ -303,16 +303,19 @@ fn run_time_loop(
 // 时间循环内辅助函数
 // ---------------------------------------------------------------------------
 
-/// 对所有 IBM 体执行一步 IBM 力计算（方法由 `cfg.ibm.method` 指定）。
+/// 对所有 IBM 体执行一步 IBM 力计算。
+///
+/// 每个体的方法参数优先使用体级覆盖（`[[ibm.bodies]]` 中的 `method`/`n_iter`/
+/// `alpha`/`beta` 字段），未设置时继承全局 `[ibm]` 设置。这允许同一仿真中
+/// 不同 IBM 体使用不同的力计算方案，以便直接对比各方法的效果。
 fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry]) {
-    let ibm_cfg = cfg.ibm.as_ref().unwrap();
     let dx = 1.0_f64;
     let dt = cfg.simulation.dt;
     for entry in ibm_entries.iter_mut() {
-        match ibm_cfg.method.to_lowercase().as_str() {
-            "penalty" => entry.ms.step_penalty(grid, dx, dt, ibm_cfg.alpha, ibm_cfg.beta),
+        match entry.method.to_lowercase().as_str() {
+            "penalty" => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
             "mls"     => entry.ms.step_mls(grid, dx, dt),
-            _         => entry.ms.step_mdf(grid, dx, dt, ibm_cfg.n_iter),
+            _         => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
         }
     }
 }

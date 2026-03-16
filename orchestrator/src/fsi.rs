@@ -71,6 +71,14 @@ pub struct IbmEntry {
     pub label: String,
     /// 受力输出配置
     pub force_cfg: SolidForceOutputConfig,
+    /// IBM 力计算方法（`"mdf"` / `"mls"` / `"penalty"`）；来自体级覆盖或全局默认
+    pub method: String,
+    /// MDF 子迭代次数（`method="mdf"` 时有效）
+    pub n_iter: i32,
+    /// 罚函数比例增益（`method="penalty"` 时有效）
+    pub alpha: f64,
+    /// 罚函数积分增益（`method="penalty"` 时有效）
+    pub beta: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +291,10 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
                 mesh_file:    ibm_cfg.mesh_file.clone(),
                 label:        String::new(),
                 force_output: None,
+                method:       None,
+                n_iter:       None,
+                alpha:        None,
+                beta:         None,
             }];
             &single_body_list
         } else {
@@ -341,15 +353,27 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
         let force_cfg = body.force_output.clone()
             .unwrap_or_else(|| ibm_cfg.force_output.clone());
 
+        // 解析体级方法参数（优先使用体级覆盖，否则继承全局 [ibm] 设置）
+        let method = body.method.clone()
+            .unwrap_or_else(|| ibm_cfg.method.clone());
+        let n_iter = body.n_iter.unwrap_or(ibm_cfg.n_iter);
+        let alpha  = body.alpha.unwrap_or(ibm_cfg.alpha);
+        let beta   = body.beta.unwrap_or(ibm_cfg.beta);
+
         if rank == 0 {
             let geom_info = match body.geometry.to_lowercase().as_str() {
                 "file"     => format!("file={:?}", body.mesh_file),
                 "filament" => format!("起点: ({}, {})  长度: {}", body.x0, body.y0, body.size),
                 _          => format!("圆心: ({}, {})  半径: {}", body.x0, body.y0, body.size),
             };
+            let method_info = if body.method.is_some() {
+                format!("  方法: {} (体级覆盖)", method)
+            } else {
+                format!("  方法: {} (继承全局)", method)
+            };
             println!(
-                "  [IBM] 体[{}] 标签={:?}  标记点数: {}  几何: {}",
-                body_idx, label, ms.len(), geom_info
+                "  [IBM] 体[{}] 标签={:?}  标记点数: {}  几何: {}{}",
+                body_idx, label, ms.len(), geom_info, method_info
             );
             if force_cfg.enabled {
                 println!(
@@ -360,7 +384,7 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             }
         }
 
-        entries.push(IbmEntry { ms, label, force_cfg });
+        entries.push(IbmEntry { ms, label, force_cfg, method, n_iter, alpha, beta });
     }
 
     Ok(entries)
