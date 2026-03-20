@@ -126,10 +126,10 @@ LBM 稳定性要求 $\tau \in (0.5, 2)$，等价于 $\nu \in (0.05, 0.5)$。若 
 | `L` | float | 参考长度（格点数） |
 
 ```python
-lbm_pre.config_gen.load_config(path) -> SolverConfig
+lbm_pre.config_gen.load_config(path) -> dict
 ```
 
-从已有 TOML 文件反序列化为 `SolverConfig` 对象（使用标准库 `tomllib`）。
+读取已有 TOML 文件并以 **普通 dict** 返回其内容（使用标准库 `tomllib`）。返回的是原始键值对字典，而非 `SolverConfig` 对象；若需要结构化对象，需自行从 dict 中取值再构造各数据类。
 
 #### 4.1.2 数据类 `BoundaryConditionConfig`
 
@@ -417,12 +417,12 @@ MeshBuilder(nx, ny, nz=1, *, lx=None, ly=None, lz=None)
 | 方法 | 说明 |
 |------|------|
 | `set_mesh_size(lc)` | 设置全局特征网格尺寸 |
-| `add_circle_obstacle(cx, cy, radius, mesh_size, tag)` | 添加圆形障碍物（孔洞） |
-| `add_rectangle_obstacle(x0, y0, width, height, mesh_size, tag)` | 添加矩形障碍物（孔洞） |
-| `build()` | 构建 Gmsh 模型（不写盘） |
-| `write(path)` | 将网格写入 `.msh` 文件 |
-| `info()` | 返回 `MeshInfo`（需先调用 `build()`） |
-| `export_surface_nodes(tag)` | 提取物理组边界节点坐标（返回 (N, 3) ndarray） |
+| `add_circle_obstacle(cx, cy, radius, mesh_size=None, tag="circle")` | 添加圆形障碍物（孔洞） |
+| `add_rectangle_obstacle(x0, y0, width, height, mesh_size=None, tag="rectangle")` | 添加矩形障碍物（孔洞） |
+| `build()` | 构建 Gmsh 模型（不写盘），返回 `self` |
+| `write(path)` | 将网格写入文件（格式由后缀推断），返回 `Path` |
+| `info()` | 返回 `MeshInfo`（若未 build 先自动调用） |
+| `finalize()` | 释放 gmsh 资源（上下文管理器自动调用） |
 
 `MeshBuilder` 支持作为上下文管理器使用（`with` 语句），在离开时自动调用 `gmsh.finalize()`：
 
@@ -434,13 +434,32 @@ with MeshBuilder(200, 80) \
     mb.write("domain.msh")
     info = mb.info()
     print(f"节点数：{info.n_nodes}，单元数：{info.n_elements}")
-    # 从圆形障碍物边界提取表面节点作为 IBM 标记点种子
-    nodes = mb.export_surface_nodes("circle")
+
+# 从已写出的 .msh 文件提取圆形障碍物边界节点作为 IBM 标记点种子
+from lbm_pre.mesh import export_surface_nodes
+nodes = export_surface_nodes("domain.msh", group_name="immersed_boundary")
+# nodes: ndarray of shape (N, 2)，按逆时针角度排序
 ```
 
-**辅助函数 `write_mesh_info(info, path=None)`**
+**模块级辅助函数**
 
-将 `MeshInfo` 输出到控制台或写入 JSON 文件（当 `path` 不为 None 时）。
+```python
+export_surface_nodes(msh_path: str | Path,
+                     group_name: str = "immersed_boundary") -> np.ndarray
+```
+
+从 `.msh` 文件中提取指定物理组的所有节点 (x, y) 坐标，按绕质心逆时针角度排序，返回形状为 **(N, 2)** 的 ndarray。适合用于从 gmsh 网格中批量导出 IBM Lagrangian 标记点种子坐标。
+
+```python
+make_channel_mesh(nx: int, ny: int, *,
+                  circle_cx: float | None = None,
+                  circle_cy: float | None = None,
+                  circle_r: float | None = None,
+                  mesh_size: float | None = None,
+                  output: str | Path = "domain.msh") -> MeshInfo
+```
+
+快捷函数：生成矩形通道（可选圆柱障碍物）并写入文件，返回 `MeshInfo`。等效于手动创建 `MeshBuilder`、调用 `add_circle_obstacle`、`build()`、`write()`。
 
 ---
 
