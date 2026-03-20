@@ -258,4 +258,209 @@ void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse)
     }
 }
 
+// ---------------------------------------------------------------------------
+// f 分布函数延拓（平衡态重建）
+// ---------------------------------------------------------------------------
+void mg_prolong_f(const MgNode& coarse, MgNode& fine)
+{
+    if (!coarse.grid || !fine.grid) {
+        throw std::invalid_argument("mg_prolong_f: both coarse and fine nodes must have grids");
+    }
+    if (fine.grid->model != LatticeModel::D2Q9) {
+        throw std::invalid_argument("mg_prolong_f: only D2Q9 is currently supported");
+    }
+
+    // 第一步：延拓宏观量 ρ/u（双线性插值）
+    mg_prolong_rho_u(coarse, fine);
+
+    // 第二步：在细网格每个节点用延拓后的 (ρ, u) 重建平衡分布函数 f
+    LatticeGrid& fg = *fine.grid;
+    const int fn = fg.size();
+
+    for (int i = 0; i < fn; ++i) {
+        const double rho_f = fg.rho[i];
+        const double ux_f  = fg.u[i * 2 + 0];
+        const double uy_f  = fg.u[i * 2 + 1];
+
+        for (int a = 0; a < d2q9::Q; ++a) {
+            const double c[2] = {
+                static_cast<double>(d2q9::C[a][0]),
+                static_cast<double>(d2q9::C[a][1])
+            };
+            const double u[2] = {ux_f, uy_f};
+            fg.f[i * d2q9::Q + a] = f_eq(d2q9::W[a], rho_f, c, u, 2);
+        }
+        // f_tmp 同步初始化为相同的平衡值（避免首步流式时使用未初始化数据）
+        for (int a = 0; a < d2q9::Q; ++a) {
+            fg.f_tmp[i * d2q9::Q + a] = fg.f[i * d2q9::Q + a];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 覆盖网格（Overset/Fringe）耦合：在细网格外边界施加粗网格 Dirichlet BC
+// ---------------------------------------------------------------------------
+void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine, int fringe_width)
+{
+    if (!coarse.grid || !fine.grid) {
+        throw std::invalid_argument("mg_apply_fringe_bc: both coarse and fine nodes must have grids");
+    }
+    if (fine.grid->model != LatticeModel::D2Q9) {
+        throw std::invalid_argument("mg_apply_fringe_bc: only D2Q9 is currently supported");
+    }
+    if (fringe_width < 1) fringe_width = 1;
+
+    const LatticeGrid& cg = *coarse.grid;
+    LatticeGrid&       fg = *fine.grid;
+
+    const int fnx = fg.nx;
+    const int fny = fg.ny;
+    const int r   = fine.refine_ratio;
+    const int d   = cg.dim();  // 2 for D2Q9
+
+    // 辅助 lambda：双线性插值粗网格宏观量到细节点 (if_local, jf_local)
+    //  — 复用与 mg_prolong_rho_u 相同的双线性插值逻辑
+    auto bilinear_rho_u = [&](int ix_fine, int jf_fine, double& rho_out, double u_out[2]) {
+        const double px = fine.extent.x_start + static_cast<double>(ix_fine) / r;
+        const double py = fine.extent.y_start + static_cast<double>(jf_fine) / r;
+
+        const int i0 = static_cast<int>(std::floor(px));
+        const int j0 = static_cast<int>(std::floor(py));
+
+        const double alpha = px - i0;
+        const double beta  = py - j0;
+
+        auto clamp_ci = [&](int ci) -> int {
+            return std::max(coarse.extent.x_start,
+                            std::min(coarse.extent.x_end, ci));
+        };
+        auto clamp_cj = [&](int cj) -> int {
+            return std::max(coarse.extent.y_start,
+                            std::min(coarse.extent.y_end, cj));
+        };
+
+        const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
+        const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
+        const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
+        const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+
+        const int c00 = cg.idx(ci00, cj00);
+        const int c10 = cg.idx(ci10, cj00);
+        const int c01 = cg.idx(ci00, cj10);
+        const int c11 = cg.idx(ci10, cj10);
+
+        const double w00 = (1.0 - alpha) * (1.0 - beta);
+        const double w10 = alpha          * (1.0 - beta);
+        const double w01 = (1.0 - alpha)  * beta;
+        const double w11 = alpha           * beta;
+
+        rho_out = w00 * cg.rho[c00] + w10 * cg.rho[c10]
+                + w01 * cg.rho[c01] + w11 * cg.rho[c11];
+        for (int k = 0; k < d; ++k) {
+            u_out[k] = w00 * cg.u[c00 * d + k] + w10 * cg.u[c10 * d + k]
+                     + w01 * cg.u[c01 * d + k] + w11 * cg.u[c11 * d + k];
+        }
+    };
+
+    // 在细网格外边界 fringe 区域（四面各 fringe_width 格）施加粗网格 Dirichlet BC
+    // 遍历细网格所有节点，判断是否位于 fringe 区域
+    for (int jy = 0; jy < fny; ++jy) {
+        for (int ix = 0; ix < fnx; ++ix) {
+            // 判断是否为 fringe 节点（位于外边界 fringe_width 层内）
+            const bool in_fringe = (ix < fringe_width || ix >= fnx - fringe_width ||
+                                    jy < fringe_width || jy >= fny - fringe_width);
+            if (!in_fringe) continue;
+
+            // 双线性插值粗网格宏观量
+            double rho_f;
+            double u_f[2] = {0.0, 0.0};
+            bilinear_rho_u(ix, jy, rho_f, u_f);
+
+            const int fi = fg.idx(ix, jy);
+
+            // 用插值宏观量重建平衡分布函数（Dirichlet BC in distribution function space）
+            fg.rho[fi]       = rho_f;
+            fg.u[fi * 2 + 0] = u_f[0];
+            fg.u[fi * 2 + 1] = u_f[1];
+            for (int a = 0; a < d2q9::Q; ++a) {
+                const double c[2] = {
+                    static_cast<double>(d2q9::C[a][0]),
+                    static_cast<double>(d2q9::C[a][1])
+                };
+                fg.f[fi * d2q9::Q + a] = f_eq(d2q9::W[a], rho_f, c, u_f, 2);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 累积时间步细化倍数
+// ---------------------------------------------------------------------------
+int mg_total_subcycle_steps(const MgNode& node)
+{
+    int total = 1;
+    const MgNode* cur = &node;
+    while (cur->parent != nullptr) {
+        total *= cur->refine_ratio;
+        cur = cur->parent;
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// AMR 细化指标：密度梯度范数
+// ---------------------------------------------------------------------------
+void mg_compute_refinement_indicator(
+    const MgNode& node,
+    std::vector<double>& indicator)
+{
+    if (!node.grid) {
+        throw std::invalid_argument("mg_compute_refinement_indicator: node.grid must not be nullptr");
+    }
+
+    const LatticeGrid& g = *node.grid;
+    const int nx = g.nx;
+    const int ny = g.ny;
+    const int n  = g.size();
+
+    indicator.assign(n, 0.0);
+
+    // 二阶中心差分 |∇ρ|（内部节点），单侧差分（边界节点）
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int c  = g.idx(i, j);
+
+            // dρ/dx（中心差分 or 单侧）
+            double drho_dx;
+            if (i == 0) {
+                const int r = g.idx(i + 1, j);
+                drho_dx = g.rho[r] - g.rho[c];
+            } else if (i == nx - 1) {
+                const int l = g.idx(i - 1, j);
+                drho_dx = g.rho[c] - g.rho[l];
+            } else {
+                const int l = g.idx(i - 1, j);
+                const int r = g.idx(i + 1, j);
+                drho_dx = 0.5 * (g.rho[r] - g.rho[l]);
+            }
+
+            // dρ/dy
+            double drho_dy;
+            if (j == 0) {
+                const int u = g.idx(i, j + 1);
+                drho_dy = g.rho[u] - g.rho[c];
+            } else if (j == ny - 1) {
+                const int d = g.idx(i, j - 1);
+                drho_dy = g.rho[c] - g.rho[d];
+            } else {
+                const int d = g.idx(i, j - 1);
+                const int u = g.idx(i, j + 1);
+                drho_dy = 0.5 * (g.rho[u] - g.rho[d]);
+            }
+
+            indicator[c] = std::sqrt(drho_dx * drho_dx + drho_dy * drho_dy);
+        }
+    }
+}
+
 } // namespace lbm

@@ -2,6 +2,7 @@
 #include "lattice.hpp"
 #include "boundary.hpp"
 #include "mpi_decomp.hpp"
+#include "solid.hpp"
 #include <vector>
 
 namespace lbm {
@@ -42,23 +43,39 @@ public:
         return bcs_;
     }
 
+    /// 设置固体节点边界条件类型。
+    /// 若设置为 BounceBack 或 InterpolatedBounceBack，则每次 step() 的 stream() 之后
+    /// 自动对 grid_.solid 中标记的固体节点施加相应反弹 BC。
+    /// 默认 SolidBCType::None（不施加，全流体模式）。
+    void set_solid_bc_type(SolidBCType t) { solid_bc_type_ = t; }
+
+    /// 返回当前固体 BC 类型。
+    [[nodiscard]] SolidBCType solid_bc_type() const { return solid_bc_type_; }
+
     /// 绑定 MPI 域分解描述符，之后每次 step() 的 stream() 末尾自动执行幽灵行交换。
     /// 传入 nullptr 可解除绑定。
     /// 仅在 LBM_ENABLE_MPI 编译宏定义时有实际效果；否则为空操作。
-    void attach_mpi(const MpiDecomp* decomp) { mpi_decomp_ = decomp; mpi_decomp2d_ = nullptr; }
+    void attach_mpi(const MpiDecomp* decomp) { mpi_decomp_ = decomp; mpi_decomp2d_ = nullptr; mpi_decomp3d_ = nullptr; }
 
     /// 绑定二维 MPI 块分解描述符（XY 方向），之后每次 step() 自动执行 2D 幽灵层交换。
     /// 传入 nullptr 可解除绑定。
     /// 仅在 LBM_ENABLE_MPI 编译宏定义时有实际效果；否则为空操作。
-    void attach_mpi2d(const MpiDecomp2D* decomp) { mpi_decomp2d_ = decomp; mpi_decomp_ = nullptr; }
+    void attach_mpi2d(const MpiDecomp2D* decomp) { mpi_decomp2d_ = decomp; mpi_decomp_ = nullptr; mpi_decomp3d_ = nullptr; }
+
+    /// 绑定三维 MPI 块分解描述符（XYZ 方向），之后每次 step() 自动执行 3D 幽灵层交换。
+    /// 传入 nullptr 可解除绑定。
+    /// 仅在 LBM_ENABLE_MPI 编译宏定义时有实际效果；否则为空操作。
+    void attach_mpi3d(const MpiDecomp3D* decomp) { mpi_decomp3d_ = decomp; mpi_decomp_ = nullptr; mpi_decomp2d_ = nullptr; }
 
 private:
     LatticeGrid&   grid_;
     double         omega_;       ///< 松弛频率  ω = 1/τ
     CollisionModel cm_;
     std::vector<BoundaryCondition> bcs_;  ///< 每步自动施加的边界条件列表
-    const MpiDecomp* mpi_decomp_ = nullptr; ///< 可选 MPI 一维域分解（nullptr = 单进程模式）
-    const MpiDecomp2D* mpi_decomp2d_ = nullptr; ///< 可选 MPI 二维块分解（nullptr = 未使用）
+    const MpiDecomp*   mpi_decomp_    = nullptr;
+    const MpiDecomp2D* mpi_decomp2d_  = nullptr;
+    const MpiDecomp3D* mpi_decomp3d_  = nullptr;
+    SolidBCType        solid_bc_type_ = SolidBCType::None;
 
     void collide_bgk();
     void collide_mrt();
@@ -75,8 +92,27 @@ private:
         int  gny2d     = 0;
         bool sg2d = false, ng2d = false, wg2d = false, eg2d = false;
 
-        /// 判断节点索引 i 是否属于幽灵层（二维模式时使用）
+        // 三维 MPI 扩展
+        bool use_mpi3d = false;
+        int  gnx3d     = 0;
+        int  gny3d     = 0;
+        int  gnz3d     = 0;
+        bool sg3d = false, ng3d = false;   ///< 南/北幽灵（Y 方向）
+        bool wg3d = false, eg3d = false;   ///< 西/东幽灵（X 方向）
+        bool bg3d = false, tg3d = false;   ///< 底/顶幽灵（Z 方向）
+
+        /// 判断节点索引 i 是否属于幽灵层（二维或三维模式时使用）
         bool is_ghost(int i) const {
+            if (use_mpi3d) {
+                const int slice = gnx3d * gny3d;
+                const int iz = i / slice;
+                const int iy = (i % slice) / gnx3d;
+                const int ix = i % gnx3d;
+                if ((bg3d && iz == 0) || (tg3d && iz == gnz3d - 1)) return true;
+                if ((sg3d && iy == 0) || (ng3d && iy == gny3d - 1)) return true;
+                if ((wg3d && ix == 0) || (eg3d && ix == gnx3d - 1)) return true;
+                return false;
+            }
             if (!use_mpi2d) return false;
             const int ix = i % gnx2d;
             const int iy = i / gnx2d;

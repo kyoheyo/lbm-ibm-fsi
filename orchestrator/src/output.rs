@@ -76,6 +76,42 @@ pub struct PartitionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// 物理场提取辅助函数
+// ---------------------------------------------------------------------------
+
+/// 从 LBM 网格中提取物理节点的流场数据（ρ、ux、uy）。
+///
+/// 当 `partition` 为 `Some` 时，仅提取物理区域（跳过幽灵行/列）；
+/// 否则提取所有节点。
+///
+/// # 返回值
+///
+/// `(rho, ux, uy, nx, ny)` — 三个长度为 `nx × ny` 的行主序向量及网格尺寸。
+pub fn extract_physical_fields(
+    grid: &LbmGrid,
+    partition: Option<PartitionInfo>,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize, usize) {
+    let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+        (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+    } else {
+        (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+    };
+    let n = pnx * pny;
+    let mut rho = Vec::with_capacity(n);
+    let mut ux  = Vec::with_capacity(n);
+    let mut uy  = Vec::with_capacity(n);
+    for j in py0..(py0 + pny) {
+        for i in px0..(px0 + pnx) {
+            let idx = (j * gnx + i) as i32;
+            rho.push(grid.rho(idx));
+            ux .push(grid.ux (idx));
+            uy .push(grid.uy (idx));
+        }
+    }
+    (rho, ux, uy, pnx, pny)
+}
+
+// ---------------------------------------------------------------------------
 // NPZ 快照写出器
 // ---------------------------------------------------------------------------
 
@@ -208,7 +244,7 @@ pub fn write_snapshot_tecplot_asc(
 
     let path = format!("{}/fluid_{:06}.dat", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建 Tecplot ASCII 文件：{path}"))?;
+        .with_context(|| format!("failed to create Tecplot ASCII file: {path}"))?;
 
     // 写文件头：标题、变量名、Zone 描述
     writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
@@ -295,7 +331,7 @@ pub fn write_snapshot_tecplot_bin(
 
     let path = format!("{}/fluid_{:06}.plt", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建 Tecplot 二进制文件：{path}"))?;
+        .with_context(|| format!("failed to create Tecplot binary file: {path}"))?;
 
     // -----------------------------------------------------------------------
     // 1. 魔数（8 字节 ASCII + 空终止）+ 字节序标志
@@ -614,7 +650,7 @@ pub fn write_global_snapshot_tecplot_asc(
 ) -> Result<()> {
     let path = format!("{}/fluid_{:06}.dat", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建合并 Tecplot ASCII 文件：{path}"))?;
+        .with_context(|| format!("failed to create combined Tecplot ASCII file: {path}"))?;
 
     writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
     writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
@@ -655,7 +691,7 @@ pub fn write_global_snapshot_tecplot_bin(
 
     let path = format!("{}/fluid_{:06}.plt", directory, step);
     let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("无法创建合并 Tecplot 二进制文件：{path}"))?;
+        .with_context(|| format!("failed to create combined Tecplot binary file: {path}"))?;
 
     // 魔数 + 字节序标志
     file.write_all(b"#!TDV112")?;

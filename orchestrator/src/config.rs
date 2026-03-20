@@ -12,6 +12,14 @@ pub struct Config {
     pub fluid: FluidConfig,
     pub structure: Option<StructureConfig>,
     pub ibm: Option<IbmConfig>,
+    /// 可选固体体配置（BB / IBB 反弹方案；圆柱、矩形等几何标记）
+    #[serde(default)]
+    pub solid: SolidConfig,
+    /// 流固耦合方案显式选择（`[fsi]`，可选）
+    ///
+    /// 不提供时退化为根据 `[solid]`/`[ibm]` 段的存在自动推断（向后兼容）。
+    #[serde(default)]
+    pub fsi: FsiConfig,
     pub output: OutputConfig,
     /// 可选 Python 集成（子进程脚本 + FFI 绘图）
     #[serde(default)]
@@ -90,22 +98,344 @@ pub struct StructureConfig {
     pub n_elements: u32,
 }
 
+// ---------------------------------------------------------------------------
+// 流固耦合方案配置（FSI coupling）
+// ---------------------------------------------------------------------------
+
+/// 流固耦合方案选择配置（`[fsi]`，可选）
+///
+/// 允许用户**显式**指定流固耦合模式，而无需依赖 `[solid]`/`[ibm]` 段的存在
+/// 来隐式推断耦合模式。显式指定能够使配置意图更加清晰，并在配置不一致时
+/// 提前报错（例如声明了 `coupling="ibm"` 但未提供 `[ibm]` 段时报错）。
+///
+/// ## 三种耦合模式
+///
+/// | `coupling` 值 | 说明 | 必须提供的段 |
+/// |---------------|------|-------------|
+/// | `"bounce_back"` / `"bb"` / `"ibb"` | 反弹格式（BB 或 IBB） | `[solid]` |
+/// | `"ibm"` | 浸入边界法（IBM） | `[ibm]` |
+/// | `"hybrid"` / `"bb_ibm"` | 反弹 + IBM 混合 | `[solid]` 和 `[ibm]` |
+/// | `"auto"`（默认） | 根据配置段自动推断（向后兼容） | 视 `[solid]`/`[ibm]` 而定 |
+///
+/// ## TOML 示例
+///
+/// ```toml
+/// # ① 纯反弹格式
+/// [fsi]
+/// coupling = "bounce_back"
+///
+/// [solid]
+/// bc_type = "interpolated_bounce_back"
+/// [[solid.bodies]]
+/// shape = "cylinder"
+/// cx = 150.0  cy = 50.0  radius = 10.0
+/// ```
+///
+/// ```toml
+/// # ② 纯 IBM 浸入边界法
+/// [fsi]
+/// coupling = "ibm"
+///
+/// [ibm]
+/// geometry = "circle"
+/// x0 = 150.0  y0 = 50.0  size = 10.0  n_markers = 64
+/// ```
+///
+/// ```toml
+/// # ③ 混合耦合（反弹 + IBM）
+/// [fsi]
+/// coupling = "hybrid"
+///
+/// [solid]
+/// bc_type = "bounce_back"
+/// [[solid.bodies]]
+/// shape = "cylinder"  cx = 100.0  cy = 50.0  radius = 8.0
+///
+/// [ibm]
+/// geometry = "circle"
+/// x0 = 250.0  y0 = 50.0  size = 10.0  n_markers = 64
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct FsiConfig {
+    /// 流固耦合模式：
+    /// - `"bounce_back"` / `"bb"` / `"ibb"`：反弹格式（需要 `[solid]` 段）
+    /// - `"ibm"`：浸入边界法（需要 `[ibm]` 段）
+    /// - `"hybrid"` / `"bb_ibm"`：反弹 + IBM 混合（需要 `[solid]` 和 `[ibm]` 段）
+    /// - `"auto"`（默认）：根据 `[solid]`/`[ibm]` 段的存在自动推断（向后兼容）
+    #[serde(default = "default_fsi_coupling")]
+    pub coupling: String,
+}
+
+fn default_fsi_coupling() -> String { "auto".to_string() }
+
+impl Default for FsiConfig {
+    fn default() -> Self {
+        FsiConfig { coupling: default_fsi_coupling() }
+    }
+}
+
+impl FsiConfig {
+    /// 将耦合模式字符串归一化为规范形式。
+    ///
+    /// | 输入 | 规范形式 |
+    /// |------|---------|
+    /// | `"bb"` / `"ibb"` | `"bounce_back"` |
+    /// | `"bb_ibm"` | `"hybrid"` |
+    /// | 其他（含 `"auto"` / `"ibm"` / `"bounce_back"` / `"hybrid"`）| 原值 |
+    pub fn normalized_coupling(&self) -> &str {
+        match self.coupling.to_lowercase().as_str() {
+            "bb" | "ibb" => "bounce_back",
+            "bb_ibm"     => "hybrid",
+            _            => self.coupling.as_str(),
+        }
+    }
+
+    /// 根据哪些 FSI 配置段存在自动推断耦合模式（仅在 `coupling="auto"` 时使用）。
+    ///
+    /// - 两段都有 → `"hybrid"`
+    /// - 仅 `[ibm]` → `"ibm"`
+    /// - 仅 `[solid]`（且非 none）→ `"bounce_back"`
+    /// - 否则 → `"none"`（无 FSI 耦合）
+    pub fn infer_coupling(has_solid: bool, has_ibm: bool) -> &'static str {
+        match (has_solid, has_ibm) {
+            (true, true)  => "hybrid",
+            (false, true) => "ibm",
+            (true, false) => "bounce_back",
+            _             => "none",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 固体体配置（BB / IBB 固体边界）
+// ---------------------------------------------------------------------------
+
+/// 顶层固体配置（`[solid]`）
+///
+/// 包含反弹方案选择（`bc_type`）和若干固体几何体的列表（`[[solid.bodies]]`）。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SolidConfig {
+    /// 反弹方案：`"none"`（默认）| `"bounce_back"` | `"interpolated_bounce_back"`
+    #[serde(default = "default_solid_bc_type")]
+    pub bc_type: String,
+    /// 固体几何体列表（可以有零或多个）
+    #[serde(default)]
+    pub bodies: Vec<SolidBodyConfig>,
+    /// 固体受力输出配置（可选）。启用后，每隔 `force_output_interval` 步将
+    /// 所有固体所受的动量交换力写入 `<output.directory>/solid_force.csv`。
+    #[serde(default)]
+    pub force_output: SolidForceOutputConfig,
+}
+
+fn default_solid_bc_type() -> String { "none".to_string() }
+
+/// 固体受力输出配置
+///
+/// ```toml
+/// [solid]
+/// bc_type = "bounce_back"
+///
+/// [solid.force_output]
+/// enabled  = true          # 是否输出受力（默认 false）
+/// interval = 100           # 每隔多少步输出一次（默认 1，即每步）
+/// filename = "solid_force" # CSV 文件名前缀（默认 "solid_force"）
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolidForceOutputConfig {
+    /// 是否启用固体受力输出（默认 `false`）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 每隔多少步输出一次（默认 1，即每步）
+    #[serde(default = "default_force_interval")]
+    pub interval: u64,
+    /// 输出 CSV 文件名（不含扩展名；默认 `"solid_force"`）
+    #[serde(default = "default_force_filename")]
+    pub filename: String,
+}
+
+fn default_force_interval() -> u64  { 1 }
+fn default_force_filename() -> String { "solid_force".to_string() }
+
+impl Default for SolidForceOutputConfig {
+    fn default() -> Self {
+        SolidForceOutputConfig {
+            enabled:  false,
+            interval: default_force_interval(),
+            filename: default_force_filename(),
+        }
+    }
+}
+
+/// 单个固体几何体描述
+///
+/// ```toml
+/// [[solid.bodies]]
+/// shape  = "cylinder"   # "cylinder" | "rectangle"
+/// cx     = 100.0        # 圆心 x（圆柱）
+/// cy     = 50.0         # 圆心 y（圆柱）
+/// radius = 20.0         # 半径（圆柱）
+///
+/// [[solid.bodies]]
+/// shape  = "rectangle"
+/// i0     = 10           # 西南角 x
+/// j0     = 5            # 西南角 y
+/// i1     = 30           # 东北角 x
+/// j1     = 25           # 东北角 y
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolidBodyConfig {
+    /// 几何形状：`"cylinder"` | `"rectangle"` | `"mesh"`
+    ///
+    /// - `"mesh"`：从外部 CSV 文件加载固体边界（第三方网格接口）。
+    ///   须同时设置 `mesh_file` 字段，指定 CSV 文件路径。
+    ///   文件格式：每行 `x, y [, q]`（格子坐标）；
+    ///   `q` 为 IBB 壁面距离分数（可选，缺省 0.5）。
+    pub shape: String,
+    // ---- 圆柱参数 ----
+    #[serde(default)] pub cx: f64,
+    #[serde(default)] pub cy: f64,
+    #[serde(default)] pub radius: f64,
+    // ---- 矩形参数 ----
+    #[serde(default)] pub i0: i32,
+    #[serde(default)] pub j0: i32,
+    #[serde(default)] pub i1: i32,
+    #[serde(default)] pub j1: i32,
+    /// 外部网格文件路径（仅 `shape="mesh"` 时有效）。
+    /// CSV 文件格式：每行 `x, y [, q]`（格子坐标；q 为 IBB 壁面距离分数，可选）。
+    #[serde(default)]
+    pub mesh_file: String,
+    /// 可选标签（用于区分多固体输出；若为空则自动编号）
+    #[serde(default)]
+    pub label: String,
+}
+
+/// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
+///
+/// 支持多个 IBM 固体体共存于同一仿真，每个体可独立设置几何形状和标签。
+/// 力计算方法（`method`/`alpha`/`beta`/`n_iter`）默认继承顶层 `[ibm]` 全局设置，
+/// 也可在此处单独覆盖，从而在同一仿真中对比不同 IBM 力计算方案。
+///
+/// ```toml
+/// [[ibm.bodies]]
+/// geometry  = "circle"
+/// x0        = 150.0
+/// y0        = 50.0
+/// size      = 10.0
+/// n_markers = 64
+/// label     = "cyl_mdf"      # 可选；受力 CSV 文件名前缀
+/// method    = "mdf"          # 可选；覆盖全局 [ibm].method
+///
+/// [[ibm.bodies]]
+/// geometry  = "circle"
+/// x0        = 150.0
+/// y0        = 200.0
+/// size      = 10.0
+/// n_markers = 64
+/// label     = "cyl_mls"
+/// method    = "mls"          # 与上一体不同的 IBM 方法
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct IbmBodyConfig {
+    /// 几何类型：`"circle"` | `"filament"` | `"file"`
+    pub geometry: String,
+    /// 中心 x（圆形）或起点 x（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub x0: f64,
+    /// 中心 y（圆形）或起点 y（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub y0: f64,
+    /// 半径（圆形）或长度（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub size: f64,
+    /// 标记点数量；`geometry="file"` 时忽略（由文件决定）
+    #[serde(default)] pub n_markers: u32,
+    /// CSV 标记点文件路径（仅 `geometry="file"` 时有效）
+    #[serde(default)] pub mesh_file: String,
+    /// 可选标签（用于区分多 IBM 固体输出；若空则自动编号）
+    #[serde(default)] pub label: String,
+    /// 该体的受力输出配置（可选；缺省继承顶层 `[ibm].force_output`）
+    #[serde(default)] pub force_output: Option<SolidForceOutputConfig>,
+    /// 该体的 IBM 力计算方法（可选；覆盖顶层 `[ibm].method`）：
+    ///   `"mdf"`     — 多重直接力法（Luo 2007）
+    ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
+    ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
+    /// 未设置时继承全局 `[ibm].method`。
+    #[serde(default)] pub method: Option<String>,
+    /// 该体的 MDF 子迭代次数（可选；覆盖顶层 `[ibm].n_iter`）
+    #[serde(default)] pub n_iter: Option<i32>,
+    /// 该体的罚函数比例增益（可选；覆盖顶层 `[ibm].alpha`）
+    #[serde(default)] pub alpha: Option<f64>,
+    /// 该体的罚函数积分增益（可选；覆盖顶层 `[ibm].beta`）
+    #[serde(default)] pub beta: Option<f64>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbmConfig {
-    /// `"circle"` 或 `"filament"`
+    /// IBM 几何类型：`"circle"` | `"filament"` | `"file"`
+    ///
+    /// **单体简写**（向后兼容）：直接在 `[ibm]` 顶层指定几何参数时，
+    /// 等价于只有一个 `[[ibm.bodies]]` 条目。
+    ///
+    /// 若同时存在 `[[ibm.bodies]]`，则忽略此字段，以 `bodies` 列表为准。
+    ///
+    /// - `"circle"`：均匀分布的圆形标记点环（需 x0/y0/size/n_markers）
+    /// - `"filament"`：沿 x 轴均匀分布的直线丝状体（需 x0/y0/size/n_markers）
+    /// - `"file"`：从外部 CSV 文件加载标记点（需 mesh_file）
+    #[serde(default)]
     pub geometry: String,
-    /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）
-    pub x0: f64,
-    /// 中心 y 坐标（圆形）或起点 y 坐标（丝状体）
-    pub y0: f64,
-    /// 半径（圆形）或长度（丝状体）
-    pub size: f64,
-    /// 拉格朗日标记点数量
-    pub n_markers: u32,
+    /// 中心 x 坐标（圆形）或起点 x 坐标（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub x0: f64,
+    /// 中心 y 坐标（圆形）或起点 y 坐标（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub y0: f64,
+    /// 半径（圆形）或长度（丝状体）；`geometry="file"` 时忽略
+    #[serde(default)] pub size: f64,
+    /// 拉格朗日标记点数量；`geometry="file"` 时忽略（由文件决定）
+    #[serde(default)] pub n_markers: u32,
+    /// 外部标记点 CSV 文件路径（仅 `geometry="file"` 时有效）。
+    /// 文件格式：每行 `x, y [, z [, ds]]`；忽略 `#` 注释行和空行。
+    #[serde(default)]
+    pub mesh_file: String,
     /// Delta 核函数：`"two_point"` 或 `"four_point"`
+    ///
+    /// 【MPI 注意】`"four_point"` 核支撑宽度为 2 格；在 MPI 模式下，
+    /// IBM 标记点应距 MPI 分区边界 ≥ 2 格，否则插值/展布会在分区边界处
+    /// 引入截断误差。可通过 `[mpi] ibm_halo_width = 2` 启用双层幽灵交换。
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
+    /// IBM 力计算方法（全局，对所有 IBM 体生效）：
+    ///   `"mdf"`     — 多重直接力法（默认，推荐）
+    ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
+    ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
+    #[serde(default = "default_ibm_method")]
+    pub method: String,
+    /// 罚函数法比例增益（仅 `method="penalty"` 时有效）
+    ///
+    /// 正大数，推荐范围 `[2/dt², 10/dt²]`。对格子单位 dt=1，推荐 `[2, 10]`。
+    /// 值 8.0 是经验值，适合 Ma≤0.1 的低速流。过大值（>20）会引起数值振荡。
+    #[serde(default = "default_ibm_alpha")]
+    pub alpha: f64,
+    /// 罚函数法积分增益（仅 `method="penalty"` 时有效；非负数，可设 0.0）
+    #[serde(default)]
+    pub beta: f64,
+    /// MDF-IBM 子迭代次数（仅 `method="mdf"` 时有效；默认 3，建议范围 2–4）
+    #[serde(default = "default_ibm_n_iter")]
+    pub n_iter: i32,
+    /// IBM 固体受力输出配置（全局默认，对所有无独立配置的 IBM 体生效）。
+    /// 启用后，每隔 `force_output.interval` 步将 IBM 合力写入 CSV 文件。
+    #[serde(default)]
+    pub force_output: SolidForceOutputConfig,
+    /// 多体 IBM 列表（`[[ibm.bodies]]`）。
+    ///
+    /// 若非空，则以此列表为准（顶层单体字段 `geometry/x0/y0/size/n_markers/mesh_file`
+    /// 将被忽略）。每个条目独立描述一个 IBM 固体体的几何。
+    ///
+    /// 向后兼容：若 `bodies` 为空且 `geometry` 非空，则自动将顶层单体字段
+    /// 当作包含一个条目的 `bodies` 列表处理（与旧版配置完全兼容）。
+    #[serde(default)]
+    pub bodies: Vec<IbmBodyConfig>,
 }
+
+fn default_ibm_method() -> String { "mdf".to_string() }
+fn default_ibm_alpha() -> f64 { 8.0 }
+fn default_ibm_n_iter() -> i32 { 3 }
+fn default_delta_kernel() -> String { "four_point".to_string() }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
@@ -271,7 +601,6 @@ fn default_lattice_model()      -> String { "D2Q9".to_string() }
 fn default_collision_model()    -> String { "BGK".to_string() }
 fn default_nz()                 -> u32    { 1 }
 fn default_rho()                -> f64    { 1.0 }
-fn default_delta_kernel()       -> String { "four_point".to_string() }
 fn default_output_dir()         -> String { "output".to_string() }
 fn default_output_format()      -> String { "npz".to_string() }
 fn default_python_interpreter() -> String { "python3".to_string() }
@@ -391,6 +720,20 @@ pub struct MpiRunConfig {
     /// Z 方向进程块数（3D 扩展预留；当前 2D 仿真时设 0 或 1；默认 1）
     #[serde(default = "default_one")]
     pub nz_blocks: u32,
+    /// IBM 幽灵层宽度（仅 IBM 方案时有效；默认 1）。
+    ///
+    /// 使用 `"four_point"` δ 函数核时，IBM 插值/展布的支撑宽度为 2 格；
+    /// 若 IBM 标记点距 MPI 块边界 < 2 格，需将此值设为 `2` 以启用双层幽灵交换，
+    /// 消除块边界处的截断误差。
+    ///
+    /// | 核函数 | 支撑宽度 | 建议值 |
+    /// |--------|----------|--------|
+    /// | `"two_point"` | 1 格 | 1（默认） |
+    /// | `"four_point"`（默认）| 2 格 | 2（标记点靠近块边界时）|
+    ///
+    /// 设置为 `0` 或省略时使用默认值 1。
+    #[serde(default = "default_one")]
+    pub ibm_halo_width: u32,
 }
 
 fn default_one()  -> u32 { 1 }
@@ -399,10 +742,11 @@ fn default_zero() -> u32 { 0 }
 impl Default for MpiRunConfig {
     fn default() -> Self {
         MpiRunConfig {
-            mode:      default_mpi_mode(),
-            nx_blocks: 1,
-            ny_blocks: 0,   // 0 = 自动：由 nprocs 决定
-            nz_blocks: 1,
+            mode:           default_mpi_mode(),
+            nx_blocks:      1,
+            ny_blocks:      0,   // 0 = 自动：由 nprocs 决定
+            nz_blocks:      1,
+            ibm_halo_width: 1,
         }
     }
 }
@@ -435,6 +779,28 @@ impl MpiRunConfig {
             self.ny_blocks.max(1)
         };
         (px, py)
+    }
+
+    /// 计算有效的 (nx_blocks, ny_blocks, nz_blocks)：
+    /// - `ny_blocks == 0` 且 `nz_blocks <= 1` 时，退化为 1D Y 切片
+    /// - 当 `nz_blocks > 1` 时启用三维分解（Z 方向切分）
+    ///
+    /// 注意：此函数仅按整除方式估算 py；调用方须在使用前验证
+    ///   px * py * pz == nprocs，不满足时应回退到兼容分解（参见 main.rs 中的检查）。
+    pub fn effective_blocks_3d(&self, nprocs: i32) -> (u32, u32, u32) {
+        let pz = self.nz_blocks.max(1);
+        let px = self.nx_blocks.max(1);
+        let py = if self.ny_blocks == 0 && pz == 1 {
+            // 2D 模式：均匀分配给 Y 方向
+            (nprocs as u32).max(1) / px
+        } else if self.ny_blocks == 0 {
+            // 3D 模式：剩余进程均匀分配给 Y 方向（nprocs / (px * pz)）
+            let rem = (nprocs as u32).max(1) / (px * pz);
+            rem.max(1)
+        } else {
+            self.ny_blocks.max(1)
+        };
+        (px, py, pz)
     }
 }
 
@@ -625,5 +991,93 @@ mod tests {
         assert_eq!(cfg.plugins.motion,   "");
         assert_eq!(cfg.plugins.flexible, "");
         assert!(!cfg.plugins.any_active());
+    }
+
+    #[test]
+    fn test_fsi_config_default() {
+        // [fsi] 段缺失时，coupling 应默认为 "auto"
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.coupling, "auto");
+        assert_eq!(cfg.fsi.normalized_coupling(), "auto");
+    }
+
+    #[test]
+    fn test_fsi_config_explicit() {
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+
+            [fsi]
+            coupling = "ibm"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.coupling, "ibm");
+        assert_eq!(cfg.fsi.normalized_coupling(), "ibm");
+    }
+
+    #[test]
+    fn test_fsi_config_aliases() {
+        // bb / ibb → bounce_back
+        let c1 = FsiConfig { coupling: "bb".to_string() };
+        assert_eq!(c1.normalized_coupling(), "bounce_back");
+
+        let c2 = FsiConfig { coupling: "ibb".to_string() };
+        assert_eq!(c2.normalized_coupling(), "bounce_back");
+
+        // bb_ibm → hybrid
+        let c3 = FsiConfig { coupling: "bb_ibm".to_string() };
+        assert_eq!(c3.normalized_coupling(), "hybrid");
+    }
+
+    #[test]
+    fn test_fsi_infer_coupling() {
+        assert_eq!(FsiConfig::infer_coupling(true, true),   "hybrid");
+        assert_eq!(FsiConfig::infer_coupling(false, true),  "ibm");
+        assert_eq!(FsiConfig::infer_coupling(true, false),  "bounce_back");
+        assert_eq!(FsiConfig::infer_coupling(false, false), "none");
+    }
+
+    #[test]
+    fn test_fsi_config_hybrid() {
+        let toml_str = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+
+            [fsi]
+            coupling = "hybrid"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fsi.normalized_coupling(), "hybrid");
     }
 }

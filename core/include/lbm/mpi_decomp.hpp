@@ -276,7 +276,7 @@ struct MpiDecomp3D {
 ///   j=1..local_ny  : 物理行
 ///   j=local_ny+1   : 北幽灵（接收北邻底物理行）
 ///
-/// 由 Solver::stream() 在 std::swap 之后、apply_BC() 之前自动调用。
+/// 由 Solver::stream() 在 stream 循环之前（碰后）自动调用。
 // ---------------------------------------------------------------------------
 void halo_exchange_d2q9(LatticeGrid& g, const MpiDecomp& decomp);
 
@@ -289,11 +289,27 @@ void halo_exchange_d2q9(LatticeGrid& g, const MpiDecomp& decomp);
 ///   1. 南北方向：整行交换（MPI_Sendrecv，一次发送整行 f 数据）
 ///   2. 东西方向：整列交换（MPI_Sendrecv，列数据需先打包到临时缓冲区）
 ///
-/// 由 Solver::stream() 在 std::swap 之后、apply_BC() 之前自动调用（若绑定了 MpiDecomp2D）。
+/// 由 Solver::stream() 在 stream 循环之前（碰后）自动调用（若绑定了 MpiDecomp2D）。
 ///
 /// 一维特例（px=1 或 py=1）：对应方向无幽灵列/行，自动跳过对应 Sendrecv。
 // ---------------------------------------------------------------------------
 void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp);
+
+// ---------------------------------------------------------------------------
+/// 三维模式（XYZ 方向）幽灵层交换（D3Q19/D3Q27）
+///
+/// 约定：g.nx/ny/nz 均已包含幽灵层（各方向各加 0~2 层）：
+///   k=0                   : 底幽灵层（pz_rank>0 时存在）
+///   k=phys_z0..+lnz-1     : 物理层
+///   k=phys_z0+lnz         : 顶幽灵层（pz_rank<pz-1 时存在）
+///   j=0 / j=phys_y0+lny   : 南/北幽灵行（类似二维）
+///   i=0 / i=phys_x0+lnx   : 西/东幽灵列（类似二维）
+///
+/// 交换顺序：先 Z（底/顶），再 Y（南/北），最后 X（西/东），每方向均使用 MPI_Sendrecv。
+///
+/// 由 Solver::stream() 在 stream 循环之前（碰后）自动调用（若绑定了 MpiDecomp3D）。
+// ---------------------------------------------------------------------------
+void halo_exchange_d3q19_3d(LatticeGrid& g, const MpiDecomp3D& decomp);
 #endif
 
 } // namespace lbm

@@ -22,6 +22,8 @@ LatticeGrid::LatticeGrid(int nx_, int ny_, int nz_, LatticeModel model_)
     rho.assign(n, 1.0);            // 密度初始化为 1（格子单位）
     u.assign(n * d, 0.0);          // 速度初始化为零
     force.assign(n * d, 0.0);      // 体力初始化为零
+    solid.assign(n, 0);            // 固体标记初始化为全流体
+    q_ibb.assign(n * q, 0.5f);     // IBB 距离分数默认 0.5（半步长反弹）
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,87 @@
+# =============================================================================
+# 圆柱绕流 IBM 算例 — 移动最小二乘插值（MLS-IBM，Wang et al. 2009）
+# =============================================================================
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10 格点（直径 D = 20）
+#   入口速度 : U_in = 0.05（格子单位），Re = 100
+#
+# IBM 方案：MLS-IBM（移动最小二乘速度插值 + 直接力展布）
+#   参考：Liu W.K. et al. (1997) Int. J. Numer. Meth. Fluids 25:1387-1407.
+#         Wang Z. et al. (2009) J. Comput. Phys. 228:1963-1978.
+#
+#   与标准 Peskin δ 函数插值的区别：
+#   ─ Peskin δ 函数：简单加权插值，权函数宽度固定（4 格），精度 O(Δx²)。
+#   ─ MLS-IBM：用移动最小二乘构造线性多项式基，精度更高（特别在标记点
+#     密度不均匀时），对曲线边界的法向梯度重构更准确。
+#
+#   权函数：Gaussian w(r) = exp(−r²/h²)，h = 2.5·dx，支撑半径 2.5 格。
+#
+# 与 MDF-IBM 的对比：
+#   ─ MDF-IBM (method="mdf")：3 次子迭代 + Peskin δ，每步成本稍高，精度确定。
+#   ─ MLS-IBM (method="mls")：单次直接力 + MLS 插值，标记点分布不均匀时优势明显。
+#   ─ 对均匀分布标记点（本算例），两者精度相近；MLS 在非均匀分布时更佳。
+#
+# 使用方法：
+#   ./lbm-fsi configs/cylinder_ibm_mls.toml
+#
+# 输出：流场快照写入 output/cylinder_ibm_mls/（NPZ 格式）
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# IBM 浸入边界方案（MLS-IBM）
+# method = "mls" 使用 mls_interpolate_velocity() 替代标准 Peskin δ 插值
+# 力展布仍使用标准 Peskin δ spread_force（保持力守恒）
+# -----------------------------------------------------------------------------
+[fsi]
+coupling = "ibm"   # ② 纯 IBM 浸入边界法
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mls"        # 移动最小二乘速度插值 + 直接力
+
+[output]
+write_interval = 500
+directory      = "output/cylinder_ibm_mls"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

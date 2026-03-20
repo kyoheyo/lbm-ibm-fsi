@@ -1,13 +1,16 @@
 mod config;
+mod fsi;
 mod output;
 mod python_bridge;
+mod sim;
 
-use clap::Parser;
 use std::path::PathBuf;
+
 use anyhow::{Context, Result};
+use clap::Parser;
 
 use config::Config;
-use lbm_bindings::{LatticeModel, CollisionModel, LbmGrid, LbmSolver, BcType, Face};
+use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmSolver};
 use output::PartitionInfo;
 
 // ---------------------------------------------------------------------------
@@ -49,624 +52,138 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-/// 以子进程方式运行 Python 脚本并等待其结束。
-fn run_python_subprocess(interpreter: &str, script: &str, args: &[&str]) -> Result<()> {
-    println!("  [python subprocess] {} {} {}", interpreter, script, args.join(" "));
-    let status = std::process::Command::new(interpreter)
-        .arg(script)
-        .args(args)
-        .status()
-        .with_context(|| format!("Failed to launch Python script: {script}"))?;
-
-    if !status.success() {
-        anyhow::bail!("Python script `{script}` exited with status: {status}");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 /// 真正的求解器入口（在 MPI init/finalize 包装内执行）。
 fn run() -> Result<()> {
     let args = Args::parse();
     let mut cfg = Config::from_file(&args.config)?;
+    if let Some(n) = args.steps { cfg.simulation.n_steps = n; }
 
-    if let Some(n) = args.steps {
-        cfg.simulation.n_steps = n;
-    }
-
-    // 读取 rank 和进程数（mpi_init() 已在调用者 main() 中完成）。
-    // 在非 MPI 模式下 rank=0, nprocs=1，此处调用安全。
+    // MPI rank / 进程数（mpi_init() 已在调用者 main() 中完成）
     let rank   = lbm_bindings::mpi_rank();
     let nprocs = lbm_bindings::mpi_size();
 
-    // -----------------------------------------------------------------------
-    // 应用并行配置：OpenMP 线程数（必须在所有进程上生效，不只 rank-0）
-    // -----------------------------------------------------------------------
+    // 应用并行配置（OpenMP 线程数必须在所有进程上生效）
     if cfg.parallel.omp_num_threads > 0 {
         lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
     }
 
-    // 进程头部信息：仅 rank-0 打印（避免 MPI 多进程重复输出）。
-    if rank == 0 {
-        println!("=== LBM-IBM-FSI 求解器 ===");
-        println!("配置文件 : {}", args.config.display());
-        println!("网格     : {}×{}×{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
-        println!("步数     : {}", cfg.simulation.n_steps);
-        println!("模型     : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
-        println!("松弛频率 : ω = {:.6}", cfg.omega());
-        println!("输出格式 : {} → {}", cfg.output.format, {
-            match cfg.output.format.as_str() {
-                "tecplot_asc" => "fluid_NNNNNN.dat（ASCII Tecplot）",
-                "tecplot_bin" => "fluid_NNNNNN.plt（二进制 Tecplot TDV112）",
-                _             => "fluid_NNNNNN.npz（NumPy 压缩归档）",
-            }
-        });
-        if cfg.parallel.omp_num_threads > 0 {
-            println!("OpenMP   : 线程数 = {}（由 [parallel].omp_num_threads 设置）",
-                     cfg.parallel.omp_num_threads);
-        }
-        lbm_bindings::print_parallel_status();
+    // 打印头部信息（rank-0 only，避免 MPI 多进程重复输出）
+    if rank == 0 { print_header(&cfg, &args.config, nprocs); }
 
-        // 打印 MPI 模式信息
-        {
-            let (norm_mode, _) = cfg.mpi.normalized_mode();
-            match norm_mode {
-                "block" => {
-                    let (px, py) = cfg.mpi.effective_blocks(nprocs);
-                    if px == 1 {
-                        println!("MPI模式  : 一维 Y 方向切片（ny_blocks={}）", py);
-                    } else if py == 1 {
-                        println!("MPI模式  : 一维 X 方向切片（nx_blocks={}）", px);
-                    } else {
-                        println!("MPI模式  : 二维块分解 {}×{}", px, py);
-                    }
-                }
-                "multigrid"   => println!("MPI模式  : 嵌套多重网格（框架模式，当前退化为独立）"),
-                "independent" => println!("MPI模式  : 多进程独立（每进程独立仿真，无通信）"),
-                _             => println!("MPI模式  : {}", cfg.mpi.mode),
-            }
-        }
-
-        // 插件启动日志
-        if cfg.plugins.any_active() {
-            println!("Plugins:");
-            if !cfg.plugins.boundary.is_empty() {
-                println!("  boundary  = \"{}\"  (IBoundaryPlugin)", cfg.plugins.boundary);
-            }
-            if !cfg.plugins.mesh.is_empty() {
-                println!("  mesh      = \"{}\"  (IMeshPlugin)", cfg.plugins.mesh);
-            }
-            if !cfg.plugins.motion.is_empty() {
-                println!("  motion    = \"{}\"  (IMotionPlugin)", cfg.plugins.motion);
-            }
-            if !cfg.plugins.flexible.is_empty() {
-                println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
-            }
-            // 注意：若要注册插件实现，请在仿真循环前调用：
-            //   lbm_bindings::register_plugins(PluginCallbacks { boundary_fn: Some(my_fn), .. })
-            // 上方的插件名称仅供提示，不自动加载共享库。
-        }
-    } // end rank-0 header output
-
-    // -----------------------------------------------------------------------
-    // Python FFI：扩展 sys.path 使 lbm_pre / lbm_post 可导入
-    // -----------------------------------------------------------------------
+    // Python sys.path 扩展（未启用 python-ffi 时为无操作）
     if let Some(ref extra_path) = cfg.python.pythonpath {
-        // 未启用 python-ffi 特性时，add_python_path 为无操作（返回 Ok）
         if let Err(e) = python_bridge::add_python_path(extra_path) {
             eprintln!("[python-ffi] sys.path extension failed: {e}");
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 预处理：Python 子进程脚本（仅 rank-0 运行，避免 MPI 多进程重复启动子进程）
-    // -----------------------------------------------------------------------
+    // 预处理：Python 子进程（rank-0 only，避免多进程重复启动）
     if rank == 0 {
         if let Some(ref script) = cfg.python.pre_script.clone() {
             println!("\n--- Pre-processing (Python subprocess) ---");
             let config_str = args.config.to_string_lossy().into_owned();
-            run_python_subprocess(&cfg.python.interpreter, script, &[&config_str])?;
+            python_bridge::run_subprocess(&cfg.python.interpreter, script, &[&config_str])?;
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 通过 Python FFI 生成 IBM 标记点（不产生 CSV 文件）
-    // -----------------------------------------------------------------------
+    // IBM 标记点生成（python-ffi 特性，进程内不产生 CSV）
     #[cfg(feature = "python-ffi")]
-    {
-        if let Some(ref ibm) = cfg.ibm {
-            println!("\n[python-ffi] generating IBM markers in-process ...");
-            match python_bridge::markers_from_geometry(
-                &ibm.geometry, ibm.x0, ibm.y0, ibm.size, ibm.n_markers,
-            ) {
-                Ok((x, y, ds)) => {
-                    let x_min = x.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let x_max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let y_min = y.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let y_max = y.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    println!(
-                        "  => {} markers  x=[{:.2},{:.2}]  y=[{:.2},{:.2}]  ds~={:.4}",
-                        x.len(), x_min, x_max, y_min, y_max,
-                        ds.first().copied().unwrap_or(0.0),
-                    );
-                    // TODO: 待 lbm_bindings 暴露对应接口后，
-                    //       将 (x, y, ds) 转发给 C++ IBM 核心。
-                    let _ = (x, y, ds);
-                }
-                Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),
-            }
-        }
-    }
+    generate_ibm_markers_ffi(&cfg);
 
-    let model = match cfg.simulation.lattice_model.as_str() {
-        "D3Q19" => LatticeModel::D3Q19,
-        "D3Q27" => LatticeModel::D3Q27,
-        _       => LatticeModel::D2Q9,
-    };
+    // 解析格子模型与碰撞模型
+    let model = parse_lattice_model(&cfg.simulation.lattice_model);
+    let cm    = parse_collision_model(&cfg.simulation.collision_model);
 
-    let cm = match cfg.simulation.collision_model.as_str() {
-        "MRT" => CollisionModel::Mrt,
-        _     => CollisionModel::Bgk,
-    };
+    // MPI 域分解设置
+    let mut mpi = sim::MpiDecomp::setup(&cfg, nprocs)?;
 
-    // -----------------------------------------------------------------------
-    // MPI 域分解：根据 [mpi] 配置计算本进程的本地网格尺寸
-    //
-    // 三种模式（均通过 MpiDecomp2D 实现，1D 是 2D 的特例）：
-    //   "block"       : XY 块分解（nx_blocks=1 → 1D Y；ny_blocks=1 → 1D X）
-    //   "independent" : 每进程独立仿真，无通信（旧名 "multi_grid"）
-    //   "multigrid"   : 嵌套多重网格框架（当前版本退化为独立模式）
-    //
-    // 旧名称兼容：
-    //   "1d_y"  → "block" (nx_blocks=1, ny_blocks=nprocs)
-    //   "2d_xy" → "block"
-    //   "multi_grid" → "independent"
-    //
-    // rank 和 nprocs 已在函数顶部通过 mpi_rank()/mpi_size() 初始化。
-    // -----------------------------------------------------------------------
-    // 归一化模式名称（旧名 → 新名）
-    let (effective_mode, mode_was_renamed) = cfg.mpi.normalized_mode();
-    if mode_was_renamed && nprocs > 1 {
-        eprintln!(
-            "[info] mpi.mode {:?} is deprecated; using {:?}. \
-             See docs/MPI并行详解.md for the new mode names.",
-            cfg.mpi.mode, effective_mode
+    // 本进程本地网格尺寸（MPI 块分解时 < 全局；单进程时 = 全局）
+    let (grid_nx, grid_ny, grid_nz) = mpi.local_grid_size(&cfg);
+    print_local_grid_sizes(rank, nprocs, grid_nx, grid_ny, grid_nz);
+
+    // 初始化格子网格与求解器
+    let mut grid   = LbmGrid::new(grid_nx, grid_ny, grid_nz, model);
+    let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
+    mpi.attach_to_solver(&mut solver);
+
+    // 流固耦合模式解析与校验
+    let has_solid = !cfg.solid.bodies.is_empty()
+        && cfg.solid.bc_type.to_lowercase() != "none";
+    let has_ibm = cfg.ibm.is_some();
+    let coupling_mode = fsi::resolve_coupling_mode(&cfg.fsi, has_solid, has_ibm);
+    fsi::validate_coupling_mode(
+        coupling_mode, has_solid, has_ibm, cfg.fsi.normalized_coupling())?;
+
+    // 固体标记与反弹方案（BB / IBB）
+    if coupling_mode.needs_solid() {
+        let (x_start, y_start, phys_x0, phys_y0) = mpi.global_coords();
+        fsi::setup_solid_bodies(
+            &cfg, &mut grid, &mut solver,
+            x_start, y_start, phys_x0, phys_y0, rank,
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 提前创建 MPI 分解对象（同时用于确定本地网格尺寸和绑定到求解器），
-    // 声明持有者以延长生命周期到仿真循环结束
-    // -----------------------------------------------------------------------
-    let mut _decomp2d: Option<lbm_bindings::LbmMpiDecomp2D> = None;
+    // 注册流体边界条件
+    sim::register_boundary_conditions(&cfg, &mut solver, &mpi, nprocs, rank);
 
-    match effective_mode {
-        "block" => {
-            // 旧模式 "1d_y" → nx_blocks=1, ny_blocks=nprocs（1D Y 切片）
-            let (px, py): (u32, u32) = if cfg.mpi.mode == "1d_y" {
-                (1, nprocs as u32)
-            } else {
-                cfg.mpi.effective_blocks(nprocs)
-            };
-            if px as i32 * py as i32 != nprocs {
-                eprintln!(
-                    "[warn] mpi.nx_blocks({}) * mpi.ny_blocks({}) = {} ≠ nprocs({}). \
-                     Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).",
-                    px, py, px as i32 * py as i32, nprocs
-                );
-                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
-            } else {
-                _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32);
-            }
-        }
-        "independent" | "multigrid" => {
-            // 无 MPI 通信，不创建任何分解对象
-            // "multigrid" 当前版本退化为独立模式
-            if effective_mode == "multigrid" && nprocs > 1 {
-                eprintln!(
-                    "[info] mode=\"multigrid\": MgTree 框架已就绪 \
-                     (LbmMgTree/MgNode)；本版本退化为独立模式（每进程运行完整网格）。\
-                     请通过 lbm_bindings::LbmMgTree API 配置嵌套关系。"
-                );
-            }
-        }
-        _ => {
-            eprintln!("[warn] unknown mpi.mode {:?}; defaulting to 1D Y slice.", effective_mode);
-            _decomp2d = lbm_bindings::LbmMpiDecomp2D::new(
-                cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
-        }
-    }
-
-    // 确定本进程实际使用的网格尺寸（从已创建的分解对象中读取）
-    let (grid_nx, grid_ny, grid_nz) = if let Some(ref d) = _decomp2d {
-        (d.grid_nx(), d.grid_ny(), cfg.fluid.nz as i32)
-    } else {
-        // "independent" / "multigrid" / 未启用 MPI：使用完整全局网格
-        (cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32)
-    };
-
-    if nprocs > 1 {
-        println!("本地网格  : rank={} → {}×{}×{}", rank, grid_nx, grid_ny, grid_nz);
-    }
-
-    // 初始化流体格子网格
-    let mut grid = LbmGrid::new(grid_nx, grid_ny, grid_nz, model);
-
-    // 初始化求解器
-    let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
-
-    // -----------------------------------------------------------------------
-    // MPI 域分解绑定：将已创建的分解对象绑定到求解器
-    // -----------------------------------------------------------------------
-    if let Some(ref mut d) = _decomp2d {
-        solver.attach_mpi2d(Some(d));
-    }
-
-    // -----------------------------------------------------------------------
-    // 注册边界条件（将 TOML 配置中的 [[fluid.boundary_conditions]] 传入 C++ 核心）
-    //
-    // 这是流场结果正确的关键步骤：若跳过此步骤，边界条件将不会被施加，
-    // 所有节点保持初始平衡态（u=0），流场云图值均为零。
-    //
-    // MPI 块分解注意事项（mode = "block"）：
-    // 每个进程只持有全局域的一个分区。物理壁面边界条件（South/North/West/East）
-    // 只应注册到持有对应物理边界的进程，避免内部进程将边界条件误施加到幽灵行/列上。
-    // -----------------------------------------------------------------------
-    for bc_cfg in &cfg.fluid.boundary_conditions {
-        let bc_type = match bc_cfg.bc_type.to_lowercase().as_str() {
-            // 反弹类
-            "bounce_back"          => BcType::BounceBack,
-            "bounce_back_full_way" => BcType::BounceBackFullWay,
-            // Zou-He 非平衡反弹类
-            "zou_he_velocity"      => BcType::ZouHeVelocity,
-            "zou_he_pressure"      => BcType::ZouHePressure,
-            // 出口类
-            "fully_developed"      => BcType::FullyDeveloped,
-            "free_outlet"          => BcType::FreeOutlet,
-            // 非平衡外推类
-            "guo_extrapolation"    => BcType::GuoExtrapolation,
-            // 周期类（流式迁移中隐式处理）
-            "periodic"             => BcType::Periodic,
-            other => {
-                eprintln!(
-                    "  [warn] unknown bc_type {:?}; defaulting to BounceBack",
-                    other
-                );
-                BcType::BounceBack
-            }
-        };
-        let face = match bc_cfg.face.to_lowercase().as_str() {
-            "east"   => Face::East,
-            "south"  => Face::South,
-            "north"  => Face::North,
-            "bottom" => Face::Bottom,
-            "top"    => Face::Top,
-            "west"   => Face::West,
-            other => {
-                eprintln!(
-                    "  [warn] unknown face {:?}; defaulting to West",
-                    other
-                );
-                Face::West
-            }
-        };
-
-        // MPI 块分解：仅在本进程持有该物理壁面时注册边界条件。
-        // 判断依据：x_start/y_start + local_nx/local_ny 是否触及全局边界。
-        let apply_bc = if effective_mode == "block" && nprocs > 1 {
-            if let Some(ref d) = _decomp2d {
-                let x_start  = d.x_start()  as u64;
-                let y_start  = d.y_start()  as u64;
-                let local_nx = d.local_nx() as u64;
-                let local_ny = d.local_ny() as u64;
-                let gnx      = cfg.fluid.nx;
-                let gny      = cfg.fluid.ny;
-                match face {
-                    Face::South  => y_start == 0,
-                    Face::North  => y_start + local_ny == gny as u64,
-                    Face::West   => x_start == 0,
-                    Face::East   => x_start + local_nx == gnx as u64,
-                    // Bottom/Top 用于三维，非分解方向，所有进程均注册
-                    _            => true,
-                }
-            } else {
-                true
-            }
-        } else {
-            true
-        };
-
-        if apply_bc {
-            solver.add_boundary_condition(
-                bc_type, face,
-                bc_cfg.ux, bc_cfg.uy, bc_cfg.uz,
-                bc_cfg.rho,
-            );
-            println!(
-                "  BC registered: {:?} on {:?} face  (ux={:.4}, uy={:.4}, rho={:.4})",
-                bc_type, face, bc_cfg.ux, bc_cfg.uy, bc_cfg.rho
-            );
-        } else {
-            println!(
-                "  BC skipped (not this rank's boundary): {:?} on {:?} face",
-                bc_type, face
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 构造 MPI 块分解分区信息（用于输出时剥离幽灵行/列并嵌入元数据）
-    // -----------------------------------------------------------------------
-    let partition: Option<PartitionInfo> = if effective_mode == "block" && nprocs > 1 {
-        _decomp2d.as_ref().map(|d| PartitionInfo {
-            phys_x0:   d.phys_x0()  as usize,
-            phys_y0:   d.phys_y0()  as usize,
-            local_nx:  d.local_nx() as usize,
-            local_ny:  d.local_ny() as usize,
-            x_start:   d.x_start()  as usize,
-            y_start:   d.y_start()  as usize,
-            global_nx: cfg.fluid.nx as usize,
-            global_ny: cfg.fluid.ny as usize,
-        })
-    } else {
-        None
-    };
-
-    // 创建输出目录
-    // MPI 块分解模式（mode="block"）下，每进程的分区快照写入各自的子目录
-    // <output.directory>/rank_<N>/，避免多进程同时写同一文件引发竞态条件。
-    // 多进程独立模式（"independent"/"multigrid"）同样写入各自子目录。
-    let (eff_mode, _) = cfg.mpi.normalized_mode();
-    let output_dir = if nprocs > 1
-        && (eff_mode == "block" || eff_mode == "independent" || eff_mode == "multigrid")
-    {
-        format!("{}/rank_{}", cfg.output.directory, rank)
-    } else {
-        cfg.output.directory.clone()
-    };
+    // 构建分区信息与输出目录
+    let partition  = mpi.partition_info(&cfg, nprocs);
+    let output_dir = mpi.output_dir(&cfg, nprocs, rank);
     std::fs::create_dir_all(&output_dir)?;
 
-    // combine_blocks=true 时，rank-0 额外向全局输出目录写出合并快照
-    let combine_blocks = cfg.output.combine_blocks && nprocs > 1 && eff_mode == "block";
+    // combine_blocks 模式下 rank-0 额外创建全局输出目录
+    let combine_blocks = cfg.output.combine_blocks && nprocs > 1
+        && mpi.effective_mode == "block";
     if combine_blocks && rank == 0 {
         std::fs::create_dir_all(&cfg.output.directory)?;
     }
 
-    if nprocs > 1 && eff_mode == "block" {
-        // 每个进程输出自己的目录信息
-        if rank == 0 {
-            let combine_note = if combine_blocks {
-                format!("（+合并全局快照 → {}/fluid_*.{}）",
-                        cfg.output.directory, cfg.output.format.replace("tecplot_", ""))
-            } else {
-                "（后处理可按 x_start/y_start 拼合全局场，或设 combine_blocks=true 自动合并）".to_string()
-            };
-            println!(
-                "输出目录  : rank=0 → {}/rank_0/  (MPI 块分解，各进程独立写出物理分区数据{})",
-                cfg.output.directory, combine_note
-            );
-        }
+    // 输出目录路径提示（rank-0 only）
+    if rank == 0 && nprocs > 1 && mpi.effective_mode == "block" {
+        let combine_note = if combine_blocks {
+            format!(" (+combined global snapshots -> {}/fluid_*.{})",
+                    cfg.output.directory, cfg.output.format.replace("tecplot_", ""))
+        } else {
+            " (post-process: stitch partitions via x_start/y_start, or set combine_blocks=true)"
+                .to_string()
+        };
+        println!(
+            "Output dir : rank=0 -> {}/rank_0/  (MPI block mode, each rank writes its partition{})",
+            cfg.output.directory, combine_note
+        );
     }
 
-    let csv_path = format!("{}/monitor.csv", output_dir);
+    // IBM 体初始化（仅在需要 IBM 耦合时）
+    let mut ibm_entries: Vec<fsi::IbmEntry> = if coupling_mode.needs_ibm() {
+        fsi::setup_ibm_bodies(&cfg, rank)?
+    } else {
+        Vec::new()
+    };
 
-    if rank == 0 {
-        println!("\nStarting time integration...");
+    if rank == 0 && coupling_mode != fsi::FsiCouplingMode::None {
+        println!("  [FSI] 耦合模式: {}", coupling_mode.description());
     }
+    if rank == 0 { println!("\nStarting time integration..."); }
+
     if cfg.simulation.n_steps == 0 {
-        if rank == 0 {
-            println!("n_steps is 0 — nothing to simulate.");
-        }
+        if rank == 0 { println!("n_steps is 0 — nothing to simulate."); }
         return Ok(());
     }
 
-    for step in 0..cfg.simulation.n_steps {
-        solver.step(&mut grid);
+    // 时间循环
+    let csv_path = format!("{}/monitor.csv", output_dir);
+    run_time_loop(
+        &cfg, &mut grid, &mut solver, &mut ibm_entries,
+        partition, &output_dir, &csv_path, combine_blocks, rank,
+    )?;
 
-        let time = (step + 1) as f64 * cfg.simulation.dt;
+    if rank == 0 { println!("\nSimulation complete."); }
 
-        // -- 高频：原生 Rust 快照（格式由 output.format 决定）-------------------
-        if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
-            if rank == 0 {
-                println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
-            }
-            match cfg.output.format.as_str() {
-                "tecplot_asc" => {
-                    // ASCII Tecplot .dat 格式：人类可读，可用 Tecplot/ParaView 打开
-                    output::write_snapshot_tecplot_asc(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
-                }
-                "tecplot_bin" => {
-                    // 二进制 Tecplot .plt 格式（TDV112）：体积最小，Tecplot 软件可直接打开
-                    output::write_snapshot_tecplot_bin(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
-                }
-                _ => {
-                    // 默认："npz"——NumPy .npz 压缩归档，Python 后处理首选格式
-                    output::write_snapshot_npz(&grid, step + 1, time, &output_dir, partition)
-                        .with_context(|| format!("写出 NPZ 快照失败（步数 {}）", step + 1))?;
-                }
-            }
-
-            // -- combine_blocks：gather 各分区数据，由 rank-0 写出全局合并快照 --
-            if combine_blocks {
-                if let Some(p) = partition {
-                    // 提取本地物理场
-                    let grid_nx  = grid.nx() as usize;
-                    let n_phys   = p.local_nx * p.local_ny;
-                    let mut l_rho = Vec::with_capacity(n_phys);
-                    let mut l_ux  = Vec::with_capacity(n_phys);
-                    let mut l_uy  = Vec::with_capacity(n_phys);
-                    for j in p.phys_y0..(p.phys_y0 + p.local_ny) {
-                        for i in p.phys_x0..(p.phys_x0 + p.local_nx) {
-                            let idx = (j * grid_nx + i) as i32;
-                            l_rho.push(grid.rho(idx));
-                            l_ux .push(grid.ux (idx));
-                            l_uy .push(grid.uy (idx));
-                        }
-                    }
-                    // Gather 三个场到 rank-0
-                    if let (Some((g_rho, gnx, gny)), Some((g_ux, _, _)), Some((g_uy, _, _))) = (
-                        output::gather_field_to_root(&l_rho, &p, 0),
-                        output::gather_field_to_root(&l_ux,  &p, 0),
-                        output::gather_field_to_root(&l_uy,  &p, 0),
-                    ) {
-                        // 只有 rank-0 执行写出（gather_field_to_root 对非 root 进程返回 None）
-                        match cfg.output.format.as_str() {
-                            "tecplot_asc" => {
-                                output::write_global_snapshot_tecplot_asc(
-                                    &g_rho, &g_ux, &g_uy, gnx, gny,
-                                    step + 1, time, &cfg.output.directory,
-                                ).with_context(|| format!(
-                                    "写出合并 Tecplot ASCII 快照失败（步数 {}）", step + 1))?;
-                            }
-                            "tecplot_bin" => {
-                                output::write_global_snapshot_tecplot_bin(
-                                    &g_rho, &g_ux, &g_uy, gnx, gny,
-                                    step + 1, time, &cfg.output.directory,
-                                ).with_context(|| format!(
-                                    "写出合并 Tecplot 二进制快照失败（步数 {}）", step + 1))?;
-                            }
-                            _ => {
-                                output::write_global_snapshot_npz(
-                                    &g_rho, &g_ux, &g_uy, gnx, gny,
-                                    step + 1, time, &cfg.output.directory,
-                                ).with_context(|| format!(
-                                    "写出合并 NPZ 快照失败（步数 {}）", step + 1))?;
-                            }
-                        }
-                    } else {
-                        // 非 root 进程：等待 root 进程的 gather 调用（非 root 参与通信）
-                        // 由于 gather_field_to_root 对每个字段都会调用 MPI Gatherv，
-                        // 非 root 进程已在函数内部参与通信，这里不需要额外操作。
-                    }
-                }
-            }
-        }
-
-        // -- 逐步：轻量级 CSV 监控日志 -----------------------------------------
-        if cfg.output.enable_csv_monitor {
-            // 仅统计物理节点的动能（排除幽灵行/列）
-            let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
-                (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
-            } else {
-                (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
-            };
-            let n_phys = pnx * pny;
-            let ke: f64 = (0..pny).flat_map(|j| (0..pnx).map(move |i| (j, i)))
-                .map(|(j, i)| {
-                    let idx = ((py0 + j) * gnx + px0 + i) as i32;
-                    let u = grid.ux(idx);
-                    let v = grid.uy(idx);
-                    u * u + v * v
-                })
-                .sum::<f64>()
-                / (n_phys as f64)
-                * 0.5;
-            output::append_monitor_csv(&csv_path, step + 1, time, &[("ke", ke)])
-                .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))?;
-        }
-
-        // -- 低频：Python FFI 等值线图（python-ffi 特性）-----------------------
-        #[cfg(feature = "python-ffi")]
-        if let Some(pi) = cfg.output.plot_interval {
-            if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
-                // 准备物理节点数据（当 combine_blocks=true 时使用全局场；否则用本地分区场）
-                let (plot_rho, plot_ux, plot_uy, plot_nx, plot_ny, plot_dir) =
-                    if combine_blocks {
-                        // combine_blocks 模式：gather 全局场并只在 rank-0 绘图
-                        if let Some(p) = partition {
-                            let grid_nx  = grid.nx() as usize;
-                            let n_phys   = p.local_nx * p.local_ny;
-                            let mut l_rho = Vec::with_capacity(n_phys);
-                            let mut l_ux  = Vec::with_capacity(n_phys);
-                            let mut l_uy  = Vec::with_capacity(n_phys);
-                            for j in p.phys_y0..(p.phys_y0 + p.local_ny) {
-                                for i in p.phys_x0..(p.phys_x0 + p.local_nx) {
-                                    let idx = (j * grid_nx + i) as i32;
-                                    l_rho.push(grid.rho(idx));
-                                    l_ux .push(grid.ux (idx));
-                                    l_uy .push(grid.uy (idx));
-                                }
-                            }
-                            let grho = output::gather_field_to_root(&l_rho, &p, 0);
-                            let gux  = output::gather_field_to_root(&l_ux,  &p, 0);
-                            let guy  = output::gather_field_to_root(&l_uy,  &p, 0);
-                            if let (Some((gr, gnx, gny)), Some((gu, _, _)), Some((gv, _, _))) =
-                                (grho, gux, guy)
-                            {
-                                (gr, gu, gv, gnx, gny, cfg.output.directory.clone())
-                            } else {
-                                // 非 root 进程：不绘图（continue to next iter）
-                                continue;
-                            }
-                        } else {
-                            // partition 为 None（不应发生）
-                            let (px0, py0, pnx, pny, gnx) =
-                                (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize);
-                            let n_phys = pnx * pny;
-                            let mut rho = Vec::with_capacity(n_phys);
-                            let mut ux  = Vec::with_capacity(n_phys);
-                            let mut uy  = Vec::with_capacity(n_phys);
-                            for j in py0..(py0 + pny) {
-                                for i in px0..(px0 + pnx) {
-                                    let idx = (j * gnx + i) as i32;
-                                    rho.push(grid.rho(idx));
-                                    ux .push(grid.ux (idx));
-                                    uy .push(grid.uy (idx));
-                                }
-                            }
-                            (rho, ux, uy, pnx, pny, output_dir.clone())
-                        }
-                    } else {
-                        // 普通模式：使用本地分区场（原有行为）
-                        let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
-                            (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
-                        } else {
-                            (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
-                        };
-                        let n_phys = pnx * pny;
-                        let mut rho = Vec::with_capacity(n_phys);
-                        let mut ux  = Vec::with_capacity(n_phys);
-                        let mut uy  = Vec::with_capacity(n_phys);
-                        for j in py0..(py0 + pny) {
-                            for i in px0..(px0 + pnx) {
-                                let idx = (j * gnx + i) as i32;
-                                rho.push(grid.rho(idx));
-                                ux .push(grid.ux (idx));
-                                uy .push(grid.uy (idx));
-                            }
-                        }
-                        (rho, ux, uy, pnx, pny, output_dir.clone())
-                    };
-
-                for field_name in &["velocity_magnitude", "vorticity", "streamlines"] {
-                    if let Err(e) = python_bridge::plot_field(
-                        &plot_rho, &plot_ux, &plot_uy, plot_nx, plot_ny,
-                        step + 1, time,
-                        &plot_dir,
-                        field_name,
-                    ) {
-                        eprintln!("[python-ffi] plot {field_name} failed at step {}: {e}", step + 1);
-                    }
-                }
-            }
-        }
-    }
-
-    if rank == 0 {
-        println!("\nSimulation complete.");
-    }
-
-    // -----------------------------------------------------------------------
-    // 后处理：Python 子进程脚本（仅 rank-0 运行，避免 MPI 多进程重复启动）
-    // -----------------------------------------------------------------------
+    // 后处理：Python 子进程（rank-0 only）
     if rank == 0 {
         if let Some(ref script) = cfg.python.post_script.clone() {
             println!("\n--- Post-processing (Python subprocess) ---");
-            run_python_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
+            python_bridge::run_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
         }
     }
 
@@ -683,13 +200,8 @@ fn run() -> Result<()> {
 /// 在非 MPI 模式（`ENABLE_MPI=OFF`）下，`mpi_init`/`mpi_finalize` 均为空操作，
 /// 此函数仍正确地将错误码传递给操作系统。
 fn main() {
-    // mpi_init() 必须在所有 MPI 函数之前调用（包括 mpi_rank / mpi_size）。
-    // 若未启用 LBM_ENABLE_MPI，此函数为空操作，安全调用。
     lbm_bindings::mpi_init();
-
     let result = run();
-
-    // 确保 MPI 总能被正确终结（不论 run() 是否返回错误）
     lbm_bindings::mpi_finalize();
 
     if let Err(e) = result {
@@ -697,3 +209,414 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 时间循环
+// ---------------------------------------------------------------------------
+
+/// 主时间步循环：每步推进仿真并按配置频率写出各类结果。
+///
+/// 涵盖：
+/// - LBM 步进 + IBM 步进
+/// - 快照写出（NPZ / Tecplot ASC / Tecplot BIN）
+/// - combine_blocks 全局快照聚合（MPI 块模式，可选）
+/// - CSV 监控日志（动能等标量量）
+/// - 固体受力统计（BB/IBB 动量交换法）
+/// - IBM 固体受力统计（Lagrangian 力密度积分，多体逐体写出）
+/// - Python FFI 等值线图（`python-ffi` 特性，可选）
+fn run_time_loop(
+    cfg: &Config,
+    grid: &mut LbmGrid,
+    solver: &mut LbmSolver,
+    ibm_entries: &mut Vec<fsi::IbmEntry>,
+    partition: Option<PartitionInfo>,
+    output_dir: &str,
+    csv_path: &str,
+    combine_blocks: bool,
+    rank: i32,
+) -> Result<()> {
+    for step in 0..cfg.simulation.n_steps {
+        solver.step(grid);
+
+        // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
+        if !ibm_entries.is_empty() {
+            step_ibm(cfg, grid, ibm_entries);
+        }
+
+        let time = (step + 1) as f64 * cfg.simulation.dt;
+
+        // 高频：欧拉场快照（每 write_interval 步或最后一步）
+        if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
+            if rank == 0 {
+                println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
+            }
+            write_step_snapshot(cfg, grid, step + 1, time, output_dir, partition)?;
+            if combine_blocks {
+                write_combined_snapshot(cfg, grid, step + 1, time, partition)?;
+            }
+        }
+
+        // 逐步：CSV 监控日志（动能等标量量）
+        if cfg.output.enable_csv_monitor {
+            write_monitor_csv(cfg, grid, step + 1, time, csv_path, partition)?;
+        }
+
+        // 固体受力输出（BB/IBB 动量交换法）
+        if cfg.solid.force_output.enabled
+            && (step % cfg.solid.force_output.interval == 0
+                || step == cfg.simulation.n_steps - 1)
+        {
+            write_solid_force(cfg, grid, step + 1, time, output_dir, partition, rank)?;
+        }
+
+        // IBM 固体受力输出（Lagrangian 力密度积分，多体逐体写出）
+        for entry in ibm_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
+                    || step == cfg.simulation.n_steps - 1)
+            {
+                let (ibm_fx, ibm_fy) = entry.ms.compute_body_force();
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
+                    output::append_monitor_csv(
+                        &force_csv, step + 1, time,
+                        &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                    ).with_context(|| format!(
+                        "Failed to write IBM force CSV ({}) at step {}", entry.label, step + 1
+                    ))?;
+                }
+            }
+        }
+
+        // 低频：Python FFI 等值线图（`python-ffi` 特性）
+        #[cfg(feature = "python-ffi")]
+        if let Some(pi) = cfg.output.plot_interval {
+            if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
+                plot_step_ffi(cfg, grid, step + 1, time, partition, combine_blocks, output_dir)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 时间循环内辅助函数
+// ---------------------------------------------------------------------------
+
+/// 对所有 IBM 体执行一步 IBM 力计算。
+///
+/// 每个体的方法参数优先使用体级覆盖（`[[ibm.bodies]]` 中的 `method`/`n_iter`/
+/// `alpha`/`beta` 字段），未设置时继承全局 `[ibm]` 设置。这允许同一仿真中
+/// 不同 IBM 体使用不同的力计算方案，以便直接对比各方法的效果。
+fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry]) {
+    let dx = 1.0_f64;
+    let dt = cfg.simulation.dt;
+    for entry in ibm_entries.iter_mut() {
+        match entry.method.to_lowercase().as_str() {
+            "penalty" => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
+            "mls"     => entry.ms.step_mls(grid, dx, dt),
+            _         => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+        }
+    }
+}
+
+/// 将当前欧拉场写出为本进程分区快照（格式由 `cfg.output.format` 决定）。
+fn write_step_snapshot(
+    cfg: &Config,
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    output_dir: &str,
+    partition: Option<PartitionInfo>,
+) -> Result<()> {
+    match cfg.output.format.as_str() {
+        "tecplot_asc" => output::write_snapshot_tecplot_asc(grid, step, time, output_dir, partition)
+            .with_context(|| format!("failed to write Tecplot ASCII snapshot (step {})", step)),
+        "tecplot_bin" => output::write_snapshot_tecplot_bin(grid, step, time, output_dir, partition)
+            .with_context(|| format!("failed to write Tecplot binary snapshot (step {})", step)),
+        _ => output::write_snapshot_npz(grid, step, time, output_dir, partition)
+            .with_context(|| format!("failed to write NPZ snapshot (step {})", step)),
+    }
+}
+
+/// combine_blocks 模式：将各进程物理场 gather 到 rank-0 并写出全局快照。
+///
+/// 非 root 进程已在 [`output::gather_field_to_root`] 内参与 `MPI_Gatherv`，
+/// 此处直接返回 `Ok(())`。
+fn write_combined_snapshot(
+    cfg: &Config,
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    partition: Option<PartitionInfo>,
+) -> Result<()> {
+    let Some(p) = partition else { return Ok(()); };
+
+    let (l_rho, l_ux, l_uy, _, _) = output::extract_physical_fields(grid, Some(p));
+
+    let (Some((g_rho, gnx, gny)), Some((g_ux, _, _)), Some((g_uy, _, _))) = (
+        output::gather_field_to_root(&l_rho, &p, 0),
+        output::gather_field_to_root(&l_ux,  &p, 0),
+        output::gather_field_to_root(&l_uy,  &p, 0),
+    ) else {
+        // 非 root 进程：已参与 gather，无需写文件
+        return Ok(());
+    };
+
+    match cfg.output.format.as_str() {
+        "tecplot_asc" => output::write_global_snapshot_tecplot_asc(
+            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
+        ).with_context(|| format!("failed to write combined Tecplot ASCII snapshot (step {})", step)),
+        "tecplot_bin" => output::write_global_snapshot_tecplot_bin(
+            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
+        ).with_context(|| format!("failed to write combined Tecplot binary snapshot (step {})", step)),
+        _ => output::write_global_snapshot_npz(
+            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
+        ).with_context(|| format!("failed to write combined NPZ snapshot (step {})", step)),
+    }
+}
+
+/// 计算平均动能并追加到 CSV 监控日志。
+fn write_monitor_csv(
+    _cfg: &Config,
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    csv_path: &str,
+    partition: Option<PartitionInfo>,
+) -> Result<()> {
+    let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
+        (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
+    } else {
+        (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
+    };
+    let n_phys = pnx * pny;
+    let ke: f64 = (0..pny)
+        .flat_map(|j| (0..pnx).map(move |i| (j, i)))
+        .map(|(j, i)| {
+            let idx = ((py0 + j) * gnx + px0 + i) as i32;
+            let u = grid.ux(idx);
+            let v = grid.uy(idx);
+            u * u + v * v
+        })
+        .sum::<f64>()
+        / (n_phys as f64)
+        * 0.5;
+    output::append_monitor_csv(csv_path, step, time, &[("ke", ke)])
+        .with_context(|| format!("Failed to write monitor CSV at step {}", step))
+}
+
+/// 统计固体所受合力（动量交换法）并写入 CSV。
+///
+/// MPI 模式下各进程的局部贡献通过 `MPI_Allreduce` 求和；仅 rank-0 写文件。
+fn write_solid_force(
+    cfg: &Config,
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    output_dir: &str,
+    partition: Option<PartitionInfo>,
+    rank: i32,
+) -> Result<()> {
+    let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+        (p.phys_x0 as i32,
+         p.phys_y0 as i32,
+         (p.phys_x0 + p.local_nx - 1) as i32,
+         (p.phys_y0 + p.local_ny - 1) as i32)
+    } else {
+        (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+    };
+
+    let (local_fx, local_fy) = lbm_bindings::compute_solid_force(grid, pi0, pj0, pi1, pj1);
+    let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+    let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+
+    if rank == 0 {
+        let force_csv = format!("{}/{}.csv", output_dir, cfg.solid.force_output.filename);
+        output::append_monitor_csv(
+            &force_csv, step, time,
+            &[("fx", global_fx), ("fy", global_fy)],
+        ).with_context(|| format!("Failed to write solid force CSV at step {}", step))?;
+    }
+    Ok(())
+}
+
+/// Python FFI 等值线图（`python-ffi` 特性）。
+///
+/// combine_blocks 模式下，先将分区场 gather 到 rank-0，再由 rank-0 绘图。
+/// 普通模式下直接使用本地物理分区场绘图。
+#[cfg(feature = "python-ffi")]
+fn plot_step_ffi(
+    cfg: &Config,
+    grid: &LbmGrid,
+    step: u64,
+    time: f64,
+    partition: Option<PartitionInfo>,
+    combine_blocks: bool,
+    output_dir: &str,
+) -> Result<()> {
+    // 确定绘图所用场数据及输出目录
+    let (plot_rho, plot_ux, plot_uy, plot_nx, plot_ny, plot_dir) = if combine_blocks {
+        if let Some(p) = partition {
+            let (l_rho, l_ux, l_uy, _, _) = output::extract_physical_fields(grid, Some(p));
+            let grho = output::gather_field_to_root(&l_rho, &p, 0);
+            let gux  = output::gather_field_to_root(&l_ux,  &p, 0);
+            let guy  = output::gather_field_to_root(&l_uy,  &p, 0);
+            if let (Some((gr, gnx, gny)), Some((gu, _, _)), Some((gv, _, _))) = (grho, gux, guy) {
+                (gr, gu, gv, gnx, gny, cfg.output.directory.clone())
+            } else {
+                // 非 root 进程：已参与 gather，不绘图
+                return Ok(());
+            }
+        } else {
+            // partition 为 None（不应发生）：退化为本地全场
+            let (rho, ux, uy, nx, ny) = output::extract_physical_fields(grid, None);
+            (rho, ux, uy, nx, ny, output_dir.to_owned())
+        }
+    } else {
+        let (rho, ux, uy, nx, ny) = output::extract_physical_fields(grid, partition);
+        (rho, ux, uy, nx, ny, output_dir.to_owned())
+    };
+
+    for field_name in &["velocity_magnitude", "vorticity", "streamlines"] {
+        if let Err(e) = python_bridge::plot_field(
+            &plot_rho, &plot_ux, &plot_uy, plot_nx, plot_ny,
+            step, time, &plot_dir, field_name,
+        ) {
+            eprintln!("[python-ffi] plot {field_name} failed at step {}: {e}", step);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 启动阶段辅助函数
+// ---------------------------------------------------------------------------
+
+/// 解析格子模型字符串为 [`LatticeModel`]（不认识的值退化为 D2Q9）。
+fn parse_lattice_model(s: &str) -> LatticeModel {
+    match s {
+        "D3Q19" => LatticeModel::D3Q19,
+        "D3Q27" => LatticeModel::D3Q27,
+        _       => LatticeModel::D2Q9,
+    }
+}
+
+/// 解析碰撞模型字符串为 [`CollisionModel`]（不认识的值退化为 BGK）。
+fn parse_collision_model(s: &str) -> CollisionModel {
+    match s {
+        "MRT" => CollisionModel::Mrt,
+        _     => CollisionModel::Bgk,
+    }
+}
+
+/// 打印求解器启动头部信息（rank-0 only）。
+fn print_header(cfg: &Config, config_path: &std::path::Path, nprocs: i32) {
+    println!("=== LBM-IBM-FSI Solver ===");
+    println!("Config   : {}", config_path.display());
+    println!("Grid     : {}x{}x{}", cfg.fluid.nx, cfg.fluid.ny, cfg.fluid.nz);
+    println!("Steps    : {}", cfg.simulation.n_steps);
+    println!("Model    : {} / {}", cfg.simulation.lattice_model, cfg.simulation.collision_model);
+    println!("Omega    : w = {:.6}", cfg.omega());
+    println!("Output   : {} -> {}", cfg.output.format, match cfg.output.format.as_str() {
+        "tecplot_asc" => "fluid_NNNNNN.dat (ASCII Tecplot)",
+        "tecplot_bin" => "fluid_NNNNNN.plt (binary Tecplot TDV112)",
+        _             => "fluid_NNNNNN.npz (NumPy compressed archive)",
+    });
+    if cfg.parallel.omp_num_threads > 0 {
+        println!("OpenMP   : threads = {} (set by [parallel].omp_num_threads)",
+                 cfg.parallel.omp_num_threads);
+    }
+    lbm_bindings::print_parallel_status();
+
+    // MPI 模式摘要
+    {
+        let (norm_mode, _) = cfg.mpi.normalized_mode();
+        match norm_mode {
+            "block" => {
+                let (px, py) = cfg.mpi.effective_blocks(nprocs);
+                let pz = cfg.mpi.nz_blocks.max(1);
+                if pz > 1 {
+                    println!("MPI mode : 3D block decomp {}x{}x{}", px, py, pz);
+                } else if px == 1 {
+                    println!("MPI mode : 1D Y-slice (ny_blocks={})", py);
+                } else if py == 1 {
+                    println!("MPI mode : 1D X-slice (nx_blocks={})", px);
+                } else {
+                    println!("MPI mode : 2D block decomp {}x{}", px, py);
+                }
+            }
+            "multigrid"   => println!("MPI mode : nested multigrid (framework mode, currently degrades to independent)"),
+            "independent" => println!("MPI mode : independent (each rank runs its own full simulation, no communication)"),
+            _             => println!("MPI mode : {}", cfg.mpi.mode),
+        }
+        let ibm_halo = cfg.mpi.ibm_halo_width.max(1);
+        if ibm_halo > 1 && cfg.ibm.is_some() {
+            println!("MPI IBM  : ibm_halo_width={} (extended ghost layer for FourPoint δ kernel)",
+                     ibm_halo);
+        }
+    }
+
+    // 插件摘要
+    if cfg.plugins.any_active() {
+        println!("Plugins:");
+        if !cfg.plugins.boundary.is_empty() {
+            println!("  boundary  = \"{}\"  (IBoundaryPlugin)", cfg.plugins.boundary);
+        }
+        if !cfg.plugins.mesh.is_empty() {
+            println!("  mesh      = \"{}\"  (IMeshPlugin)", cfg.plugins.mesh);
+        }
+        if !cfg.plugins.motion.is_empty() {
+            println!("  motion    = \"{}\"  (IMotionPlugin)", cfg.plugins.motion);
+        }
+        if !cfg.plugins.flexible.is_empty() {
+            println!("  flexible  = \"{}\"  (IFlexibleSolverPlugin)", cfg.plugins.flexible);
+        }
+    }
+}
+
+/// 在多进程环境下，依次按 rank 顺序打印各进程的本地网格尺寸。
+///
+/// 顺序打印可避免多进程并发写入 stdout 时 UTF-8 多字节序列被截断/乱序。
+fn print_local_grid_sizes(rank: i32, nprocs: i32, grid_nx: i32, grid_ny: i32, grid_nz: i32) {
+    if nprocs > 1 {
+        use std::io::Write;
+        for r in 0..nprocs {
+            if rank == r {
+                print!("  rank {} local grid: {}x{}x{}\n", rank, grid_nx, grid_ny, grid_nz);
+                let _ = std::io::stdout().flush();
+            }
+            lbm_bindings::mpi_barrier();
+        }
+    }
+}
+
+/// 通过 Python FFI 生成 IBM 标记点（进程内，不产生 CSV 文件）。
+///
+/// 仅在启用 `python-ffi` 特性时编译；否则为空操作。
+#[cfg(feature = "python-ffi")]
+fn generate_ibm_markers_ffi(cfg: &Config) {
+    if let Some(ref ibm) = cfg.ibm {
+        println!("\n[python-ffi] generating IBM markers in-process ...");
+        match python_bridge::markers_from_geometry(
+            &ibm.geometry, ibm.x0, ibm.y0, ibm.size, ibm.n_markers,
+        ) {
+            Ok((x, y, ds)) => {
+                let x_min = x.iter().cloned().fold(f64::INFINITY, f64::min);
+                let x_max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let y_min = y.iter().cloned().fold(f64::INFINITY, f64::min);
+                let y_max = y.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                println!(
+                    "  => {} markers  x=[{:.2},{:.2}]  y=[{:.2},{:.2}]  ds~={:.4}",
+                    x.len(), x_min, x_max, y_min, y_max,
+                    ds.first().copied().unwrap_or(0.0),
+                );
+                // TODO: 待 lbm_bindings 暴露对应接口后，
+                //       将 (x, y, ds) 转发给 C++ IBM 核心。
+                let _ = (x, y, ds);
+            }
+            Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),
+        }
+    }
+}
+

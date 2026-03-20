@@ -1,0 +1,136 @@
+# =============================================================================
+# 混合 BB/IBB + IBM 耦合算例（③ 混合耦合模式）
+# =============================================================================
+#
+# 耦合模式：③ 混合 BB/IBB + IBM — [solid] + [ibm] 同时生效
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   固体 1   : BB/IBB 圆柱，中心 (120, 50)，半径 R=8（用 IBB 精确曲线边界）
+#   固体 2   : IBM 圆柱，中心 (250, 50)，半径 R=10（用 MDF-IBM 浸入边界法）
+#   入口速度 : U_in = 0.05
+#   运动粘度 : ν = 0.01
+#
+# 混合耦合说明：
+#   - [solid] 段配置的固体（BB/IBB）：将流体节点直接标记为固体，
+#     在 stream-collide 中施加反弹边界；适合固定刚体，计算效率高。
+#   - [ibm] 段配置的固体（IBM）：以 Lagrangian 标记点代替固体节点，
+#     力连续分布；适合柔性固体或需要精确受力统计的场合。
+#   - 两种方案在同一仿真中共存：BB/IBB 先在 step() 内处理，
+#     IBM 在 step() 之后调用（见时间循环注释）。
+#
+# 适用场景：
+#   - 含固定结构（BB/IBB 高效处理）和柔性/移动结构（IBM 准确处理）的混合问题
+#   - 从外部网格文件导入复杂几何（solid.bodies[].shape="mesh" 或 ibm.bodies[].geometry="file"）
+#
+# 使用方法：
+#   单进程：./lbm-fsi configs/hybrid_bb_ibm_channel.toml
+#   MPI（4进程）：mpirun -n 4 ./lbm-fsi configs/hybrid_bb_ibm_channel.toml
+#
+# 输出：流场快照写入 output/hybrid_bb_ibm/（NPZ 格式）
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+# 西壁（进口）
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+# 东壁（出口）
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+# 南壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# [fsi] 流固耦合方案（显式选择）
+# coupling = "hybrid" 表示同时使用反弹格式（BB/IBB）和浸入边界法（IBM），
+# 对应下方的 [solid] 段（BB/IBB 圆柱）和 [ibm] 段（IBM 圆柱）。
+# -----------------------------------------------------------------------------
+[fsi]
+coupling = "hybrid"   # ③ 混合耦合（反弹 + IBM）
+
+# -----------------------------------------------------------------------------
+# [solid] 固体 1：BB/IBB 圆柱（反弹格式，高效，适合固定结构）
+#
+# mark_solid_cylinder() 将满足 (i-cx)²+(j-cy)² < R² 的节点标记为固体，
+# 并计算精确 IBB 距离分数 q。
+# bc_type = "interpolated_bounce_back"：二阶精度 Bouzidi IBB。
+# -----------------------------------------------------------------------------
+[solid]
+bc_type = "interpolated_bounce_back"
+
+[[solid.bodies]]
+shape  = "cylinder"
+cx     = 120.0    # 圆心 x
+cy     = 50.0     # 圆心 y
+radius = 8.0      # 半径
+
+# BB/IBB 固体受力（动量交换法）
+[solid.force_output]
+enabled  = true
+interval = 500
+filename = "solid_bb_force"
+
+# -----------------------------------------------------------------------------
+# [ibm] 固体 2：IBM 圆柱（浸入边界法，适合柔性/移动结构或精确受力统计）
+#
+# [[ibm.bodies]] 列表描述 IBM 固体体；method 控制所有 IBM 体的力计算算法。
+# 混合模式下，IBM 力在每步 step() 结束后追加展布到流体格子 (grid.force)。
+# -----------------------------------------------------------------------------
+[ibm]
+method       = "mdf"          # MDF-IBM：多重直接力法（Luo 2007）
+n_iter       = 3
+delta_kernel = "four_point"
+
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 250.0    # 圆心 x
+y0         = 50.0     # 圆心 y
+size       = 10.0     # 半径 R=10
+n_markers  = 64
+label      = "ibm_cyl"
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 500
+filename = "ibm_cyl_force"
+
+[output]
+write_interval = 500
+directory      = "output/hybrid_bb_ibm"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
+
+# MPI 并行（可选）
+# [mpi]
+# mode           = "block"
+# nx_blocks      = 1
+# ny_blocks      = 0
+# ibm_halo_width = 2   # 启用双层幽灵交换（FourPoint 核 + 标记点靠近 MPI 块边界时）

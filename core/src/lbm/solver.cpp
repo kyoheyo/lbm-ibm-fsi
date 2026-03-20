@@ -1,6 +1,7 @@
 #include "lbm/solver.hpp"
 #include "lbm/boundary.hpp"
 #include "lbm/mpi_decomp.hpp"
+#include "lbm/solid.hpp"
 #include <cmath>
 #include <stdexcept>
 
@@ -61,9 +62,63 @@ void Solver::step()
 {
     collide();
     stream();
+
+    // -----------------------------------------------------------------------
+    // 计算本地物理区域范围（MPI 模式下跳过幽灵行/列）
+    //
+    // pb 同时供固体 BC（apply_solid_bounce_back / apply_solid_ibb）
+    // 和面 BC（apply_boundary_conditions）使用，避免重复计算。
+    // -----------------------------------------------------------------------
+    PhysicalBounds pb;
+    pb.j_s = 0;
+    pb.j_n = grid_.ny - 1;
+    pb.i_w = 0;
+    pb.i_e = grid_.nx - 1;
+#ifdef LBM_ENABLE_MPI
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        // 1D Y-切片：幽灵在 j=0（南）和 j=local_ny+1（北）
+        pb.j_s = 1;
+        pb.j_n = grid_.ny - 2;   // = local_ny
+        pb.has_south_wall = mpi_decomp_->has_south_wall();
+        pb.has_north_wall = mpi_decomp_->has_north_wall();
+        pb.has_west_wall  = true;
+        pb.has_east_wall  = true;
+    }
+    if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+        pb.j_s = mpi_decomp2d_->phys_y0();
+        pb.j_n = mpi_decomp2d_->phys_y0() + mpi_decomp2d_->local_ny - 1;
+        pb.i_w = mpi_decomp2d_->phys_x0();
+        pb.i_e = mpi_decomp2d_->phys_x0() + mpi_decomp2d_->local_nx - 1;
+        pb.has_south_wall = mpi_decomp2d_->has_south_wall();
+        pb.has_north_wall = mpi_decomp2d_->has_north_wall();
+        pb.has_west_wall  = mpi_decomp2d_->has_west_wall();
+        pb.has_east_wall  = mpi_decomp2d_->has_east_wall();
+    }
+    if (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1) {
+        pb.j_s = mpi_decomp3d_->phys_y0();
+        pb.j_n = mpi_decomp3d_->phys_y0() + mpi_decomp3d_->local_ny - 1;
+        pb.i_w = mpi_decomp3d_->phys_x0();
+        pb.i_e = mpi_decomp3d_->phys_x0() + mpi_decomp3d_->local_nx - 1;
+        pb.has_south_wall = mpi_decomp3d_->has_south_wall();
+        pb.has_north_wall = mpi_decomp3d_->has_north_wall();
+        pb.has_west_wall  = mpi_decomp3d_->has_west_wall();
+        pb.has_east_wall  = mpi_decomp3d_->has_east_wall();
+    }
+#endif
+
+    // 施加固体节点反弹边界条件（BB 或 IBB）
+    // 固体 BC 在面 BC 之前施加，以确保面 BC（Zou-He 等）具有更高优先级（最后写入）。
+    // MPI 模式下仅对物理区域 [pb.i_w, pb.i_e] × [pb.j_s, pb.j_n] 施加，
+    // 跳过幽灵节点，防止幽灵行的 f 被错误覆盖。
+    if (solid_bc_type_ == SolidBCType::BounceBack) {
+        apply_solid_bounce_back(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
+    } else if (solid_bc_type_ == SolidBCType::InterpolatedBounceBack) {
+        apply_solid_ibb(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
+    }
+
     // 施加通过 add_boundary_condition() 注册的边界条件
     if (!bcs_.empty()) {
-        apply_boundary_conditions(grid_, bcs_);
+        apply_boundary_conditions(grid_, bcs_, pb);
         // BC 修正了边界节点的 f 值，需重新计算宏观量以供下次碰撞使用
         grid_.compute_macroscopic();
     }
@@ -120,6 +175,22 @@ Solver::CollideGuard Solver::make_collide_guard() const
         g.wg2d  = mpi_decomp2d_->has_west_ghost();
         g.eg2d  = mpi_decomp2d_->has_east_ghost();
         // 二维模式下 n_start/n_end 不适用，交由 is_ghost() 逐节点检查
+        g.n_start = 0;
+        g.n_end   = n;
+    }
+    // 三维（XYZ 方向）幽灵层
+    g.use_mpi3d = (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1);
+    if (g.use_mpi3d) {
+        g.gnx3d = grid_.nx;
+        g.gny3d = grid_.ny;
+        g.gnz3d = grid_.nz;
+        g.sg3d  = mpi_decomp3d_->has_south_ghost();
+        g.ng3d  = mpi_decomp3d_->has_north_ghost();
+        g.wg3d  = mpi_decomp3d_->has_west_ghost();
+        g.eg3d  = mpi_decomp3d_->has_east_ghost();
+        g.bg3d  = mpi_decomp3d_->has_bottom_ghost();
+        g.tg3d  = mpi_decomp3d_->has_top_ghost();
+        // 三维模式下 n_start/n_end 不适用，交由 is_ghost() 逐节点检查
         g.n_start = 0;
         g.n_end   = n;
     }
@@ -306,12 +377,49 @@ void Solver::apply_guo_forcing(int node, const double* F, double* /*f_a_ptr*/)
 
 // ---------------------------------------------------------------------------
 // 流式迁移：将分布函数沿各离散速度方向传播
+//
+// MPI 幽灵层交换时序说明（关键正确性）
+// ─────────────────────────────────────
+// 幽灵层交换必须在流式迁移之前完成（即 collide() 之后、stream 循环之前），
+// 而非流式迁移之后。原因如下：
+//
+// 在 D2Q9/D3Q19 推送（PUSH）方案中，每个源节点 (i,j) 将其碰后分布函数
+// f*[i,j,a] 推送到目标节点 (i+cx_a, j+cy_a)。对于北物理边界 j=lny 上的节点，
+// 推送 cy=+1 方向时目标为 j=lny+1（北幽灵行）：
+//   f_tmp[i, lny+1, North] = fc[i, lny, North]
+//
+// 南邻进程（rank+1）在其 stream 步需要将本进程物理行 j=lny 的碰后值作为
+// 幽灵行数据使用。这些值尚未经历 stream，仍位于 grid_.f（碰后值）。
+//
+// 若在 stream 之后交换，则发送的是已流式迁移的数据（即来自 j=lny-1 的
+// cy=+1 方向分量），而非 j=lny 的碰后值，导致接口处一阶误差，
+// 表现为交界处速度/密度不连续（与单进程结果不一致）。
+//
+// 正确时序：
+//   1. collide()           — 碰后分布函数保存在 grid_.f
+//   2. halo_exchange()     — 发送 grid_.f 中的物理边界行（碰后值）到邻居幽灵行
+//   3. stream loop (PUSH)  — 以正确的幽灵数据推送跨进程方向
+//   4. swap f ↔ f_tmp
+//   5. compute_macroscopic()
 // ---------------------------------------------------------------------------
 void Solver::stream()
 {
     const int nx = grid_.nx;
     const int ny = grid_.ny;
     const int nz = grid_.nz;
+
+#ifdef LBM_ENABLE_MPI
+    // 幽灵层交换：在 stream 之前完成（使用碰后分布函数 grid_.f）
+    // 这样邻居幽灵行在 stream 推送时已包含正确的对端碰后值，
+    // 保证跨进程边界数据与串行结果一致，消除交界处不连续。
+    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
+        halo_exchange_d2q9(grid_, *mpi_decomp_);
+    } else if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+        halo_exchange_d2q9_2d(grid_, *mpi_decomp2d_);
+    } else if (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1) {
+        halo_exchange_d3q19_3d(grid_, *mpi_decomp3d_);
+    }
+#endif
 
     if (grid_.model == LatticeModel::D2Q9) {
 #ifdef LBM_ENABLE_OPENMP
@@ -351,15 +459,6 @@ void Solver::stream()
 
     // 将迁移后的临时缓冲区与主缓冲区交换，并更新宏观量
     std::swap(grid_.f, grid_.f_tmp);
-
-#ifdef LBM_ENABLE_MPI
-    // MPI 幽灵层交换（在 BC 施加之前完成，使边界节点拿到正确的邻居数据）
-    if (mpi_decomp_ && mpi_decomp_->nprocs > 1) {
-        halo_exchange_d2q9(grid_, *mpi_decomp_);
-    } else if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
-        halo_exchange_d2q9_2d(grid_, *mpi_decomp2d_);
-    }
-#endif
 
     grid_.compute_macroscopic();
 }

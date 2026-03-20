@@ -4,6 +4,7 @@
 #include "lbm/boundary.hpp"
 #include "lbm/mpi_decomp.hpp"
 #include "lbm/mg_tree.hpp"
+#include "lbm/stretched_grid.hpp"
 #include <cmath>
 #include <cstdio>
 #include <numeric>
@@ -772,7 +773,11 @@ static int test_corner_bounce_back_skip_nonwall()
     }
 
     // 4. 直接调用 apply_boundary_conditions（不经过碰撞/流式迁移）
-    lbm::apply_boundary_conditions(g, bcs);
+    // 非 MPI 模式：物理边界就是整个网格，PhysicalBounds 使用默认（全格覆盖）
+    lbm::PhysicalBounds pb;
+    pb.j_s = 0; pb.j_n = g.ny - 1;
+    pb.i_w = 0; pb.i_e = g.nx - 1;
+    lbm::apply_boundary_conditions(g, bcs, pb);
 
     const int OPP[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
     bool ok = true;
@@ -1308,7 +1313,492 @@ static int test_mg_tree_guards()
     const long long vr = child->volume_ratio();
     ok &= (vr == 1024LL * 1024LL);  // D2: 1024^2
 
+
     std::printf("[MgTree] overflow guards + std::variant decomp: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ===========================================================================
+// 拉伸网格（StretchedGrid）测试
+// ===========================================================================
+
+// 测试：等比拉伸网格构造 — 坐标单调递增、端点精确、间距比正确
+static int test_stretched_grid_geometric()
+{
+    // 构建 x 方向等比拉伸（ratio=1.1）、y 方向均匀（ratio=1.0）网格
+    const int nx = 20, ny = 10;
+    auto sg = lbm::StretchedGrid::build_geometric(
+        nx, ny, 1,
+        0.0, 1.0,   // x 范围
+        0.0, 1.0,   // y 范围
+        1.1, 1.0,   // x 等比 1.1, y 均匀
+        lbm::LatticeModel::D2Q9);
+
+    bool ok = true;
+
+    // 检查节点数
+    ok &= (sg.lattice.nx == nx);
+    ok &= (sg.lattice.ny == ny);
+
+    // 检查端点精确
+    ok &= (std::abs(sg.x_phys[0]      - 0.0) < 1e-12);
+    ok &= (std::abs(sg.x_phys[nx - 1] - 1.0) < 1e-12);
+    ok &= (std::abs(sg.y_phys[0]      - 0.0) < 1e-12);
+    ok &= (std::abs(sg.y_phys[ny - 1] - 1.0) < 1e-12);
+
+    // 检查 x 方向单调递增
+    for (int i = 0; i + 1 < nx; ++i) {
+        if (sg.x_phys[i + 1] <= sg.x_phys[i]) { ok = false; break; }
+    }
+
+    // 检查 y 方向均匀（间距误差 < 1e-10）
+    const double dy_expected = 1.0 / (ny - 1);
+    for (int j = 0; j + 1 < ny; ++j) {
+        if (std::abs(sg.y_phys[j + 1] - sg.y_phys[j] - dy_expected) > 1e-10) {
+            ok = false; break;
+        }
+    }
+
+    // 检查拉伸比
+    const double sr_x = sg.max_stretch_ratio_x();
+    const double sr_y = sg.max_stretch_ratio_y();
+    ok &= (sr_x > 1.0 && sr_x < 1.15);   // 等比 1.1，最大比略大于 1.0
+    ok &= (sr_y < 1.001);                 // 均匀时 ≈ 1.0
+
+    // 检查 dx/dy 数组大小和最后一个值（外推）
+    ok &= (static_cast<int>(sg.dx.size()) == nx);
+    ok &= (static_cast<int>(sg.dy.size()) == ny);
+    ok &= (sg.dx[nx - 1] == sg.dx[nx - 2]);
+    ok &= (sg.dy[ny - 1] == sg.dy[ny - 2]);
+
+    std::printf("[StretchedGrid] geometric construction: sr_x=%.3f sr_y=%.3f → %s\n",
+                sr_x, sr_y, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：tanh 拉伸网格 — 两端节点比中央密（边界层效果）
+static int test_stretched_grid_tanh()
+{
+    const int nx = 50, ny = 50;
+    // delta=0.8 → 适度拉伸，两端约 2× 比中央密
+    auto sg = lbm::StretchedGrid::build_tanh(
+        nx, ny, 1,
+        0.0, 1.0,
+        0.0, 1.0,
+        0.8, 0.8,
+        lbm::LatticeModel::D2Q9);
+
+    bool ok = true;
+
+    // 端点精确
+    ok &= (std::abs(sg.x_phys[0]      - 0.0) < 1e-12);
+    ok &= (std::abs(sg.x_phys[nx - 1] - 1.0) < 1e-12);
+    ok &= (std::abs(sg.y_phys[0]      - 0.0) < 1e-12);
+    ok &= (std::abs(sg.y_phys[ny - 1] - 1.0) < 1e-12);
+
+    // 单调递增
+    for (int i = 0; i + 1 < nx; ++i) {
+        if (sg.x_phys[i + 1] <= sg.x_phys[i]) { ok = false; break; }
+    }
+
+    // tanh 拉伸：两端间距 < 中央间距（边界层效果）
+    const double dx_left   = sg.dx[0];
+    const double dx_center = sg.dx[nx / 2];
+    ok &= (dx_left < dx_center);   // 左端比中央更密
+
+    // delta=0 时应退化为均匀
+    auto sg_uniform = lbm::StretchedGrid::build_tanh(
+        20, 20, 1,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0);
+    const double dy_u = sg_uniform.y_phys[1] - sg_uniform.y_phys[0];
+    for (int j = 0; j + 1 < 20; ++j) {
+        if (std::abs((sg_uniform.y_phys[j + 1] - sg_uniform.y_phys[j]) - dy_u) > 1e-10) {
+            ok = false; break;
+        }
+    }
+
+    std::printf("[StretchedGrid] tanh construction: dx_left=%.4f dx_center=%.4f → %s\n",
+                dx_left, dx_center, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：自定义坐标 + 错误检查
+static int test_stretched_grid_custom()
+{
+    bool ok = true;
+
+    // 正常构建
+    std::vector<double> xc = {0.0, 0.1, 0.3, 0.6, 1.0};
+    std::vector<double> yc = {0.0, 0.5, 1.0};
+    auto sg = lbm::StretchedGrid::build_custom(1, xc, yc, lbm::LatticeModel::D2Q9);
+    ok &= (sg.lattice.nx == 5);
+    ok &= (sg.lattice.ny == 3);
+    ok &= (std::abs(sg.x_phys[2] - 0.3) < 1e-14);
+    ok &= (std::abs(sg.dx[0] - 0.1) < 1e-14);
+
+    // 非单调坐标应抛出异常
+    bool threw_x = false;
+    try {
+        std::vector<double> bad = {0.0, 0.5, 0.3, 1.0};  // 非单调
+        lbm::StretchedGrid::build_custom(1, bad, {0.0, 1.0});
+    } catch (const std::invalid_argument&) {
+        threw_x = true;
+    }
+    ok &= threw_x;
+
+    // 空坐标应抛出异常
+    bool threw_empty = false;
+    try {
+        lbm::StretchedGrid::build_custom(1, {}, {0.0, 1.0});
+    } catch (const std::invalid_argument&) {
+        threw_empty = true;
+    }
+    ok &= threw_empty;
+
+    std::printf("[StretchedGrid] custom coordinates: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：IS-LBM 修正基本性质
+//   - 在均匀网格上，修正应产生与标准流式完全相同（幂等）的结果
+//   - 拉伸比低于阈值时，修正自动跳过（f 不变）
+//   - 拉伸网格上，修正后 f 值有限（无 NaN/Inf）
+static int test_stretched_grid_islbm()
+{
+    bool ok = true;
+
+    // ---- 1. 均匀网格（ratio=1.0）：IS-LBM 修正后结果应与修正前相同（幂等）
+    {
+        const int nx = 16, ny = 16;
+        auto sg = lbm::StretchedGrid::build_geometric(
+            nx, ny, 1, 0.0, 1.0, 0.0, 1.0,
+            1.0, 1.0);
+
+        // 初始化为有值的 f（非零速度）
+        lbm::Solver solver(sg.lattice, 1.0);
+        lbm::BoundaryCondition bc;
+        bc.type = lbm::BCType::BounceBack; bc.face = lbm::Face::South;
+        solver.add_boundary_condition(bc);
+        bc.face = lbm::Face::North; solver.add_boundary_condition(bc);
+        solver.step();
+
+        // 记录 step() 后的 f 值
+        std::vector<double> f_before = sg.lattice.f;
+
+        // 施加 IS-LBM 修正（均匀网格，拉伸比 = 1.0 < 阈值 1.05 → 应自动跳过）
+        lbm::islbm_interpolation_correction(sg, 1.05);
+        const std::vector<double>& f_after = sg.lattice.f;
+
+        for (int i = 0; i < static_cast<int>(f_before.size()); ++i) {
+            if (std::abs(f_before[i] - f_after[i]) > 1e-12) { ok = false; break; }
+        }
+    }
+
+    // ---- 2. 拉伸网格（ratio=1.2 > 阈值）：修正后 f 有限、质量守恒
+    {
+        const int nx = 32, ny = 32;
+        auto sg = lbm::StretchedGrid::build_geometric(
+            nx, ny, 1, 0.0, 1.0, 0.0, 1.0,
+            1.2, 1.2);
+
+        lbm::Solver solver(sg.lattice, 1.0);
+        // 运行几步使 f 有一定变化
+        for (int t = 0; t < 5; ++t) solver.step();
+
+        // 修正前总质量
+        double mass_before = 0.0;
+        for (double r : sg.lattice.rho) mass_before += r;
+
+        // 施加 IS-LBM 修正（拉伸比 > 阈值，实际修正）
+        lbm::islbm_interpolation_correction(sg, 1.05);
+
+        // 检查 f 值有限
+        for (int i = 0; i < static_cast<int>(sg.lattice.f.size()); ++i) {
+            if (!std::isfinite(sg.lattice.f[i])) { ok = false; break; }
+        }
+
+        // 修正后总质量（双线性插值保持连续性，质量应基本守恒，允许 0.1% 偏差）
+        double mass_after = 0.0;
+        for (double r : sg.lattice.rho) mass_after += r;
+        ok &= (std::abs(mass_after - mass_before) / mass_before < 0.001);
+    }
+
+    std::printf("[StretchedGrid] IS-LBM correction (idempotent uniform, finite stretched): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ===========================================================================
+// 多重网格改进：mg_prolong_f、mg_apply_fringe_bc、AMR 指标
+// ===========================================================================
+
+// 测试：mg_prolong_f — 延拓后细网格 f 为有效平衡分布（sum_a f_a = rho, f finite）
+static int test_mg_prolong_f()
+{
+    // 创建 2 层网格：粗 32×32，细 16×16（覆盖粗网格中心区域 8..23）
+    lbm::MgTree tree({0, 31, 0, 31, 0, 0});
+    auto* fine_node = tree.add_level(tree.root(), {8, 23, 8, 23, 0, 0}, 2);
+
+    lbm::LatticeGrid coarse_g(32, 32, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid fine_g  (32, 32, 1, lbm::LatticeModel::D2Q9);
+
+    // 初始化粗网格：均匀密度 + 非零速度
+    const double omega = 1.0;
+    lbm::Solver coarse_solver(coarse_g, omega);
+    for (int t = 0; t < 10; ++t) coarse_solver.step();
+
+    tree.root()->grid = &coarse_g;
+    fine_node->grid   = &fine_g;
+
+    // 执行 f 延拓
+    lbm::mg_prolong_f(*tree.root(), *fine_node);
+
+    bool ok = true;
+
+    // 验证细网格 f 有限
+    for (double v : fine_g.f) {
+        if (!std::isfinite(v)) { ok = false; break; }
+    }
+
+    // 验证细网格各节点 sum_a f_a = rho（平衡分布守恒性）
+    for (int n = 0; n < fine_g.size(); ++n) {
+        double sum = 0.0;
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            sum += fine_g.f[n * lbm::d2q9::Q + a];
+        }
+        if (std::abs(sum - fine_g.rho[n]) > 1e-10) { ok = false; break; }
+    }
+
+    // 验证 f_tmp 已同步（首步流式迁移时不会使用未初始化数据）
+    for (int i = 0; i < static_cast<int>(fine_g.f.size()); ++i) {
+        if (std::abs(fine_g.f[i] - fine_g.f_tmp[i]) > 1e-14) { ok = false; break; }
+    }
+
+    std::printf("[MgTree] mg_prolong_f (f = f_eq(rho,u) + f_tmp synced): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：mg_apply_fringe_bc — fringe 区域 f 从粗网格更新，内部区域不变
+static int test_mg_apply_fringe_bc()
+{
+    lbm::MgTree tree({0, 31, 0, 31, 0, 0});
+    auto* fine_node = tree.add_level(tree.root(), {4, 27, 4, 27, 0, 0}, 2);
+
+    lbm::LatticeGrid coarse_g(32, 32, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid fine_g  (48, 48, 1, lbm::LatticeModel::D2Q9);
+
+    // 粗网格 rho 设为非均匀（便于检测是否被插值进 fringe）
+    for (int n = 0; n < coarse_g.size(); ++n) {
+        coarse_g.rho[n] = 1.0 + 0.01 * (n % 7);
+        // u 保持 0（默认已初始化为 0）
+    }
+    // 不调用 compute_macroscopic()——它需要有效的 f 值才能工作。
+    // mg_apply_fringe_bc 只读 rho 和 u，无需 f。
+
+    // 细网格 f 设为已知值（便于检测 fringe 是否被覆盖）
+    for (double& v : fine_g.f) v = 42.0;
+
+    tree.root()->grid = &coarse_g;
+    fine_node->grid   = &fine_g;
+
+    // 施加 fringe BC（宽度 2 格）
+    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, 2);
+
+    bool ok = true;
+    const int fnx = fine_g.nx;  // = 48
+
+    // fringe 区域（前2列/后2列/前2行/后2行）：f 应已被覆盖（≠ 42）
+    // 检查 (0,0)（左下角，在 fringe 内）
+    const int n_fringe = fine_g.idx(0, 0);
+    ok &= (fine_g.f[n_fringe * lbm::d2q9::Q] != 42.0);
+
+    // 内部节点 (10,10)：f 应仍为 42（未被修改）
+    const int n_inner = fine_g.idx(10, 10);
+    ok &= (fine_g.f[n_inner * lbm::d2q9::Q] == 42.0);
+
+    // fringe 区域的 f 值有限
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < fnx; ++i) {
+            const int n = fine_g.idx(i, j);
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                if (!std::isfinite(fine_g.f[n * lbm::d2q9::Q + a])) { ok = false; }
+            }
+        }
+    }
+
+    std::printf("[MgTree] mg_apply_fringe_bc (fringe updated, interior unchanged): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：AMR 细化指标 — mg_compute_refinement_indicator（密度梯度正确性）
+static int test_mg_refinement_indicator()
+{
+    // 创建含密度梯度的网格（右半部分 rho=1.1，左半部分 rho=1.0）
+    const int nx = 20, ny = 10;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            g.rho[g.idx(i, j)] = (i >= nx / 2) ? 1.1 : 1.0;
+        }
+    }
+
+    lbm::MgTree tree({0, nx - 1, 0, ny - 1, 0, 0});
+    tree.root()->grid = &g;
+
+    std::vector<double> indicator;
+    lbm::mg_compute_refinement_indicator(*tree.root(), indicator);
+
+    bool ok = true;
+    ok &= (static_cast<int>(indicator.size()) == g.size());
+
+    // 分界面附近（i = nx/2 - 1 或 i = nx/2）的指标值应比均匀区域大
+    double max_indicator = *std::max_element(indicator.begin(), indicator.end());
+    // 远离分界面的节点（e.g. i=2, j=0）指标应约为 0
+    const double ind_interior = indicator[g.idx(2, ny / 2)];
+    ok &= (max_indicator > ind_interior * 10.0);
+    ok &= (max_indicator > 0.0);
+
+    // 均匀区域指标 = 0（中心差分后 dρ/dx = 0）
+    ok &= (std::abs(ind_interior) < 1e-14);
+
+    // mg_total_subcycle_steps 测试（顺便放在这里）
+    lbm::MgTree tree2({0, 63, 0, 63, 0, 0});
+    auto* l1 = tree2.add_level(tree2.root(), {16, 47, 16, 47, 0, 0}, 2);
+    auto* l2 = tree2.add_level(l1,            {24, 39, 24, 39, 0, 0}, 4);
+    ok &= (lbm::mg_total_subcycle_steps(*tree2.root()) == 1);
+    ok &= (lbm::mg_total_subcycle_steps(*l1) == 2);
+    ok &= (lbm::mg_total_subcycle_steps(*l2) == 8);
+
+    std::printf("[MgTree] mg_compute_refinement_indicator + total_subcycle_steps: "
+                "max_ind=%.4f interior_ind=%.2e → %s\n",
+                max_indicator, ind_interior, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ===========================================================================
+// MPI BC 壁面所有权过滤测试（修复分块边界速度阶跃）
+// ===========================================================================
+
+// 测试：PhysicalBounds::has_south_wall/has_north_wall=false 时
+//       South/North BC 应完全跳过（不修改内部物理行），防止 MPI 分块边界速度阶跃。
+//
+// 复现场景：4 进程 1D Y 分解中，rank 1（内部进程）的 has_south_wall=false，
+//           因此 South BounceBack 不应改变 j=1 行的 f 值。
+//           若改变，则在分块边界处产生速度 kink（即问题所描述的物理失真）。
+static int test_bc_wall_ownership_filter()
+{
+    // 模拟内部进程（non-wall rank）：local_ny=15, grid_ny=17（含南北幽灵）
+    const int nx = 16, local_ny = 15, grid_ny = local_ny + 2;
+    lbm::LatticeGrid g(nx, grid_ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 将所有物理行 f 设为已知值，以便检测是否被意外修改
+    for (int j = 1; j <= local_ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const int n = g.idx(i, j);
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                g.f    [n * lbm::d2q9::Q + a] = 1.0 + 0.01 * a + 0.001 * j;
+                g.f_tmp[n * lbm::d2q9::Q + a] = g.f[n * lbm::d2q9::Q + a];
+            }
+        }
+    }
+
+    // 内部进程的 PhysicalBounds：不拥有南/北物理壁
+    lbm::PhysicalBounds pb;
+    pb.j_s = 1;        pb.j_n = local_ny;
+    pb.i_w = 0;        pb.i_e = nx - 1;
+    pb.has_south_wall = false;   // ← 关键：内部进程不持有南壁
+    pb.has_north_wall = false;   // ← 内部进程不持有北壁
+    pb.has_west_wall  = true;
+    pb.has_east_wall  = true;
+
+    // 注册 South + North BounceBack（与实际通道流配置相同）
+    std::vector<lbm::BoundaryCondition> bcs;
+    lbm::BoundaryCondition bc_s, bc_n;
+    bc_s.type = lbm::BCType::BounceBack; bc_s.face = lbm::Face::South;
+    bc_n.type = lbm::BCType::BounceBack; bc_n.face = lbm::Face::North;
+    bcs.push_back(bc_s);
+    bcs.push_back(bc_n);
+
+    // 记录 BC 施加前 j=1（紧邻南幽灵）和 j=local_ny（紧邻北幽灵）的 f 值
+    std::vector<double> f_row1_before(nx * lbm::d2q9::Q);
+    std::vector<double> f_rowN_before(nx * lbm::d2q9::Q);
+    for (int i = 0; i < nx; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            f_row1_before[i * lbm::d2q9::Q + a] =
+                g.f[g.idx(i, 1)        * lbm::d2q9::Q + a];
+            f_rowN_before[i * lbm::d2q9::Q + a] =
+                g.f[g.idx(i, local_ny) * lbm::d2q9::Q + a];
+        }
+    }
+
+    // 施加 BC（has_*_wall=false 的面应被完全跳过）
+    lbm::apply_boundary_conditions(g, bcs, pb);
+
+    bool ok = true;
+    // j=1 的 f 值应完全不变（South BounceBack 已跳过）
+    for (int i = 0; i < nx && ok; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q && ok; ++a) {
+            if (g.f[g.idx(i, 1) * lbm::d2q9::Q + a] !=
+                f_row1_before[i * lbm::d2q9::Q + a])
+                ok = false;
+        }
+    }
+    // j=local_ny 的 f 值应完全不变（North BounceBack 已跳过）
+    for (int i = 0; i < nx && ok; ++i) {
+        for (int a = 0; a < lbm::d2q9::Q && ok; ++a) {
+            if (g.f[g.idx(i, local_ny) * lbm::d2q9::Q + a] !=
+                f_rowN_before[i * lbm::d2q9::Q + a])
+                ok = false;
+        }
+    }
+
+    std::printf("[MPI] BC wall-ownership filter (interior rank skips S/N BC): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 互补测试：has_south_wall=true 时 South BounceBack 应实际修改 j=pb.j_s 的 f 值
+static int test_bc_wall_ownership_south_applied()
+{
+    const int nx = 8, ny = 8;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    // f 和 f_tmp 设为不同的已知值，以便通过读取 f_tmp[opp] 来检测反弹是否执行
+    for (auto& v : g.f)     v = 2.0;
+    for (auto& v : g.f_tmp) v = 3.0;  // BounceBack 从 f_tmp 读取
+
+    lbm::PhysicalBounds pb;
+    pb.j_s = 0;        pb.j_n = ny - 1;
+    pb.i_w = 0;        pb.i_e = nx - 1;
+    pb.has_south_wall = true;  // 持有南壁 → BC 应被施加
+    pb.has_north_wall = true;
+    pb.has_west_wall  = true;
+    pb.has_east_wall  = true;
+
+    std::vector<lbm::BoundaryCondition> bcs;
+    lbm::BoundaryCondition bc;
+    bc.type = lbm::BCType::BounceBack; bc.face = lbm::Face::South;
+    bcs.push_back(bc);
+
+    lbm::apply_boundary_conditions(g, bcs, pb);
+
+    // 半步反弹（South 面）：南壁节点的"朝北"幽灵方向 ← f_tmp 中对应的"朝南"方向
+    // D2Q9 方向约定：2=N(0,+1), 5=NE(+1,+1), 6=NW(-1,+1) — 均为南壁的未知（幽灵）方向
+    //                4=S(0,-1), 7=SW(-1,-1), 8=SE(+1,-1) — 对应的已知（反射来源）方向
+    // 反弹：f[2]←f_tmp[4]=3, f[5]←f_tmp[7]=3, f[6]←f_tmp[8]=3（原值均为 2.0）
+    bool ok = true;
+    for (int i = 0; i < nx && ok; ++i) {
+        const double* f = &g.f[g.idx(i, 0) * lbm::d2q9::Q];
+        if (std::abs(f[2] - 3.0) > 1e-14) ok = false;   // N  ← f_tmp[S=4]  = 3.0
+        if (std::abs(f[5] - 3.0) > 1e-14) ok = false;   // NE ← f_tmp[SW=7] = 3.0
+        if (std::abs(f[6] - 3.0) > 1e-14) ok = false;   // NW ← f_tmp[SE=8] = 3.0
+    }
+
+    std::printf("[MPI] BC wall-ownership: south wall owner applies BB (f changed): %s\n",
+                ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1338,6 +1828,15 @@ int test_lbm_main()
     failures += test_mg_prolong_rho_u();
     failures += test_mg_restrict_rho_u();
     failures += test_mg_tree_guards();
+    failures += test_stretched_grid_geometric();
+    failures += test_stretched_grid_tanh();
+    failures += test_stretched_grid_custom();
+    failures += test_stretched_grid_islbm();
+    failures += test_mg_prolong_f();
+    failures += test_mg_apply_fringe_bc();
+    failures += test_mg_refinement_indicator();
+    failures += test_bc_wall_ownership_filter();
+    failures += test_bc_wall_ownership_south_applied();
     if (failures == 0)
         std::printf("1: All tests PASSED\n");
     return failures;
