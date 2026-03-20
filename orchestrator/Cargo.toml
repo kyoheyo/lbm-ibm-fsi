@@ -18,11 +18,11 @@ python-ffi = ["dep:pyo3"]
 [dependencies]
 lbm-bindings = { path = "../bindings" }
 serde        = { version = "1", features = ["derive"] }
-toml         = "0.8"
+toml         = "1"
 clap         = { version = "4", features = ["derive"] }
 anyhow       = "1"
-zip          = { version = "2.4", default-features = false, features = ["deflate"] }
-pyo3         = { version = "0.24", optional = true }
+zip          = { version = "2", default-features = false, features = ["deflate"] }
+pyo3         = { version = "0.28", optional = true }
 
 [dev-dependencies]
 approx = "0.5"

@@ -50,7 +50,7 @@ pub fn add_python_path(extra_path: &str) -> Result<()> {
     {
         use pyo3::prelude::*;
         use pyo3::types::PyList;
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
             let path = path.downcast::<PyList>()?;
@@ -93,7 +93,7 @@ pub fn markers_from_geometry(
     {
         use pyo3::prelude::*;
         use pyo3::types::PyTuple;
-        let result = Python::with_gil(|py| -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+        let result = Python::attach(|py| -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
             let bridge = py.import("lbm_pre.bridge")?;
             let ret = bridge.call_method1(
                 "geometry_markers_raw",
@@ -149,7 +149,7 @@ pub fn plot_field(
     {
         use pyo3::prelude::*;
         use pyo3::types::PyList;
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             let bridge = py.import("lbm_post.bridge")?;
             let rho_list = PyList::new(py, rho)?;
             let ux_list  = PyList::new(py, ux)?;
