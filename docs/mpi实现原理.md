@@ -77,16 +77,56 @@ y_start[r]  = r * base + min(r, ny % nprocs)
 **本地网格布局（含幽灵行，`nprocs > 1`）：**
 
 ```
-j = 0            : 南幽灵行（来自 rank-1 的最北物理行）
-j = 1            : 本进程最南物理行（全局 y_start）
+j = 0            : 南幽灵行（ALL ranks 均分配，含 rank 0；rank 0 的 rank_south=-1
+                              即 MPI_PROC_NULL，Sendrecv 为空操作，此行不会被填充）
+j = 1            : 本进程最南物理行（全局 y_start）— rank 0 物理南壁
     ...
-j = local_ny     : 本进程最北物理行（全局 y_end）
-j = local_ny+1   : 北幽灵行（来自 rank+1 的最南物理行）
+j = local_ny     : 本进程最北物理行（全局 y_end）  — rank nprocs-1 物理北壁
+j = local_ny+1   : 北幽灵行（ALL ranks 均分配，含 rank nprocs-1；
+                              rank nprocs-1 的 rank_north=-1，此行不会被填充）
 ```
 
+> **关键约定**：无论是哪个 rank，**物理区域始终从 j=1 开始，到 j=local_ny 结束**。
+> `PhysicalBounds::j_s=1`（南物理边界），`j_n=local_ny`（北物理边界）。
+> `apply_boundary_conditions()` 使用这两个索引而非硬编码的 0/ny-1。
+
+**`MpiDecomp` 结构体字段（`core/include/lbm/mpi_decomp.hpp`）：**
+
+```cpp
+struct MpiDecomp {
+    int rank       = 0;   ///< 当前进程编号
+    int nprocs     = 1;   ///< 进程总数
+    int global_nx  = 0;   ///< 全局列数
+    int global_ny  = 0;   ///< 全局行数
+    int y_start    = 0;   ///< 本地物理起始行（全局坐标）
+    int y_end      = 0;   ///< 本地物理结束行（全局坐标，含）
+    int local_ny   = 0;   ///< 本地物理行数（不含幽灵行）
+    int rank_south = -1;  ///< 南邻 rank（rank 0 时 = MPI_PROC_NULL = -1）
+    int rank_north = -1;  ///< 北邻 rank（rank nprocs-1 时 = MPI_PROC_NULL = -1）
+
+    bool has_south_wall() const { return y_start == 0; }           ///< 是否持有全局南壁
+    bool has_north_wall() const { return y_end == global_ny - 1; } ///< 是否持有全局北壁
+    int  grid_ny() const { return (nprocs > 1) ? local_ny + 2 : local_ny; } ///< 含幽灵行 ny
+};
+```
+
+**幽灵行交换（`halo_exchange_d2q9(grid, decomp)`）：**
+
+```
+交换 1（发送顶物理行给北邻，接收南幽灵行来自南邻）：
+  send: f[j=local_ny][i=1..nx]  → rank_north（tag=0）
+  recv: f[j=0][i=1..nx]         ← rank_south（tag=0）
+
+交换 2（发送底物理行给南邻，接收北幽灵行来自北邻）：
+  send: f[j=1][i=1..nx]         → rank_south（tag=1）
+  recv: f[j=local_ny+1][i=1..nx]← rank_north（tag=1）
+```
+`MPI_PROC_NULL` 邻居的 Sendrecv 调用合法（无操作），rank 0 和 rank nprocs-1 的边界幽灵行不被填充。
+
 **代码位置：**
-- 结构体定义：`core/include/lbm/mpi_decomp.hpp` 第 83~104 行（`struct MpiDecomp`）
+- 结构体定义：`core/include/lbm/mpi_decomp.hpp`（`struct MpiDecomp`）
 - 创建函数：`core/src/lbm/mpi_decomp.cpp` 第 22~43 行（`MpiDecomp::create()`）
+- 幽灵行交换：`core/src/lbm/mpi_decomp.cpp` 第 47~92 行（`halo_exchange_d2q9()`）
 
 ---
 
@@ -279,32 +319,47 @@ if (mpi_decomp3d_ && mpi_decomp3d_->nprocs > 1)
 
 在 MPI 并行模式下，每个进程的本地网格包含幽灵行/列。如果直接将边界条件（BC）施加在本地网格的 `j=0` 或 `j=ny-1` 行（即幽灵行），就会污染幽灵数据，导致下一时间步的幽灵交换将错误的 BC 值传递给相邻进程，从而在分区接口处产生速度/密度阶跃。
 
-`PhysicalBounds` 结构体（`core/include/lbm/boundary.hpp` 第 59~100 行）通过显式记录物理行/列范围来解决这一问题：
+`PhysicalBounds` 结构体（`core/include/lbm/boundary.hpp`）通过显式记录物理行/列范围来解决这一问题：
 
 ```cpp
 struct PhysicalBounds {
-    int  j_s = 0, j_n = ny-1;   // 物理南/北边界行索引（本地坐标）
-    int  i_w = 0, i_e = nx-1;   // 物理西/东边界列索引（本地坐标）
-    bool has_south_wall = true;  // 本进程是否持有全局南壁
-    bool has_north_wall = true;  // 本进程是否持有全局北壁
-    bool has_west_wall  = true;  // 本进程是否持有全局西壁
-    bool has_east_wall  = true;  // 本进程是否持有全局东壁
+    int  j_s = 0;              ///< 物理南边界行索引（含，本地坐标）；MPI 1D 时=1
+    int  j_n = 0;              ///< 物理北边界行索引（含，本地坐标）；MPI 1D 时=local_ny
+    int  i_w = 0;              ///< 物理西边界列索引（含，本地坐标）
+    int  i_e = 0;              ///< 物理东边界列索引（含，本地坐标）
+    bool has_south_wall = true; ///< 本进程是否持有全局南壁（仅此为 true 才施加 South BC）
+    bool has_north_wall = true; ///< 本进程是否持有全局北壁（仅此为 true 才施加 North BC）
+    bool has_west_wall  = true; ///< 本进程是否持有全局西壁
+    bool has_east_wall  = true; ///< 本进程是否持有全局东壁
 };
 ```
 
-`apply_boundary_conditions()` 在遍历壁面节点时以 `j_s`/`j_n`/`i_w`/`i_e` 替代硬编码的 `0`/`ny-1`/`0`/`nx-1`，并用 `has_*_wall` 标志决定是否真正施加该面的 BC。
+`apply_boundary_conditions()` 接收 `PhysicalBounds` 参数，在遍历壁面节点时以 `j_s`/`j_n`/`i_w`/`i_e` 替代硬编码的 `0`/`ny-1`/`0`/`nx-1`，并用 `has_*_wall` 标志决定是否真正施加该面的 BC：
 
-**在 `Solver::step()` 中计算 `PhysicalBounds`（`core/src/lbm/solver.cpp` 第 78~121 行）：**
+```cpp
+// 仅当 has_south_wall=true 时才在 j_s 行施加南壁 BC，内部 rank 跳过
+void apply_boundary_conditions(LatticeGrid& grid, const PhysicalBounds& bounds,
+                                const std::vector<BoundaryCondition>& bcs);
+```
+
+**`Solver::step()` 中按分解类型填充 `PhysicalBounds`（`core/src/lbm/solver.cpp`）：**
 
 ```
 非 MPI：    j_s=0, j_n=ny-1, i_w=0, i_e=nx-1, 所有 has_*_wall=true
-1D Y 切片： j_s=1, j_n=ny-2, i_w=0, i_e=nx-1
-            has_south_wall = (rank 0 才为 true)
-            has_north_wall = (rank nprocs-1 才为 true)
+1D Y 切片： j_s=1, j_n=local_ny, i_w=0, i_e=nx-1
+            has_south_wall = decomp.has_south_wall()  （仅 rank 0 为 true）
+            has_north_wall = decomp.has_north_wall()  （仅 rank nprocs-1 为 true）
 2D 块分解： j_s=phys_y0, j_n=phys_y0+local_ny-1
             i_w=phys_x0, i_e=phys_x0+local_nx-1
-            has_*_wall 均按各自进程是否位于全局边缘而设置
+            has_south_wall = decomp2d.has_south_wall() （row_rank==0）
+            has_north_wall = decomp2d.has_north_wall() （row_rank==py-1）
+            has_west_wall  = decomp2d.has_west_wall()  （col_rank==0）
+            has_east_wall  = decomp2d.has_east_wall()  （col_rank==px-1）
 ```
+
+`has_south_wall()` / `has_north_wall()` / `has_west_wall()` / `has_east_wall()` 是 `MpiDecomp` 和 `MpiDecomp2D` 上的内联成员函数（见 §2.1 / §2.2）。
+
+**固体 BB/IBB 的 MPI 适配**：`apply_solid_bounce_back()` 和 `apply_solid_ibb()` 接受物理区域范围参数 `(grid, phys_i0, phys_j0, phys_i1, phys_j1)`，仅对本进程物理区域内的固体节点施加反弹计算，避免处理幽灵层中的无效固体标记。受力统计 `lbm_compute_solid_force()` 同样只统计本进程物理区域贡献，调用方须通过 `lbm_mpi_allreduce_sum_f64()` 求全局合力。
 
 ---
 
