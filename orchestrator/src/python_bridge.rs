@@ -53,7 +53,7 @@ pub fn add_python_path(extra_path: &str) -> Result<()> {
         Python::attach(|py| -> PyResult<()> {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            let path = path.downcast::<PyList>()?;
+            let path = path.cast::<PyList>()?;
             path.insert(0, extra_path)?;
             Ok(())
         })?;
@@ -99,7 +99,7 @@ pub fn markers_from_geometry(
                 "geometry_markers_raw",
                 (geometry, x0, y0, size, n_markers as usize),
             )?;
-            let tuple = ret.downcast::<PyTuple>()?;
+            let tuple = ret.cast::<PyTuple>()?;
             let x:  Vec<f64> = tuple.get_item(0)?.extract()?;
             let y:  Vec<f64> = tuple.get_item(1)?.extract()?;
             let ds: Vec<f64> = tuple.get_item(2)?.extract()?;

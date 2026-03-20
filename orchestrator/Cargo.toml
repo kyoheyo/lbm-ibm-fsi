@@ -22,7 +22,7 @@ toml         = "1"
 clap         = { version = "4", features = ["derive"] }
 anyhow       = "1"
 zip          = { version = "2", default-features = false, features = ["deflate"] }
-pyo3         = { version = "0.28", optional = true }
+pyo3         = { version = "0.28", optional = true, features = ["auto-initialize"] }
 
 [dev-dependencies]
 approx = "0.5"
