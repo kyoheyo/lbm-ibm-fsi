@@ -68,10 +68,12 @@ lbm_solver_step          // ← Rust 能直接声明并调用
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  第五层：orchestrator/src/main.rs（Rust 主控驱动）                    │
-│  · 解析 TOML 配置                                                     │
-│  · 调用第四层的安全类型驱动仿真循环                                    │
-│  · 写出 NPZ 快照 / CSV 监控日志                                        │
+│  第五层：orchestrator/src/（Rust 主控驱动）                           │
+│  · main.rs    — 解析 TOML 配置，驱动仿真循环，写出 NPZ/CSV           │
+│  · sim.rs     — MpiDecomp（MPI 域分解上下文）+ 边界条件注册           │
+│  · fsi.rs     — FsiCouplingMode 推断/验证 + 固体/IBM 体初始化         │
+│  · output.rs  — 原生 Rust 输出（NPZ / ASCII Tecplot / 二进制 Tecplot）│
+│  · config.rs  — TOML 配置解析（PluginsConfig + output.format）        │
 └────────────────────────┬─────────────────────────────────────────────┘
                          │ 调用 LbmGrid / LbmSolver / register_plugins
 ┌────────────────────────▼─────────────────────────────────────────────┐
@@ -653,7 +655,16 @@ pub fn set_omp_num_threads(n: i32);
 
 ## 7 第五层：主控驱动（orchestrator）
 
-文件：`orchestrator/src/main.rs`
+文件：`orchestrator/src/` — 包含以下源文件：
+
+| 文件 | 职责 |
+|------|------|
+| `main.rs` | 主控流程：配置读取 → MPI 初始化 → 网格/求解器创建 → 仿真循环 → 后处理 |
+| `config.rs` | TOML 配置文件解析（`Config`、`MpiRunConfig`、`FsiConfig` 等结构体） |
+| `output.rs` | 原生 Rust 输出：NPZ 压缩快照、ASCII Tecplot `.dat`、二进制 Tecplot `.plt`、CSV |
+| `sim.rs` | `MpiDecomp` 结构体（统一封装 2D/3D MPI 分解）+ `register_boundary_conditions()` |
+| `fsi.rs` | `FsiCouplingMode` 枚举 + `IbmEntry` 结构体 + 固体/IBM 体初始化函数 |
+| `python_bridge.rs` | Python FFI 桥接（pyo3，`python-ffi` 特性保护） |
 
 主控层只使用第四层的安全类型，**完全没有 `unsafe` 代码**：
 

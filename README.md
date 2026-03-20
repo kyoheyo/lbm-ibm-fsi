@@ -57,7 +57,11 @@ lbm-ibm-fsi/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       └── config.rs
+│       ├── config.rs
+│       ├── output.rs
+│       ├── sim.rs               # MPI decomp context + BC registration
+│       ├── fsi.rs               # FSI coupling modes + body setup
+│       └── python_bridge.rs     # optional Python FFI bridge
 │
 ├── python/                  # Python pre/post-processing
 │   ├── pyproject.toml       # Package metadata & dependencies
