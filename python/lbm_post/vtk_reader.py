@@ -212,7 +212,7 @@ class NpzReader:
     def last(self) -> FieldSnapshot:
         """加载最后一个（时间步最大）快照。"""
         if not self._files:
-            raise FileNotFoundError(f"目录 {self.directory} 中没有 fluid_*.npz 文件")
+            raise FileNotFoundError(f"No fluid_*.npz files found in directory: {self.directory}")
         return self.read(self._files[-1])
 
 
@@ -296,7 +296,7 @@ class TecplotAscReader:
             if m:
                 ny = int(m.group(1))
         if nx == 0 or ny == 0:
-            raise ValueError(f"无法从文件 {p} 中解析网格尺寸（I/J）")
+            raise ValueError(f"Cannot parse grid dimensions (I/J) from file: {p}")
 
         # 跳过头部行（TITLE + VARIABLES + ZONE），读取数据行
         # 头部行通常有 3 行，但也可能更多——以第一个纯数字行为准
@@ -309,7 +309,7 @@ class TecplotAscReader:
 
         if len(data_lines) != nx * ny:
             raise ValueError(
-                f"文件 {p} 中数据行数 {len(data_lines)} 与网格大小 {nx}×{ny} 不符"
+                f"Data line count {len(data_lines)} does not match grid size {nx}x{ny} in file: {p}"
             )
 
         # 解析数字并重新排列为 (ny, nx) 数组
@@ -337,7 +337,7 @@ class TecplotAscReader:
     def last(self) -> FieldSnapshot:
         """加载最后一个（时间步最大）快照。"""
         if not self._files:
-            raise FileNotFoundError(f"目录 {self.directory} 中没有 fluid_*.dat 文件")
+            raise FileNotFoundError(f"No fluid_*.dat files found in directory: {self.directory}")
         return self.read(self._files[-1])
 
 
@@ -436,12 +436,12 @@ class TecplotBinReader:
         magic = raw[pos:pos + 8]
         pos += 8
         if magic != b"#!TDV112":
-            raise ValueError(f"文件 {p} 不是有效的 TDV112 二进制 Tecplot 文件（魔数错误）")
+            raise ValueError(f"File {p} is not a valid TDV112 binary Tecplot file (invalid magic bytes)")
 
         # 字节序标志（应为 1）
         byte_order = read_i32()
         if byte_order != 1:
-            raise ValueError(f"文件 {p} 使用大端字节序，本读取器仅支持小端（Intel）格式")
+            raise ValueError(f"File {p} uses big-endian byte order; only little-endian (Intel) is supported")
 
         # -----------------------------------------------------------------------
         # 2. 文件类型（0 = 全场，忽略）
@@ -477,7 +477,7 @@ class TecplotBinReader:
         # -----------------------------------------------------------------------
         zone_marker = read_f32()
         if abs(zone_marker - 299.0) > 0.01:
-            raise ValueError(f"文件 {p} 中 Zone 标记值错误（期望 299.0，实际 {zone_marker}）")
+            raise ValueError(f"Zone marker error in file {p}: expected 299.0, got {zone_marker}")
 
         _zone_name   = read_tec_string()
         _parent_zone = read_i32()
@@ -498,7 +498,7 @@ class TecplotBinReader:
         # -----------------------------------------------------------------------
         eoh = read_f32()
         if abs(eoh - 357.0) > 0.01:
-            raise ValueError(f"文件 {p} 中 EOH 标记值错误（期望 357.0，实际 {eoh}）")
+            raise ValueError(f"EOH marker error in file {p}: expected 357.0, got {eoh}")
 
         # -----------------------------------------------------------------------
         # 8. 数据区域
@@ -506,7 +506,7 @@ class TecplotBinReader:
         # 区域数据标记（299.0）
         data_marker = read_f32()
         if abs(data_marker - 299.0) > 0.01:
-            raise ValueError(f"文件 {p} 中数据区域标记值错误（期望 299.0，实际 {data_marker}）")
+            raise ValueError(f"Data zone marker error in file {p}: expected 299.0, got {data_marker}")
 
         # 各变量格式（2 = float64）
         var_formats = [read_i32() for _ in range(n_vars)]
@@ -526,7 +526,7 @@ class TecplotBinReader:
                 arr = np.frombuffer(raw, dtype="<f4", count=n, offset=pos).astype(np.float64)
                 pos += n * 4
             else:
-                raise ValueError(f"文件 {p} 中变量格式 {fmt} 未知（支持 1=float32，2=float64）")
+                raise ValueError(f"Unknown variable format {fmt} in file {p} (supported: 1=float32, 2=float64)")
             vars_data.append(arr)
 
         # 按变量名确定 rho/ux/uy 的索引（X=0, Y=1, RHO=2, UX=3, UY=4）
@@ -548,7 +548,7 @@ class TecplotBinReader:
     def last(self) -> FieldSnapshot:
         """加载最后一个（时间步最大）快照。"""
         if not self._files:
-            raise FileNotFoundError(f"目录 {self.directory} 中没有 fluid_*.plt 文件")
+            raise FileNotFoundError(f"No fluid_*.plt files found in directory: {self.directory}")
         return self.read(self._files[-1])
 
 
@@ -580,7 +580,7 @@ class VtkReader:
         # 提取 Piece 节点范围
         piece = root.find(".//Piece")
         if piece is None:
-            raise ValueError(f"文件 {p} 中没有 <Piece> 元素")
+            raise ValueError(f"No <Piece> element found in file: {p}")
 
         nx_str = piece.get("NumberOfPoints", "0")
         n_total = int(nx_str)
@@ -652,7 +652,7 @@ def load_snapshot(path: str | Path) -> FieldSnapshot:
     elif p.suffix in {".vtu", ".vtk"}:
         return VtkReader.read_vtu(p)
     else:
-        raise ValueError(f"不支持的快照格式：{p.suffix}（支持 .npz / .dat / .plt / .vtu）")
+        raise ValueError(f"Unsupported snapshot format: {p.suffix} (supported: .npz / .dat / .plt / .vtu)")
 
 
 # ---------------------------------------------------------------------------
@@ -823,10 +823,10 @@ def combine_block_snapshots(
     """
     base = Path(output_dir)
     if not base.exists():
-        raise FileNotFoundError(f"输出目录不存在：{base}")
+        raise FileNotFoundError(f"Output directory does not exist: {base}")
 
     if fmt not in {"npz", "dat", "plt"}:
-        raise ValueError(f"不支持的输出格式 {fmt!r}，可选：'npz'、'dat'、'plt'")
+        raise ValueError(f"Unsupported output format {fmt!r}; choose from: 'npz', 'dat', 'plt'")
 
     # 扫描所有 rank_* 子目录
     rank_dirs = sorted(
@@ -835,8 +835,8 @@ def combine_block_snapshots(
     )
     if not rank_dirs:
         raise FileNotFoundError(
-            f"目录 {base} 中没有找到任何 rank_* 子目录。"
-            f"请确认求解器使用了 mpi.mode=\"block\" 并成功运行。"
+            f"No rank_* subdirectories found in {base}. "
+            f"Ensure the solver ran with mpi.mode=\"block\"."
         )
 
     dst_dir = Path(out_dir) if out_dir is not None else base / "combined"
@@ -853,8 +853,8 @@ def combine_block_snapshots(
 
     if not step_to_files:
         raise FileNotFoundError(
-            f"在 {base}/rank_*/ 目录中未找到任何 fluid_*.npz 文件。"
-            "本函数需要 NPZ 格式的分区文件（内嵌位置元数据）作为输入。"
+            f"No fluid_*.npz files found under {base}/rank_*/. "
+            "This function requires NPZ partition files (with embedded position metadata) as input."
         )
 
     written: list[Path] = []
@@ -868,9 +868,9 @@ def combine_block_snapshots(
         first_data = np.load(files[0])
         if "global_nx" not in first_data or "global_ny" not in first_data:
             raise ValueError(
-                f"文件 {files[0]} 中缺少 global_nx/global_ny 元数据。"
-                "请确认求解器以 NPZ 格式输出分区数据，且每个 .npz 文件包含"
-                "x_start / y_start / global_nx / global_ny 字段。"
+                f"File {files[0]} is missing global_nx/global_ny metadata. "
+                "Ensure the solver outputs NPZ partition files containing "
+                "x_start / y_start / global_nx / global_ny fields."
             )
         gnx      = int(first_data["global_nx"])
         gny      = int(first_data["global_ny"])
@@ -886,8 +886,8 @@ def combine_block_snapshots(
             d = np.load(fpath)
             if "x_start" not in d or "y_start" not in d:
                 raise ValueError(
-                    f"文件 {fpath} 中缺少 x_start/y_start 元数据，"
-                    "无法确定该分区在全局坐标系中的位置。"
+                    f"File {fpath} is missing x_start/y_start metadata; "
+                    "cannot determine partition position in global coordinate system."
                 )
             xs  = int(d["x_start"])
             ys  = int(d["y_start"])
