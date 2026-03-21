@@ -236,7 +236,7 @@ void Solver::collide_bgk()
                 f_a += -omega_ * (f_a - feq);
 
                 // Guo 体力修正
-                apply_guo_forcing(i, Fi, &f_a);
+                apply_guo_forcing(i, d2q9::W[a], c, Fi, &f_a);
                 grid_.f[i * d2q9::Q + a] = f_a;
             }
         }
@@ -258,7 +258,7 @@ void Solver::collide_bgk()
                 double feq = f_eq(d3q19::W[a], ri, c, ui, d);
                 double f_a = grid_.f[i * d3q19::Q + a];
                 f_a += -omega_ * (f_a - feq);
-                apply_guo_forcing(i, Fi, &f_a);
+                apply_guo_forcing(i, d3q19::W[a], c, Fi, &f_a);
                 grid_.f[i * d3q19::Q + a] = f_a;
             }
         }
@@ -311,6 +311,7 @@ void Solver::collide_mrt()
         const double* fi = &grid_.f[i * d2q9::Q];
         const double* ui = &grid_.u[i * d];
         const double  ri = grid_.rho[i];
+        const double* Fi = &grid_.force[i * d];
 
         // 投影到矩空间：m = M * f
         double m[d2q9::Q] = {};
@@ -359,6 +360,11 @@ void Solver::collide_mrt()
             for (int k = 0; k < d2q9::Q; ++k) {
                 val += Mi[a][k] * m_star[k];
             }
+            const double c_a[2] = {
+                static_cast<double>(d2q9::C[a][0]),
+                static_cast<double>(d2q9::C[a][1])
+            };
+            apply_guo_forcing(i, d2q9::W[a], c_a, Fi, &val);
             grid_.f[i * d2q9::Q + a] = val;
         }
     }
@@ -367,18 +373,27 @@ void Solver::collide_mrt()
 // ---------------------------------------------------------------------------
 // Guo et al. (2002) 体力格式：
 //   F_a = w_a (1 - ω/2) [(c_a - u)/cs² + (c_a·u)c_a/cs⁴] · F
-// 在 BGK 松弛后作为对 f_a 的修正项加入。
+// 在碰撞（BGK 或 MRT 反投影）后作为对 f_a 的修正项加入。
 // ---------------------------------------------------------------------------
-void Solver::apply_guo_forcing(int node, const double* F, double* /*f_a_ptr*/)
+void Solver::apply_guo_forcing(int node, double w_a, const double* c_a,
+                                const double* F, double* f_a_ptr)
 {
-    // 修正量通过速度偏移累积到 grid_.force 中并在 compute_macroscopic() 中处理：
-    //   u_eff = u + F*dt/(2*rho)
-    // 只要调用方遵循标准时序（在 collide() 前调用 compute_macroscopic()），
-    // 此方式已在平衡值计算中隐式捕获。
-    // 完整的 Guo 修正需要逐方向项；下方为占位实现。
-    (void)node;
-    (void)F;
-    // TODO: 当存在非零体力时实现逐方向 Guo 修正。
+    const int      d   = grid_.dim();
+    const double*  u   = &grid_.u[node * d];
+    constexpr double cs2 = 1.0 / 3.0;
+    constexpr double cs4 = 1.0 / 9.0;
+
+    // c_a · u
+    double cu = 0.0;
+    for (int alpha = 0; alpha < d; ++alpha)
+        cu += c_a[alpha] * u[alpha];
+
+    // sum_α [(c_aα - u_α)/cs² + (c_a·u)*c_aα/cs⁴] * F_α
+    double term = 0.0;
+    for (int alpha = 0; alpha < d; ++alpha)
+        term += ((c_a[alpha] - u[alpha]) / cs2 + cu * c_a[alpha] / cs4) * F[alpha];
+
+    *f_a_ptr += w_a * (1.0 - 0.5 * omega_) * term;
 }
 
 // ---------------------------------------------------------------------------

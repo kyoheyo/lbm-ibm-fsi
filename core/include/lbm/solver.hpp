@@ -81,7 +81,13 @@ private:
     void collide_mrt();
 
     // Guo 体力格式 — 在碰撞过程中添加体力修正项
-    void apply_guo_forcing(int node, const double* F, double* f_post);
+    // node   : 节点索引（用于读取 grid_.u）
+    // w_a    : 方向 a 的格子权重
+    // c_a    : 方向 a 的格子速度向量（维度分量，double 类型）
+    // F      : 该节点的体力密度（维度分量）
+    // f_a_ptr: 指向碰后分布函数 f_a 的指针（原地修正）
+    void apply_guo_forcing(int node, double w_a, const double* c_a,
+                           const double* F, double* f_a_ptr);
 
     /// MPI 幽灵层跳过控制（供 collide_bgk/collide_mrt 共用）
     struct CollideGuard {
