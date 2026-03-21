@@ -10,26 +10,31 @@
 // MPI 跨块注意事项
 // ----------------
 // interpolate_velocity() / mls_interpolate_velocity()：
-//   读取本地网格（含幽灵层）的速度值。幽灵层在 stream() 前由 halo_exchange()
-//   填充了邻居进程的 f 值，故 macroscopic 计算后幽灵节点速度也是正确的。
-//   因此，标记点的支撑域只要不超出幽灵层宽度（1 格），插值就是正确的。
+//   读取本地网格（含幽灵层）的速度值。
 //
-//   【重要】当使用 FourPoint 核（support=2）时，支撑宽度为 2 格；
-//   若标记点距分区边界 < 2 格，插值将遗漏超出幽灵层的贡献，引入误差。
-//   建议：FourPoint 核下，IBM 标记点应距 MPI 分区边界 ≥ 2 格，
-//   或在配置中启用 2 层幽灵交换（设置 [mpi] ibm_halo_width = 2）。
+//   【重要】solver.step() 内部调用 stream() 时会先执行 halo_exchange()（交换 f），
+//   然后执行 PUSH 流式迁移。PUSH 迁移会将物理边界行的 f 推送进幽灵行，
+//   从而 **覆盖** halo_exchange 写入的邻居数据。其后 compute_macroscopic() 对所有
+//   节点（含幽灵行）计算 u，但此时幽灵行 u 来自本地边界行的外推值，
+//   **并非邻居进程的真实速度**。
+//
+//   因此，在 step_ibm() 调用 interpolate_velocity() 之前，必须先通过
+//   ibm_halo_exchange_u_2d() 显式交换 u 场幽灵行，才能得到正确的邻居速度。
+//   ibm_halo_width=1 交换 1 层（满足 TwoPoint 核）；FourPoint 核（support=2）
+//   仍需标记点距分区边界 ≥ 2 格（当前结构仅分配 1 层幽灵行，无法完全支持 2 层）。
 //
 // spread_force()：
 //   向本地网格（含幽灵层）写入体力。写入幽灵层的贡献在下一次 halo_exchange()
 //   时不会自动传递给邻居进程——调用方需在 spread_force() 后显式执行力场的
-//   幽灵层归并（reduce-scatter）。若 IBM 力仅用于 Guo 体力格式，且标记点始终
-//   位于物理区域内部（距块边界 ≥ 2 格），则可安全忽略此项。
+//   幽灵层归并（reduce-scatter）。
 //
-//   spread_force_with_halo_reduce() 提供了自动 MPI 幽灵层力场归并功能：
-//   展布后对幽灵层力贡献执行 MPI_Allreduce，将跨块力正确累加到邻居物理层。
+//   ibm_halo_reduce_force_2d() 提供了正确的 MPI 幽灵层力场归并：
+//   将本进程幽灵行中的力贡献通过 MPI_Sendrecv 发送回邻居的对应物理行并累加，
+//   然后清零本地幽灵行，确保跨块力展布的完整性。
 
 #include "marker.hpp"
 #include "../lbm/lattice.hpp"
+#include "../lbm/mpi_decomp.hpp"
 
 namespace ibm {
 
@@ -205,5 +210,32 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
 // ===========================================================================
 void compute_ibm_body_force(const MarkerSet& ms,
                              double& out_fx, double& out_fy);
+
+// ===========================================================================
+// MPI 幽灵层 u 场交换（IBM 插值前调用）
+//
+// solver.step() 中 PUSH 流式迁移会覆盖幽灵行的 f 值，导致 compute_macroscopic()
+// 后幽灵行 u 来自本地边界行外推，而非邻居实际速度。
+// 本函数在 step_ibm() 之前显式交换 u 场幽灵行，使 interpolate_velocity()
+// 能读到邻居进程的真实速度。
+//
+// @param grid    本地流体网格（含幽灵层；u 场将被更新）
+// @param decomp  二维 MPI 域分解描述符
+// ===========================================================================
+void ibm_halo_exchange_u_2d(lbm::LatticeGrid& grid,
+                              const lbm::MpiDecomp2D& decomp);
+
+// ===========================================================================
+// MPI 幽灵层力场归并（IBM 力展布后调用）
+//
+// spread_force() 可能向幽灵行写入力贡献，这些贡献属于邻居进程物理行的一部分。
+// 本函数通过 MPI_Sendrecv 将幽灵行力贡献发回各自的邻居物理行并累加，
+// 然后清零本地幽灵行，确保跨 MPI 边界的 IBM 力展布物理上完整。
+//
+// @param grid    本地流体网格（含幽灵层；force 场将被修改）
+// @param decomp  二维 MPI 域分解描述符
+// ===========================================================================
+void ibm_halo_reduce_force_2d(lbm::LatticeGrid& grid,
+                                const lbm::MpiDecomp2D& decomp);
 
 } // namespace ibm

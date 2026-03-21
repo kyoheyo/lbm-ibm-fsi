@@ -284,6 +284,15 @@ mod ffi {
         pub fn lbm_ibm_compute_body_force(ms: *const IbmMarkerSetHandle,
                                            out_fx: *mut f64, out_fy: *mut f64);
 
+        /// IBM 幽灵层 u 场交换：step_ibm() 前调用，填充幽灵行/列的真实邻居速度。
+        /// 修正 solver.step() 后幽灵行 u 来自本地外推（而非邻居速度）的问题。
+        pub fn lbm_ibm_halo_exchange_u_2d(g: *mut LatticeGridHandle,
+                                           h: *mut MpiDecomp2DHandle);
+
+        /// IBM 幽灵层力场归并：spread_force() 后调用，将幽灵行/列力贡献归还邻居并累加。
+        pub fn lbm_ibm_halo_reduce_force_2d(g: *mut LatticeGridHandle,
+                                             h: *mut MpiDecomp2DHandle);
+
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
         // Rust 安全封装: register_plugins()（见本文件底部）
@@ -1241,6 +1250,36 @@ impl LbmIbmMarkerSet {
         }
         (fx, fy)
     }
+}
+
+/// IBM MPI 幽灵层辅助函数（独立函数，不附属于 marker set）
+///
+/// ## 使用时序（MPI 模式下每步）
+/// ```text
+/// ibm_halo_exchange_u_2d(grid, decomp2d);  // 步骤 1：填充幽灵行真实邻居速度
+/// marker_set.step_*(grid, dx, dt);          // 步骤 2：插值 + 力计算 + 展布
+/// ibm_halo_reduce_force_2d(grid, decomp2d); // 步骤 3：归并幽灵行力贡献
+/// ```
+///
+/// 两个函数在 `nprocs==1` 时均为空操作。
+
+/// 在 `step_ibm()` 前交换幽灵行/列的速度场。
+///
+/// `solver.step()` 完成后幽灵行 `u` 来自本地边界行外推（PUSH 流式迁移覆盖了
+/// `halo_exchange` 写入的邻居 f，再 `compute_macroscopic` 得到），而非邻居真实速度。
+/// 本函数通过 `MPI_Sendrecv` 将物理边界行/列的 `u` 正确填充到幽灵行/列，
+/// 使 `interpolate_velocity()` 的支撑域计算物理正确。
+pub fn ibm_halo_exchange_u_2d(grid: &mut LbmGrid, decomp: &mut LbmMpiDecomp2D) {
+    unsafe { ffi::lbm_ibm_halo_exchange_u_2d(grid.ptr, decomp.ptr) }
+}
+
+/// 在 `step_ibm()` 后归并幽灵行/列的力贡献。
+///
+/// `spread_force()` 可能向幽灵行/列写入力，这些力属于邻居物理区域的一部分。
+/// 本函数将幽灵行/列力通过 `MPI_Sendrecv` 发回各自邻居并在其物理行/列上累加，
+/// 然后清零本地幽灵行/列，确保跨 MPI 边界的 IBM 力展布物理上完整。
+pub fn ibm_halo_reduce_force_2d(grid: &mut LbmGrid, decomp: &mut LbmMpiDecomp2D) {
+    unsafe { ffi::lbm_ibm_halo_reduce_force_2d(grid.ptr, decomp.ptr) }
 }
 
 impl Drop for LbmIbmMarkerSet {

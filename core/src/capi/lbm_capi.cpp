@@ -1343,4 +1343,25 @@ void lbm_ibm_compute_body_force(const IbmMarkerSetHandle* ms,
     ibm::compute_ibm_body_force(*marker_set, *out_fx, *out_fy);
 }
 
+/// IBM 幽灵层 u 场交换：在 step_ibm() 调用 interpolate_velocity() 之前调用。
+/// solver.step() 完成后幽灵行 u 来自本地边界行外推（非邻居真实速度），
+/// 本函数通过 MPI_Sendrecv 将物理边界行/列的 u 正确填充到邻居的幽灵行/列中，
+/// 确保 FourPoint δ 核支撑域内的速度插值物理正确。
+/// 使用 MpiDecomp2D 描述符（px=1,py=nprocs 时即为 1D Y 切片）。
+void lbm_ibm_halo_exchange_u_2d(lbm::LatticeGrid* g, MpiDecomp2DHandle* h)
+{
+    if (!g || !h) return;
+    ibm::ibm_halo_exchange_u_2d(*g, *reinterpret_cast<lbm::MpiDecomp2D*>(h));
+}
+
+/// IBM 幽灵层力场归并：在 spread_force() 之后调用。
+/// 将本进程幽灵行/列中的力贡献通过 MPI_Sendrecv 发回各自邻居的物理行/列并累加，
+/// 然后清零本地幽灵行/列，确保跨 MPI 分区边界的 IBM 力展布物理上完整。
+/// 使用 MpiDecomp2D 描述符（px=1,py=nprocs 时即为 1D Y 切片）。
+void lbm_ibm_halo_reduce_force_2d(lbm::LatticeGrid* g, MpiDecomp2DHandle* h)
+{
+    if (!g || !h) return;
+    ibm::ibm_halo_reduce_force_2d(*g, *reinterpret_cast<lbm::MpiDecomp2D*>(h));
+}
+
 } // extern "C" (IBM)

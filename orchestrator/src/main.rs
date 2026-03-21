@@ -204,7 +204,7 @@ fn run() -> Result<()> {
     let csv_path = format!("{}/monitor.csv", output_dir);
     run_time_loop(
         &cfg, &mut grid, &mut solver, &mut ibm_entries,
-        partition, &output_dir, &csv_path, combine_blocks, rank,
+        &mut mpi, partition, &output_dir, &csv_path, combine_blocks, rank,
     )?;
 
     if rank == 0 { println!("\nSimulation complete."); }
@@ -260,6 +260,7 @@ fn run_time_loop(
     grid: &mut LbmGrid,
     solver: &mut LbmSolver,
     ibm_entries: &mut Vec<fsi::IbmEntry>,
+    mpi: &mut sim::MpiDecomp,
     partition: Option<PartitionInfo>,
     output_dir: &str,
     csv_path: &str,
@@ -278,7 +279,18 @@ fn run_time_loop(
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
         if !ibm_entries.is_empty() {
+            // MPI 修正 1：solver.step() 完成后幽灵行 u 是本地边界行外推值，不是邻居真实速度。
+            // 在 interpolate_velocity() 之前显式交换 u 场幽灵行，确保跨块插值物理正确。
+            if let Some(ref mut d2) = mpi.decomp2d {
+                lbm_bindings::ibm_halo_exchange_u_2d(grid, d2);
+            }
+
             step_ibm(cfg, grid, ibm_entries);
+
+            // MPI 修正 2：spread_force() 可能向幽灵行写入力贡献；将这些贡献归还邻居并累加。
+            if let Some(ref mut d2) = mpi.decomp2d {
+                lbm_bindings::ibm_halo_reduce_force_2d(grid, d2);
+            }
         }
 
         let time = (step + 1) as f64 * cfg.simulation.dt;
@@ -704,9 +716,18 @@ fn print_header(cfg: &Config, config_path: &std::path::Path, nprocs: i32) {
             _             => println!("MPI mode : {}", cfg.mpi.mode),
         }
         let ibm_halo = cfg.mpi.ibm_halo_width.max(1);
-        if ibm_halo > 1 && cfg.ibm.is_some() {
-            println!("MPI IBM  : ibm_halo_width={} (extended ghost layer for FourPoint δ kernel)",
-                     ibm_halo);
+        if cfg.ibm.is_some() {
+            println!(
+                "MPI IBM  : ibm_halo_width={} \
+                 (u-halo exchange before interpolation + force halo reduce after spread; \
+                 {})",
+                ibm_halo,
+                if ibm_halo >= 2 {
+                    "FourPoint kernel: 1 ghost layer available — markers must be ≥2 cells from boundary"
+                } else {
+                    "TwoPoint kernel supported; FourPoint kernel requires markers ≥2 cells from boundary"
+                }
+            );
         }
     }
 
