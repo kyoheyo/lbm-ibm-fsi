@@ -29,7 +29,30 @@ import matplotlib
 matplotlib.use("Agg")   # non-interactive backend (safe in headless environments)
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.font_manager as _fm
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# CJK font detection: if a CJK-capable font is available on this system,
+# prepend it to the sans-serif list so that Chinese/Japanese/Korean text in
+# titles and labels is rendered correctly instead of producing "Glyph missing"
+# warnings (or, on Windows without any CJK font, a crash inside tight_layout).
+# ---------------------------------------------------------------------------
+_CJK_CANDIDATES = [
+    "Microsoft YaHei",      # Windows
+    "SimHei",               # Windows fallback
+    "PingFang SC",          # macOS
+    "Noto Sans CJK SC",     # Linux (Google Noto)
+    "WenQuanYi Micro Hei",  # Linux (Wen Quan Yi)
+    "Arial Unicode MS",     # cross-platform (if installed)
+]
+_installed_fonts = {f.name for f in _fm.fontManager.ttflist}
+_cjk_font = next((f for f in _CJK_CANDIDATES if f in _installed_fonts), None)
+if _cjk_font:
+    matplotlib.rcParams["font.sans-serif"] = (
+        [_cjk_font] + matplotlib.rcParams.get("font.sans-serif", [])
+    )
+    matplotlib.rcParams["axes.unicode_minus"] = False
 
 from .vtk_reader import FieldSnapshot, MarkerSnapshot
 
@@ -43,6 +66,7 @@ __all__ = [
     "plot_markers",
     "plot_beam_deformation",
     "plot_convergence",
+    "plot_velocity_profile",
     "save_figure",
 ]
 

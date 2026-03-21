@@ -78,12 +78,12 @@ if str(_PYTHON_DIR) not in sys.path:
 # 方法元数据（标签 → 显示名称 + 曲线样式）
 # ---------------------------------------------------------------------------
 
-# 每个条目：(csv_stem, display_label, color, linestyle)
+# Each entry: (csv_stem, display_label, color, linestyle)
 _METHODS: list[tuple[str, str, str, str]] = [
-    ("cyl_ibb_force",  "IBB（插值反弹，Bouzidi 2001）",         "#1f77b4", "-"),
-    ("cyl_mdf_force",  "IBM-MDF（多重直接力，Luo 2007）",        "#ff7f0e", "--"),
-    ("cyl_mls_force",  "IBM-MLS（移动最小二乘，Wang 2009）",     "#2ca02c", "-."),
-    ("cyl_pen_force",  "IBM-Penalty（罚函数反馈，Goldstein 1993）", "#d62728", ":"),
+    ("cyl_ibb_force",  "IBB (Interp. Bounce-Back, Bouzidi 2001)",    "#1f77b4", "-"),
+    ("cyl_mdf_force",  "IBM-MDF (Multi Direct Forcing, Luo 2007)",    "#ff7f0e", "--"),
+    ("cyl_mls_force",  "IBM-MLS (Moving Least Squares, Wang 2009)",   "#2ca02c", "-."),
+    ("cyl_pen_force",  "IBM-Penalty (Feedback Force, Goldstein 1993)", "#d62728", ":"),
 ]
 
 
@@ -177,26 +177,23 @@ def _plot_flow_fields(snap, output_dir: Path) -> None:
 
     # 1. 速度幅值云图
     fig, ax = plot_velocity_magnitude(snap, figsize=(14, 10))
-    ax.set_title(f"速度幅值云图 — 固体边界条件比较（Re=100）{step_tag}")
+    ax.set_title(f"Velocity Magnitude — Solid BC Comparison (Re=100){step_tag}")
     _annotate_cylinders(ax)
     save_figure(fig, output_dir / "velocity_magnitude.png")
-    plt.close(fig)
     print("  [1/5] velocity_magnitude.png")
 
     # 2. 压力云图
     fig, ax = plot_pressure(snap, figsize=(14, 10))
-    ax.set_title(f"压力云图（p = ρ/3）— 固体边界条件比较{step_tag}")
+    ax.set_title(f"Pressure (p = rho/3) — Solid BC Comparison{step_tag}")
     _annotate_cylinders(ax)
     save_figure(fig, output_dir / "pressure.png")
-    plt.close(fig)
     print("  [2/5] pressure.png")
 
     # 3. 涡量云图
     fig, ax = plot_vorticity(snap, figsize=(14, 10))
-    ax.set_title(f"涡量云图（ωz）— 固体边界条件比较{step_tag}")
+    ax.set_title(f"Vorticity (wz) — Solid BC Comparison{step_tag}")
     _annotate_cylinders(ax)
     save_figure(fig, output_dir / "vorticity.png")
-    plt.close(fig)
     print("  [3/5] vorticity.png")
 
 
@@ -245,13 +242,13 @@ def _plot_force_comparison(input_dir: Path, output_dir: Path) -> None:
         plt.close(fig_fy)
         return
 
-    for ax, comp, fname in [
-        (ax_fx, "Fx（阻力）", "force_fx_comparison.png"),
-        (ax_fy, "Fy（升力）", "force_fy_comparison.png"),
+    for ax, comp, label_y, fname in [
+        (ax_fx, "Fx (Drag)",  "Fx (lattice units)", "force_fx_comparison.png"),
+        (ax_fy, "Fy (Lift)",  "Fy (lattice units)", "force_fy_comparison.png"),
     ]:
-        ax.set_xlabel("时间步", fontsize=12)
-        ax.set_ylabel(f"{comp}（格子单位）", fontsize=12)
-        ax.set_title(f"{comp} 随时间变化 — 固体边界条件对比（Re=100）", fontsize=13)
+        ax.set_xlabel("Time step", fontsize=12)
+        ax.set_ylabel(label_y, fontsize=12)
+        ax.set_title(f"{comp} vs. Time — Solid BC Comparison (Re=100)", fontsize=13)
         ax.legend(fontsize=9, loc="upper right")
         ax.grid(True, alpha=0.3)
         fig = ax.get_figure()
