@@ -1,17 +1,17 @@
 """
 lbm_pre.geometry
 ================
-Geometry helpers for placing IBM Lagrangian markers and defining
-immersed-boundary shapes that are passed to the solver.
+为放置 IBM Lagrangian 标记点及定义浸没边界形状提供几何辅助工具，
+生成的形状数据将传入求解器。
 
-All coordinates are in **lattice units** (Δx = 1 unless stated otherwise).
+所有坐标均以**格子单位**（Δx = 1，除非另有说明）表示。
 
 Public API
 ----------
-circle_markers()    — uniform markers around a circle
-filament_markers()  — uniform markers along a straight filament
-bezier_markers()    — markers along a cubic Bézier curve
-write_markers_csv() — write marker coordinates to CSV for the solver
+circle_markers()    — 在圆形上均匀分布标记点
+filament_markers()  — 在直线丝状体上均匀分布标记点
+bezier_markers()    — 在三次 Bézier 曲线上均匀分布标记点
+write_markers_csv() — 将标记点坐标写入 CSV 文件供求解器读取
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ __all__ = [
 @dataclass
 class MarkerArray:
     """
-    A collection of Lagrangian IBM marker positions and arc-length elements.
+    IBM Lagrangian 标记点位置及弧长元素的集合。
 
     Attributes
     ----------
-    x, y    : 1-D arrays of marker coordinates
-    ds      : 1-D array of arc-length (or area) element per marker
-    tag     : optional label (e.g. 'circle', 'filament')
+    x, y    : 标记点坐标的一维数组
+    ds      : 每个标记点对应的弧长（或面积）元素的一维数组
+    tag     : 可选标签（如 'circle'、'filament'）
     """
     x: np.ndarray
     y: np.ndarray
@@ -57,29 +57,29 @@ class MarkerArray:
         return len(self.x)
 
     def to_xy(self) -> np.ndarray:
-        """Return (N, 2) array of (x, y) positions."""
+        """返回形状为 (N, 2) 的 (x, y) 位置数组。"""
         return np.column_stack([self.x, self.y])
 
     def centroid(self) -> tuple[float, float]:
-        """Return the mean (x, y) position."""
+        """返回平均 (x, y) 位置（质心）。"""
         return float(self.x.mean()), float(self.y.mean())
 
 
 # ---------------------------------------------------------------------------
-# Marker constructors
+# 标记点构造函数
 # ---------------------------------------------------------------------------
 
 def circle_markers(cx: float, cy: float, radius: float,
                    n: int = 64, *, tag: str = "circle") -> MarkerArray:
     """
-    Generate *n* uniformly-spaced markers around a circle.
+    在圆形上生成 *n* 个均匀分布的标记点。
 
     Parameters
     ----------
-    cx, cy  : centre coordinates (lattice units)
-    radius  : circle radius
-    n       : number of markers
-    tag     : label
+    cx, cy  : 圆心坐标（格子单位）
+    radius  : 圆形半径
+    n       : 标记点数量
+    tag     : 标签
 
     Returns
     -------
@@ -96,18 +96,18 @@ def ellipse_markers(cx: float, cy: float,
                     a: float, b: float,
                     n: int = 64, *, tag: str = "ellipse") -> MarkerArray:
     """
-    Generate *n* markers uniformly distributed (in arc length) around an ellipse.
+    在椭圆上生成 *n* 个弧长均匀分布的标记点。
 
-    Uses adaptive angular spacing so that the arc-length elements are nearly
-    equal, matching the numerical requirement of the IBM delta function.
+    采用自适应角度间距，使各弧长元素近似相等，
+    满足 IBM delta 函数的数值要求。
 
     Parameters
     ----------
-    cx, cy  : centre
-    a, b    : semi-axes (a = horizontal, b = vertical)
-    n       : number of markers
+    cx, cy  : 圆心
+    a, b    : 半轴长（a = 水平方向，b = 垂直方向）
+    n       : 标记点数量
     """
-    # Over-sample the parametric curve then re-sample at equal arc-length
+    # 对参数曲线过采样，再按等弧长重新采样
     N_fine = max(n * 100, 10000)
     t_fine = np.linspace(0.0, 2.0 * np.pi, N_fine, endpoint=False)
     xf = cx + a * np.cos(t_fine)
@@ -116,13 +116,13 @@ def ellipse_markers(cx: float, cy: float,
     dx = np.diff(xf, append=xf[0] - xf[-1])
     dy = np.diff(yf, append=yf[0] - yf[-1])
 
-    # Cumulative arc length
+    # 累积弧长
     seg_len = np.sqrt(dx**2 + dy**2)
     arc = np.concatenate([[0.0], np.cumsum(seg_len)])
     total_len = arc[-1]
     ds_val = total_len / n
 
-    # Sample at equal arc-length intervals
+    # 按等弧长间隔采样
     s_targets = np.linspace(0.0, total_len, n, endpoint=False)
     x = np.interp(s_targets, arc[:-1], xf)
     y = np.interp(s_targets, arc[:-1], yf)
@@ -134,13 +134,13 @@ def filament_markers(x0: float, y0: float,
                      x1: float, y1: float,
                      n: int = 32, *, tag: str = "filament") -> MarkerArray:
     """
-    Generate *n* uniformly-spaced markers along a straight filament.
+    在直线丝状体上生成 *n* 个均匀间距的标记点。
 
     Parameters
     ----------
-    (x0, y0) : start point
-    (x1, y1) : end point
-    n        : number of markers (includes both endpoints)
+    (x0, y0) : 起点
+    (x1, y1) : 终点
+    n        : 标记点数量（包含两个端点）
     """
     t = np.linspace(0.0, 1.0, n)
     x = x0 + t * (x1 - x0)
@@ -153,13 +153,13 @@ def filament_markers(x0: float, y0: float,
 def bezier_markers(control_points: Sequence[Tuple[float, float]],
                    n: int = 64, *, tag: str = "bezier") -> MarkerArray:
     """
-    Generate *n* markers uniformly distributed in arc-length along a cubic
-    Bézier curve defined by *control_points* (4 points for cubic).
+    在由 *control_points*（4 个控制点的三次 Bézier 曲线）定义的曲线上
+    生成 *n* 个弧长均匀分布的标记点。
 
     Parameters
     ----------
-    control_points : list of (x, y) tuples — must have exactly 4 entries
-    n              : number of output markers
+    control_points : (x, y) 元组列表 — 必须恰好包含 4 个点
+    n              : 输出标记点数量
     """
     pts = np.asarray(control_points, dtype=float)
     if len(pts) != 4:
@@ -167,7 +167,7 @@ def bezier_markers(control_points: Sequence[Tuple[float, float]],
 
     N_fine = max(n * 100, 10000)
     t_fine = np.linspace(0.0, 1.0, N_fine)
-    # De Casteljau / Bernstein evaluation
+    # De Casteljau / Bernstein 计算
     xf = (
         (1 - t_fine)**3 * pts[0, 0]
         + 3 * (1 - t_fine)**2 * t_fine * pts[1, 0]
@@ -198,9 +198,9 @@ def bezier_markers(control_points: Sequence[Tuple[float, float]],
 
 def write_markers_csv(markers: MarkerArray, path: str | Path) -> Path:
     """
-    Write marker positions to a CSV file consumable by the solver.
+    将标记点位置写入可被求解器读取的 CSV 文件。
 
-    Format::
+    格式::
 
         # tag: <tag>
         x,y,ds
@@ -210,11 +210,11 @@ def write_markers_csv(markers: MarkerArray, path: str | Path) -> Path:
     Parameters
     ----------
     markers : MarkerArray
-    path    : output file path
+    path    : 输出文件路径
 
     Returns
     -------
-    Path of the written file.
+    写出文件的 Path。
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -229,7 +229,7 @@ def write_markers_csv(markers: MarkerArray, path: str | Path) -> Path:
 
 def read_markers_csv(path: str | Path) -> MarkerArray:
     """
-    Read a marker CSV file written by :func:`write_markers_csv`.
+    读取由 :func:`write_markers_csv` 写出的标记点 CSV 文件。
 
     Returns
     -------
