@@ -52,22 +52,28 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-/// 真正的求解器入口（在 MPI init/finalize 包装内执行）。
+/// Solver entry point (executed inside the MPI init/finalize wrapper).
 fn run() -> Result<()> {
     let args = Args::parse();
     let mut cfg = Config::from_file(&args.config)?;
     if let Some(n) = args.steps { cfg.simulation.n_steps = n; }
 
-    // MPI rank / 进程数（mpi_init() 已在调用者 main() 中完成）
+    // MPI rank / nprocs (mpi_init() has already been called by main())
     let rank   = lbm_bindings::mpi_rank();
     let nprocs = lbm_bindings::mpi_size();
 
-    // 应用并行配置（OpenMP 线程数必须在所有进程上生效）
+    // When LBM_ENABLE_MPI is OFF, mpi_rank()/mpi_size() always return 0/1.
+    // If the binary is launched under mpiexec anyway, every process would
+    // think it is rank-0 and print the header N times.  Read the launcher
+    // environment variables as a fallback so only the true rank-0 prints.
+    let rank = if nprocs == 1 { launcher_rank(rank) } else { rank };
+
+    // Apply parallel config (OpenMP thread count must be set on all ranks)
     if cfg.parallel.omp_num_threads > 0 {
         lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
     }
 
-    // 打印头部信息（rank-0 only，避免 MPI 多进程重复输出）
+    // Print header (rank-0 only, prevents duplicate output in MPI mode)
     if rank == 0 { print_header(&cfg, &args.config, nprocs); }
 
     // Python sys.path 扩展（未启用 python-ffi 时为无操作）
@@ -161,7 +167,7 @@ fn run() -> Result<()> {
     };
 
     if rank == 0 && coupling_mode != fsi::FsiCouplingMode::None {
-        println!("  [FSI] 耦合模式: {}", coupling_mode.description());
+        println!("  [FSI] coupling mode: {}", coupling_mode.description());
     }
     if rank == 0 { println!("\nStarting time integration..."); }
 
@@ -191,14 +197,15 @@ fn run() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-/// 顶层入口：初始化 MPI → 运行求解器 → 终结 MPI。
+/// Top-level entry point: initialise MPI → run solver → finalise MPI.
 ///
-/// 将仿真逻辑封装在 [`run()`] 中，确保无论 `run()` 成功还是出错，
-/// `mpi_finalize()` 总能被调用，避免 MPI 进程因未调用 `MPI_Finalize`
-/// 而引发警告或资源泄漏。
+/// Wrapping simulation logic inside [`run()`] ensures that `mpi_finalize()`
+/// is always called regardless of whether `run()` succeeds or returns an
+/// error, preventing MPI processes from exiting without calling
+/// `MPI_Finalize` (which would produce warnings or resource leaks).
 ///
-/// 在非 MPI 模式（`ENABLE_MPI=OFF`）下，`mpi_init`/`mpi_finalize` 均为空操作，
-/// 此函数仍正确地将错误码传递给操作系统。
+/// When `LBM_ENABLE_MPI=OFF`, `mpi_init`/`mpi_finalize` are no-ops and
+/// this function still propagates the exit code to the OS correctly.
 fn main() {
     lbm_bindings::mpi_init();
     let result = run();
@@ -490,10 +497,10 @@ fn plot_step_ffi(
 }
 
 // ---------------------------------------------------------------------------
-// 启动阶段辅助函数
+// Startup helper functions
 // ---------------------------------------------------------------------------
 
-/// 解析格子模型字符串为 [`LatticeModel`]（不认识的值退化为 D2Q9）。
+/// Parse a lattice model string into a [`LatticeModel`] (unknown values fall back to D2Q9).
 fn parse_lattice_model(s: &str) -> LatticeModel {
     match s {
         "D3Q19" => LatticeModel::D3Q19,
@@ -502,7 +509,7 @@ fn parse_lattice_model(s: &str) -> LatticeModel {
     }
 }
 
-/// 解析碰撞模型字符串为 [`CollisionModel`]（不认识的值退化为 BGK）。
+/// Parse a collision model string into a [`CollisionModel`] (unknown values fall back to BGK).
 fn parse_collision_model(s: &str) -> CollisionModel {
     match s {
         "MRT" => CollisionModel::Mrt,
@@ -510,7 +517,36 @@ fn parse_collision_model(s: &str) -> CollisionModel {
     }
 }
 
-/// 打印求解器启动头部信息（rank-0 only）。
+/// Determine the effective MPI rank even when `LBM_ENABLE_MPI` is OFF.
+///
+/// When MPI support is not compiled in, `mpi_rank()` always returns 0 and
+/// `mpi_size()` always returns 1.  If the binary is still launched via
+/// `mpiexec -n N`, every process would believe it is rank-0 and produce
+/// duplicate header output.
+///
+/// This function reads the standard MPI launcher environment variables set
+/// by OpenMPI (`OMPI_COMM_WORLD_RANK`), MPICH/PMI (`PMI_RANK`),
+/// MVAPICH2 (`MV2_COMM_WORLD_RANK`), and PMIx/Slurm (`PMIX_RANK`) as a
+/// fallback.  If any of these variables is present and parses to a
+/// non-negative integer, that value is returned; otherwise `fallback` (the
+/// value from `mpi_rank()`) is returned unchanged.
+fn launcher_rank(fallback: i32) -> i32 {
+    for var in &[
+        "OMPI_COMM_WORLD_RANK",
+        "PMI_RANK",
+        "MV2_COMM_WORLD_RANK",
+        "PMIX_RANK",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            if let Ok(r) = val.trim().parse::<i32>() {
+                return r;
+            }
+        }
+    }
+    fallback
+}
+
+/// Print solver startup header (rank-0 only).
 fn print_header(cfg: &Config, config_path: &std::path::Path, nprocs: i32) {
     println!("=== LBM-IBM-FSI Solver ===");
     println!("Config   : {}", config_path.display());
@@ -575,9 +611,10 @@ fn print_header(cfg: &Config, config_path: &std::path::Path, nprocs: i32) {
     }
 }
 
-/// 在多进程环境下，依次按 rank 顺序打印各进程的本地网格尺寸。
+/// Print each rank's local grid size in rank order.
 ///
-/// 顺序打印可避免多进程并发写入 stdout 时 UTF-8 多字节序列被截断/乱序。
+/// Sequential printing avoids interleaved output when multiple processes
+/// write to stdout concurrently (which can corrupt multi-byte UTF-8 sequences).
 fn print_local_grid_sizes(rank: i32, nprocs: i32, grid_nx: i32, grid_ny: i32, grid_nz: i32) {
     if nprocs > 1 {
         use std::io::Write;
@@ -591,9 +628,9 @@ fn print_local_grid_sizes(rank: i32, nprocs: i32, grid_nx: i32, grid_ny: i32, gr
     }
 }
 
-/// 通过 Python FFI 生成 IBM 标记点（进程内，不产生 CSV 文件）。
+/// Generate IBM marker points via Python FFI (in-process, no CSV file produced).
 ///
-/// 仅在启用 `python-ffi` 特性时编译；否则为空操作。
+/// Only compiled when the `python-ffi` feature is enabled; otherwise a no-op.
 #[cfg(feature = "python-ffi")]
 fn generate_ibm_markers_ffi(cfg: &Config) {
     if let Some(ref ibm) = cfg.ibm {
@@ -611,8 +648,8 @@ fn generate_ibm_markers_ffi(cfg: &Config) {
                     x.len(), x_min, x_max, y_min, y_max,
                     ds.first().copied().unwrap_or(0.0),
                 );
-                // TODO: 待 lbm_bindings 暴露对应接口后，
-                //       将 (x, y, ds) 转发给 C++ IBM 核心。
+                // TODO: forward (x, y, ds) to the C++ IBM core once
+                //       lbm_bindings exposes the corresponding interface.
                 let _ = (x, y, ds);
             }
             Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),

@@ -223,25 +223,25 @@ def main() -> None:
         fmt_label = "ASCII Tecplot (.dat)"
     else:
         reader = TecplotBinReader(input_dir)
-        fmt_label = "二进制 Tecplot (.plt)"
+        fmt_label = "binary Tecplot (.plt)"
 
     if len(reader) == 0:
         print(
-            f"[plot_solver_output] 错误：目录 {input_dir} 中没有 {fmt_label} 快照文件\n"
-            "  请先运行求解器：\n"
+            f"[plot_solver_output] Error: no {fmt_label} snapshots found in {input_dir}\n"
+            "  Please run the solver first:\n"
             "    ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    print(f"[plot_solver_output] 在 {input_dir} 中找到 {len(reader)} 个快照（格式：{fmt_label}）")
+    print(f"[plot_solver_output] found {len(reader)} snapshot(s) in {input_dir} (format: {fmt_label})")
 
     if args.step is not None:
         snap = reader.read(args.step)
-        print(f"  使用第 {snap.step} 步快照")
+        print(f"  using step {snap.step}")
     else:
         snap = reader.last()
-        print(f"  使用最后一帧  step={snap.step}  time={snap.time:.2f}")
+        print(f"  using last frame  step={snap.step}  time={snap.time:.2f}")
 
     cx = args.centre_x if args.centre_x is not None else snap.nx // 2
     cy = args.centre_y if args.centre_y is not None else snap.ny // 2
@@ -295,20 +295,20 @@ def main() -> None:
             log_scale=False,
         )
         save_figure(fig, output_dir / "monitor_velocity.png")
-        print(f"  [6/6] monitor_velocity.png  （{len(all_snaps)} 个时间步）")
+        print(f"  [6/6] monitor_velocity.png  ({len(all_snaps)} time steps)")
     else:
-        print("  [6/6] monitor_velocity.png  跳过（只有 1 个快照）")
+        print("  [6/6] monitor_velocity.png  skipped (only 1 snapshot)")
 
     # ------------------------------------------------------------------
     # 体积统计量
     # ------------------------------------------------------------------
     bq = compute_bulk_quantities(snap)
-    print(f"\n第 {bq.step} 步体积统计量：")
-    print(f"  动能      KE        = {bq.ke:.6f}")
-    print(f"  涡量能    Enstrophy = {bq.enstrophy:.6f}")
-    print(f"  密度均值  ρ mean    = {bq.rho_mean:.6f}  std = {bq.rho_std:.2e}")
-    print(f"  最大散度  max|∇·u|  = {bq.div_max:.2e}")
-    print(f"\n图像已保存 → {output_dir}")
+    print(f"\nBulk statistics at step {bq.step}:")
+    print(f"  KE        = {bq.ke:.6f}")
+    print(f"  Enstrophy = {bq.enstrophy:.6f}")
+    print(f"  rho mean  = {bq.rho_mean:.6f}  std = {bq.rho_std:.2e}")
+    print(f"  max|div u| = {bq.div_max:.2e}")
+    print(f"\nFigures saved -> {output_dir}")
 
 
 if __name__ == "__main__":

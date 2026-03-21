@@ -38,13 +38,13 @@ pub enum FsiCouplingMode {
 }
 
 impl FsiCouplingMode {
-    /// 返回耦合模式的中文描述字符串（用于启动日志）
+    /// Returns a short English description string for startup logging.
     pub fn description(&self) -> &'static str {
         match self {
-            FsiCouplingMode::BounceBack => "① 纯 BB/IBB（反弹格式）",
-            FsiCouplingMode::Ibm        => "② 纯 IBM（浸入边界法）",
-            FsiCouplingMode::Hybrid     => "③ 混合 BB/IBB + IBM（反弹格式 + 浸入边界法）",
-            FsiCouplingMode::None       => "无 FSI 耦合（纯流体仿真）",
+            FsiCouplingMode::BounceBack => "bounce-back / IBB",
+            FsiCouplingMode::Ibm        => "IBM (immersed boundary)",
+            FsiCouplingMode::Hybrid     => "hybrid BB/IBB + IBM",
+            FsiCouplingMode::None       => "none (pure fluid)",
         }
     }
 
@@ -139,17 +139,17 @@ pub fn validate_coupling_mode(
 
     if mode.needs_solid() && !has_solid {
         bail!(
-            "[fsi] coupling={:?} 要求提供 [solid] 段并设置非空 bodies，\
-             但配置中未找到有效的 [solid] 配置。\n\
-             请添加 [solid] 段，或将 fsi.coupling 改为 \"ibm\" / \"auto\"。",
+            "[fsi] coupling={:?} requires a [solid] section with non-empty bodies, \
+             but no valid [solid] config was found.\n\
+             Please add a [solid] section, or set fsi.coupling = \"ibm\" / \"auto\".",
             coupling_str
         );
     }
     if mode.needs_ibm() && !has_ibm {
         bail!(
-            "[fsi] coupling={:?} 要求提供 [ibm] 段，\
-             但配置中未找到 [ibm] 配置。\n\
-             请添加 [ibm] 段，或将 fsi.coupling 改为 \"bounce_back\" / \"auto\"。",
+            "[fsi] coupling={:?} requires an [ibm] section, \
+             but no [ibm] config was found.\n\
+             Please add an [ibm] section, or set fsi.coupling = \"bounce_back\" / \"auto\".",
             coupling_str
         );
     }
@@ -190,7 +190,7 @@ pub fn setup_solid_bodies(
                 lbm_bindings::mark_solid_cylinder(grid, local_cx, local_cy, body.radius);
                 if rank == 0 {
                     println!(
-                        "  [solid] 圆柱标记: center=({:.2}, {:.2}), radius={:.2}",
+                        "  [solid] cylinder: center=({:.2}, {:.2}), radius={:.2}",
                         body.cx, body.cy, body.radius
                     );
                 }
@@ -203,7 +203,7 @@ pub fn setup_solid_bodies(
                 );
                 if rank == 0 {
                     println!(
-                        "  [solid] 矩形标记: [{}, {}] × [{}, {}]",
+                        "  [solid] rectangle: [{}, {}] x [{}, {}]",
                         body.i0, body.i1, body.j0, body.j1
                     );
                 }
@@ -211,13 +211,13 @@ pub fn setup_solid_bodies(
             "mesh" => {
                 if body.mesh_file.is_empty() {
                     if rank == 0 {
-                        eprintln!("  [warn] solid.bodies shape=\"mesh\" 但 mesh_file 为空，跳过");
+                        eprintln!("  [warn] solid.bodies shape=\"mesh\" but mesh_file is empty, skipping");
                     }
                 } else {
                     lbm_bindings::mark_solid_from_mesh_file(grid, &body.mesh_file);
                     if rank == 0 {
                         println!(
-                            "  [solid] 网格文件标记: file={:?}",
+                            "  [solid] mesh file: file={:?}",
                             body.mesh_file
                         );
                     }
@@ -225,7 +225,7 @@ pub fn setup_solid_bodies(
             }
             other => {
                 if rank == 0 {
-                    eprintln!("  [warn] 未知固体形状 {:?}，跳过", other);
+                    eprintln!("  [warn] unknown solid body shape {:?}, skipping", other);
                 }
             }
         }
@@ -240,21 +240,21 @@ pub fn setup_solid_bodies(
 
     if rank == 0 {
         let scheme_name = match bc_mode {
-            1 => "BounceBack（半步长反弹，Ladd 1994，一阶精度）",
-            2 => "InterpolatedBounceBack（Bouzidi 插值反弹，2001，二阶精度）",
-            _ => "None（固体节点已标记，但不施加反弹，仅用于调试）",
+            1 => "BounceBack (half-way, Ladd 1994, 1st-order)",
+            2 => "InterpolatedBounceBack (Bouzidi 2001, 2nd-order)",
+            _ => "None (solid nodes marked, no bounce-back applied; debug only)",
         };
-        println!("  [solid] 反弹方案: {}", scheme_name);
+        println!("  [solid] BC scheme: {}", scheme_name);
         if cfg.solid.force_output.enabled {
             let nprocs = lbm_bindings::mpi_size();
             println!(
-                "  [solid] 受力统计: 每 {} 步输出到 {}/{}.csv（动量交换法，MEA）",
+                "  [solid] force output: every {} steps -> {}/{}.csv (momentum exchange, MEA)",
                 cfg.solid.force_output.interval,
                 cfg.output.directory,
                 cfg.solid.force_output.filename
             );
             if nprocs > 1 {
-                println!("  [solid] MPI 受力统计: 各进程局部贡献通过 MPI_Allreduce 求和");
+                println!("  [solid] MPI force reduction: local contributions summed via MPI_Allreduce");
             }
         }
     }
@@ -312,11 +312,11 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
                 "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
                 ibm_cfg.alpha, ibm_cfg.beta,
             ),
-            "mls" => "MLS-IBM（移动最小二乘，Wang 2009）".to_string(),
-            _     => format!("MDF-IBM（多重直接力，Luo 2007，n_iter={}）", ibm_cfg.n_iter),
+            "mls" => "MLS-IBM (moving least squares, Wang 2009)".to_string(),
+            _     => format!("MDF-IBM (multi-direct-forcing, Luo 2007, n_iter={})", ibm_cfg.n_iter),
         };
         println!(
-            "  [IBM] 方案: {}  δ核: {}  固体体数: {}",
+            "  [IBM] scheme: {}  delta kernel: {}  bodies: {}",
             method_name, ibm_cfg.delta_kernel, effective_bodies.len()
         );
     }
@@ -328,8 +328,8 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             "file" => {
                 if body.mesh_file.is_empty() {
                     bail!(
-                        "[IBM] 第 {} 体 geometry=\"file\" 但 mesh_file 未设置，\
-                         请在 [[ibm.bodies]] 中添加 mesh_file = \"path/to/markers.csv\"",
+                        "[IBM] body {} has geometry=\"file\" but mesh_file is not set; \
+                         please add mesh_file = \"path/to/markers.csv\" under [[ibm.bodies]]",
                         body_idx
                     );
                 }
@@ -353,7 +353,7 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
         let force_cfg = body.force_output.clone()
             .unwrap_or_else(|| ibm_cfg.force_output.clone());
 
-        // 解析体级方法参数（优先使用体级覆盖，否则继承全局 [ibm] 设置）
+        // Resolve per-body method params (body-level overrides global [ibm] settings)
         let method = body.method.clone()
             .unwrap_or_else(|| ibm_cfg.method.clone());
         let n_iter = body.n_iter.unwrap_or(ibm_cfg.n_iter);
@@ -363,21 +363,21 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
         if rank == 0 {
             let geom_info = match body.geometry.to_lowercase().as_str() {
                 "file"     => format!("file={:?}", body.mesh_file),
-                "filament" => format!("起点: ({}, {})  长度: {}", body.x0, body.y0, body.size),
-                _          => format!("圆心: ({}, {})  半径: {}", body.x0, body.y0, body.size),
+                "filament" => format!("start=({}, {})  length={}", body.x0, body.y0, body.size),
+                _          => format!("center=({}, {})  radius={}", body.x0, body.y0, body.size),
             };
             let method_info = if body.method.is_some() {
-                format!("  方法: {} (体级覆盖)", method)
+                format!("  method={} (body override)", method)
             } else {
-                format!("  方法: {} (继承全局)", method)
+                format!("  method={} (inherited global)", method)
             };
             println!(
-                "  [IBM] 体[{}] 标签={:?}  标记点数: {}  几何: {}{}",
+                "  [IBM] body[{}] label={:?}  markers={}  geometry: {}{}",
                 body_idx, label, ms.len(), geom_info, method_info
             );
             if force_cfg.enabled {
                 println!(
-                    "  [IBM] 体[{}] 受力统计: 每 {} 步输出到 {}/{}.csv",
+                    "  [IBM] body[{}] force output: every {} steps -> {}/{}.csv",
                     body_idx, force_cfg.interval,
                     cfg.output.directory, force_cfg.filename
                 );

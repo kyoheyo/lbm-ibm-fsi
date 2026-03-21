@@ -231,7 +231,7 @@ def _plot_force_comparison(input_dir: Path, output_dir: Path) -> None:
         csv_path = input_dir / f"{csv_stem}.csv"
         steps, fx_list, fy_list = _read_force_csv(csv_path)
         if not steps:
-            print(f"  [警告] 未找到受力 CSV：{csv_path}，跳过 {csv_stem}")
+            print(f"  [warn] force CSV not found: {csv_path}, skipping {csv_stem}")
             continue
         any_data = True
         ax_fx.plot(steps, fx_list, label=disp_label,
@@ -240,7 +240,7 @@ def _plot_force_comparison(input_dir: Path, output_dir: Path) -> None:
                    color=color, linestyle=ls, linewidth=1.2)
 
     if not any_data:
-        print("  [警告] 所有受力 CSV 均为空，跳过受力对比图")
+        print("  [warn] all force CSVs are empty, skipping force comparison plot")
         plt.close(fig_fx)
         plt.close(fig_fy)
         return
@@ -280,8 +280,8 @@ def main() -> None:
 
     if not input_dir.exists():
         print(
-            f"[compare_solid_bcs] 错误：输入目录不存在：{input_dir}\n"
-            "  请先运行仿真：\n"
+            f"[compare_solid_bcs] Error: input directory does not exist: {input_dir}\n"
+            "  Please run the simulation first:\n"
             "    ./lbm-fsi configs/solid_bc_comparison.toml",
             file=sys.stderr,
         )
@@ -290,8 +290,8 @@ def main() -> None:
     output_dir = Path(args.output) if args.output else input_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[compare_solid_bcs] 输入目录 : {input_dir}")
-    print(f"[compare_solid_bcs] 输出目录 : {output_dir}")
+    print(f"[compare_solid_bcs] Input dir : {input_dir}")
+    print(f"[compare_solid_bcs] Output dir: {output_dir}")
 
     # ──────────────────────────────────────────────────────────────────────
     # 加载流场快照（自动检测格式）
@@ -308,8 +308,8 @@ def main() -> None:
             fmt = "tecplot_bin"
         else:
             print(
-                f"[compare_solid_bcs] 未在 {input_dir} 中找到流场快照文件。\n"
-                "  跳过流场云图，仅生成受力对比曲线（若 CSV 已存在）。"
+                f"[compare_solid_bcs] No flow snapshots found in {input_dir}.\n"
+                "  Skipping flow contour plots; will only generate force comparison (if CSVs exist)."
             )
 
     snap = None
@@ -323,11 +323,11 @@ def main() -> None:
         if len(reader) > 0:
             snap = reader.read(args.step) if args.step is not None else reader.last()
             print(
-                f"[compare_solid_bcs] 流场格式: {fmt}  快照数: {len(reader)}"
-                f"  使用: step={snap.step}  time={snap.time:.2f}"
+                f"[compare_solid_bcs] format: {fmt}  snapshots: {len(reader)}"
+                f"  using: step={snap.step}  time={snap.time:.2f}"
             )
         else:
-            print(f"[compare_solid_bcs] {input_dir} 中无 {fmt} 格式快照，跳过流场云图。")
+            print(f"[compare_solid_bcs] No {fmt} snapshots in {input_dir}, skipping flow contour plots.")
 
     # ──────────────────────────────────────────────────────────────────────
     # 1–3. 流场云图
@@ -335,15 +335,15 @@ def main() -> None:
     if snap is not None:
         _plot_flow_fields(snap, output_dir)
     else:
-        print("  [1-3/5] 跳过流场云图（无快照数据）")
+        print("  [1-3/5] skipping flow contour plots (no snapshot data)")
 
     # ──────────────────────────────────────────────────────────────────────
     # 4–5. 受力对比曲线
     # ──────────────────────────────────────────────────────────────────────
     _plot_force_comparison(input_dir, output_dir)
 
-    print(f"\n[compare_solid_bcs] 图像已保存 → {output_dir}")
-    print("生成文件:")
+    print(f"\n[compare_solid_bcs] Figures saved -> {output_dir}")
+    print("Generated files:")
     for fname in [
         "velocity_magnitude.png",
         "pressure.png",
@@ -355,7 +355,7 @@ def main() -> None:
         if p.exists():
             print(f"  ✓ {fname}")
         else:
-            print(f"  ✗ {fname}（未生成）")
+            print(f"  ✗ {fname} (not generated)")
 
 
 if __name__ == "__main__":

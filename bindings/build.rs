@@ -32,12 +32,12 @@ fn main() {
     println!("cargo:rustc-link-lib=static=lbm_core");
 
     // 步骤 6：链接 C++ 标准库（平台相关；Windows/MSVC 自动处理）
-    // 使用 CARGO_CFG_TARGET_OS（目标平台）而非 cfg!(target_os)（宿主平台），支持交叉编译
+    // Use CARGO_CFG_TARGET_OS (target platform) instead of cfg!(target_os) (host platform) to support cross-compilation
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
-        "macos" | "ios" => println!("cargo:rustc-link-lib=c++"),   // Apple Clang 默认使用 libc++
-        "windows"       => {}                                        // MSVC 工具链自动链接 CRT，无需声明
-        _               => println!("cargo:rustc-link-lib=stdc++"), // Linux/FreeBSD 等使用 libstdc++
+        "macos" | "ios" => println!("cargo:rustc-link-lib=c++"),   // Apple Clang uses libc++ by default
+        "windows"       => {}                                        // MSVC toolchain links CRT automatically
+        _               => println!("cargo:rustc-link-lib=stdc++"), // Linux/FreeBSD etc. use libstdc++
     }
 
     // 步骤 7：当 MPI 启用时链接 MPI 库

@@ -81,9 +81,9 @@ def main() -> int:
         from lbm_post.vtk_reader import combine_block_snapshots
     except ImportError as e:
         print(
-            f"错误：无法导入 lbm_post（{e}）。\n"
-            "请先安装：  pip install -e python/\n"
-            "或将 python/ 目录加入 PYTHONPATH：  export PYTHONPATH=python",
+            f"Error: cannot import lbm_post ({e}).\n"
+            "Install it first:  pip install -e python/\n"
+            "or add python/ to PYTHONPATH:  export PYTHONPATH=python",
             file=sys.stderr,
         )
         return 1
@@ -91,29 +91,29 @@ def main() -> int:
     out_dir = args.out if args.out else None
     ext = args.fmt
 
-    print(f"输入目录 : {args.dir}")
-    print(f"输出格式 : {args.fmt}  →  fluid_NNNNNN.{ext}")
+    print(f"Input dir    : {args.dir}")
+    print(f"Output format: {args.fmt}  ->  fluid_NNNNNN.{ext}")
     dst = out_dir if out_dir else str(Path(args.dir) / "combined")
-    print(f"输出目录 : {dst}")
+    print(f"Output dir   : {dst}")
     print()
 
     try:
         written = combine_block_snapshots(args.dir, fmt=args.fmt, out_dir=out_dir)
     except FileNotFoundError as e:
-        print(f"错误：{e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return 1
     except ValueError as e:
-        print(f"错误：{e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return 1
 
     if not written:
-        print("未找到可合并的分区快照文件。")
+        print("No partition snapshot files found to combine.")
         return 0
 
-    print(f"已合并 {len(written)} 个时间步快照：")
+    print(f"Combined {len(written)} time-step snapshot(s):")
     for p in written:
         print(f"  {p}")
-    print(f"\n合并完成。输出目录：{written[0].parent}")
+    print(f"\nDone. Output directory: {written[0].parent}")
     return 0
 
 
