@@ -1100,4 +1100,60 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.fsi.normalized_coupling(), "hybrid");
     }
+
+    #[test]
+    fn test_async_io_config() {
+        // 默认值：async_io = false
+        let toml_default = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+        "#;
+        let cfg_default: Config = toml::from_str(toml_default).unwrap();
+        assert!(!cfg_default.output.async_io, "async_io 默认应为 false");
+
+        // 显式启用：async_io = true
+        let toml_async = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+            async_io = true
+        "#;
+        let cfg_async: Config = toml::from_str(toml_async).unwrap();
+        assert!(cfg_async.output.async_io, "async_io = true 应被正确解析");
+
+        // 显式禁用：async_io = false
+        let toml_sync = r#"
+            [simulation]
+            n_steps = 10
+            dt = 1.0
+
+            [fluid]
+            nx = 4
+            ny = 4
+            nu = 0.1
+
+            [output]
+            write_interval = 5
+            async_io = false
+        "#;
+        let cfg_sync: Config = toml::from_str(toml_sync).unwrap();
+        assert!(!cfg_sync.output.async_io, "async_io = false 应被正确解析");
+    }
 }

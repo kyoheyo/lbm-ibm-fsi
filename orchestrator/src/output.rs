@@ -1239,4 +1239,53 @@ mod tests {
         let lines3: Vec<&str> = text3.lines().collect();
         assert_eq!(lines3.len(), 4, "expected header + 3 rows after second flush");
     }
+
+    /// Verify that write_snapshot_raw dispatches to the correct format.
+    #[test]
+    fn test_write_snapshot_raw_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_raw_snapshot_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        let rho = vec![1.0f64; 4];
+        let ux  = vec![0.1f64; 4];
+        let uy  = vec![0.0f64; 4];
+
+        // NPZ 格式
+        write_snapshot_raw("npz", &rho, &ux, &uy, 2, 2, 1, 0.0, dir_str, None).unwrap();
+        assert!(dir.join("fluid_000001.npz").exists(), "npz file should be created");
+
+        // Tecplot ASCII 格式
+        write_snapshot_raw("tecplot_asc", &rho, &ux, &uy, 2, 2, 2, 1.0, dir_str, None).unwrap();
+        assert!(dir.join("fluid_000002.dat").exists(), "dat file should be created");
+
+        // Tecplot binary 格式
+        write_snapshot_raw("tecplot_bin", &rho, &ux, &uy, 2, 2, 3, 2.0, dir_str, None).unwrap();
+        assert!(dir.join("fluid_000003.plt").exists(), "plt file should be created");
+    }
+
+    /// Verify that write_global_snapshot_raw dispatches correctly.
+    #[test]
+    fn test_write_global_snapshot_raw_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_global_raw_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        let rho = vec![1.0f64; 4];
+        let ux  = vec![0.1f64; 4];
+        let uy  = vec![0.0f64; 4];
+
+        write_global_snapshot_raw("npz", &rho, &ux, &uy, 2, 2, 1, 0.0, dir_str).unwrap();
+        assert!(dir.join("fluid_000001.npz").exists());
+
+        write_global_snapshot_raw("tecplot_asc", &rho, &ux, &uy, 2, 2, 2, 1.0, dir_str).unwrap();
+        assert!(dir.join("fluid_000002.dat").exists());
+
+        write_global_snapshot_raw("tecplot_bin", &rho, &ux, &uy, 2, 2, 3, 2.0, dir_str).unwrap();
+        assert!(dir.join("fluid_000003.plt").exists());
+    }
 }
