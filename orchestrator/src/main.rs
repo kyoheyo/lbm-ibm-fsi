@@ -1,3 +1,4 @@
+mod async_output;
 mod config;
 mod fsi;
 mod output;
@@ -246,14 +247,14 @@ fn main() {
 
 /// 主时间步循环：每步推进仿真并按配置频率写出各类结果。
 ///
-/// 涵盖：
-/// - LBM 步进 + IBM 步进
-/// - 快照写出（NPZ / Tecplot ASC / Tecplot BIN）
-/// - combine_blocks 全局快照聚合（MPI 块模式，可选）
-/// - CSV 监控日志（动能等标量量；内存缓冲后批量写出，避免逐步 syscall 开销）
-/// - 固体受力统计（BB/IBB 动量交换法）
-/// - IBM 固体受力统计（Lagrangian 力密度积分，多体逐体写出）
-/// - Python FFI 等值线图（`python-ffi` 特性，可选）
+/// ## 输出模式（由 `[output] async_io` 控制）
+///
+/// ### 阻塞模式（默认，`async_io = false`）
+/// 每次写出操作在主线程内同步完成，行为与原始实现完全一致。
+///
+/// ### 异步模式（`async_io = true`）
+/// 主线程从 `LbmGrid` 提取数据后立即提交给后台 `lbm-io` 线程写出，
+/// 不阻塞仿真推进。MPI 集合通信仍在主线程同步执行。
 fn run_time_loop(
     cfg: &Config,
     grid: &mut LbmGrid,
@@ -265,11 +266,9 @@ fn run_time_loop(
     combine_blocks: bool,
     rank: i32,
 ) -> Result<()> {
-    // CSV monitor: accumulate rows in memory; flush at snapshot intervals.
-    // This replaces the previous per-step file open/write/close that caused
-    // measurable CPU-utilization spikes (O(n_steps) syscalls per rank).
-    let mut csv_buf: Option<output::CsvBuffer> = if cfg.output.enable_csv_monitor {
-        Some(output::CsvBuffer::new(csv_path))
+    let async_io = cfg.output.async_io;
+    let writer: Option<async_output::AsyncWriter> = if async_io {
+        Some(async_output::AsyncWriter::new(8))
     } else {
         None
     };
@@ -286,34 +285,101 @@ fn run_time_loop(
         let is_snapshot = step % cfg.output.write_interval == 0
             || step == cfg.simulation.n_steps - 1;
 
-        // 高频：欧拉场快照（每 write_interval 步或最后一步）
+        // 高频：欧拉场快照
         if is_snapshot {
             if rank == 0 {
                 println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
             }
-            write_step_snapshot(cfg, grid, step + 1, time, output_dir, partition)?;
+
+            if let Some(ref w) = writer {
+                let (rho, ux, uy, nx, ny) = output::extract_physical_fields(grid, partition);
+                let fmt = cfg.output.format.clone();
+                let dir = output_dir.to_owned();
+                let p   = partition;
+                w.submit(move || {
+                    output::write_snapshot_raw(&fmt, &rho, &ux, &uy, nx, ny, step + 1, time, &dir, p)
+                        .with_context(|| format!("failed to write snapshot (step {})", step + 1))
+                });
+            } else {
+                write_step_snapshot(cfg, grid, step + 1, time, output_dir, partition)?;
+            }
+
+            // combine_blocks：MPI gather 在主线程；文件写出可异步
             if combine_blocks {
-                write_combined_snapshot(cfg, grid, step + 1, time, partition)?;
+                if let Some(p) = partition {
+                    let (l_rho, l_ux, l_uy, _, _) = output::extract_physical_fields(grid, Some(p));
+                    let g_rho_r = output::gather_field_to_root(&l_rho, &p, 0);
+                    let g_ux_r  = output::gather_field_to_root(&l_ux,  &p, 0);
+                    let g_uy_r  = output::gather_field_to_root(&l_uy,  &p, 0);
+                    if let (Some((g_rho, gnx, gny)), Some((g_ux, _, _)), Some((g_uy, _, _)))
+                        = (g_rho_r, g_ux_r, g_uy_r)
+                    {
+                        let fmt = cfg.output.format.clone();
+                        let dir = cfg.output.directory.clone();
+                        if let Some(ref w) = writer {
+                            w.submit(move || {
+                                output::write_global_snapshot_raw(
+                                    &fmt, &g_rho, &g_ux, &g_uy, gnx, gny, step + 1, time, &dir,
+                                ).with_context(|| format!("failed to write combined snapshot (step {})", step + 1))
+                            });
+                        } else {
+                            output::write_global_snapshot_raw(
+                                &cfg.output.format, &g_rho, &g_ux, &g_uy, gnx, gny,
+                                step + 1, time, &cfg.output.directory,
+                            ).with_context(|| format!("failed to write combined snapshot (step {})", step + 1))?;
+                        }
+                    }
+                    // non-root already participated in gather
+                }
             }
         }
 
-        // 逐步：CSV 监控日志（动能等标量量）
-        // 数据行写入内存缓冲区；每次写出快照时一并刷盘（批量 write 替代逐步 open/close）。
-        if let Some(ref mut buf) = csv_buf {
-            buffer_monitor_csv(cfg, grid, step + 1, time, buf, partition);
-            if is_snapshot {
-                buf.flush().with_context(|| {
-                    format!("Failed to flush monitor CSV at step {}", step + 1)
-                })?;
+        // 逐步：CSV 监控日志（每步写出，保证时效性）
+        if cfg.output.enable_csv_monitor {
+            let ke = compute_monitor_ke(grid, partition);
+            if let Some(ref w) = writer {
+                let path = csv_path.to_owned();
+                w.submit(move || {
+                    output::append_monitor_csv(&path, step + 1, time, &[("ke", ke)])
+                        .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))
+                });
+            } else {
+                output::append_monitor_csv(csv_path, step + 1, time, &[("ke", ke)])
+                    .with_context(|| format!("Failed to write monitor CSV at step {}", step + 1))?;
             }
         }
 
-        // 固体受力输出（BB/IBB 动量交换法）
+        // 固体受力输出（MPI allreduce 在主线程；文件写出可异步）
         if cfg.solid.force_output.enabled
             && (step % cfg.solid.force_output.interval == 0
                 || step == cfg.simulation.n_steps - 1)
         {
-            write_solid_force(cfg, grid, step + 1, time, output_dir, partition, rank)?;
+            let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                (p.phys_x0 as i32, p.phys_y0 as i32,
+                 (p.phys_x0 + p.local_nx - 1) as i32,
+                 (p.phys_y0 + p.local_ny - 1) as i32)
+            } else {
+                (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+            };
+            let (local_fx, local_fy) = lbm_bindings::compute_solid_force(grid, pi0, pj0, pi1, pj1);
+            let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+            let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+            if rank == 0 {
+                let force_csv = format!("{}/{}.csv", output_dir, cfg.solid.force_output.filename);
+                if let Some(ref w) = writer {
+                    w.submit(move || {
+                        output::append_monitor_csv(
+                            &force_csv, step + 1, time,
+                            &[("fx", global_fx), ("fy", global_fy)],
+                        ).with_context(|| format!("Failed to write solid force CSV at step {}", step + 1))
+                    });
+                } else {
+                    output::append_monitor_csv(
+                        &force_csv, step + 1, time,
+                        &[("fx", global_fx), ("fy", global_fy)],
+                    ).with_context(|| format!("Failed to write solid force CSV at step {}", step + 1))?;
+                }
+            }
         }
 
         // IBM 固体受力输出（Lagrangian 力密度积分，多体逐体写出）
@@ -325,17 +391,29 @@ fn run_time_loop(
                 let (ibm_fx, ibm_fy) = entry.ms.compute_body_force();
                 if rank == 0 {
                     let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
-                    output::append_monitor_csv(
-                        &force_csv, step + 1, time,
-                        &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
-                    ).with_context(|| format!(
-                        "Failed to write IBM force CSV ({}) at step {}", entry.label, step + 1
-                    ))?;
+                    let label = entry.label.clone();
+                    if let Some(ref w) = writer {
+                        w.submit(move || {
+                            output::append_monitor_csv(
+                                &force_csv, step + 1, time,
+                                &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                            ).with_context(|| format!(
+                                "Failed to write IBM force CSV ({}) at step {}", label, step + 1
+                            ))
+                        });
+                    } else {
+                        output::append_monitor_csv(
+                            &force_csv, step + 1, time,
+                            &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                        ).with_context(|| format!(
+                            "Failed to write IBM force CSV ({}) at step {}", entry.label, step + 1
+                        ))?;
+                    }
                 }
             }
         }
 
-        // 低频：Python FFI 等值线图（`python-ffi` 特性）
+        // Python FFI 等值线图（Python GIL 限制，始终在主线程执行）
         #[cfg(feature = "python-ffi")]
         if let Some(pi) = cfg.output.plot_interval {
             if step % pi == 0 || step == cfg.simulation.n_steps - 1 {
@@ -344,9 +422,15 @@ fn run_time_loop(
         }
     }
 
-    // 仿真结束后刷写 CSV 缓冲区中剩余数据（write_interval 不能整除 n_steps 时可能残留）
-    if let Some(ref mut buf) = csv_buf {
-        buf.flush().context("Failed to flush final monitor CSV")?;
+    // 异步模式：等待所有待写任务完成并收集错误
+    if let Some(w) = writer {
+        let errors = w.shutdown();
+        if !errors.is_empty() {
+            for e in errors.iter().skip(1) {
+                eprintln!("[io-thread] {e:#}");
+            }
+            return Err(errors.into_iter().next().unwrap());
+        }
     }
 
     Ok(())
@@ -396,6 +480,7 @@ fn write_step_snapshot(
 ///
 /// 非 root 进程已在 [`output::gather_field_to_root`] 内参与 `MPI_Gatherv`，
 /// 此处直接返回 `Ok(())`。
+#[allow(dead_code)]
 fn write_combined_snapshot(
     cfg: &Config,
     grid: &LbmGrid,
@@ -416,37 +501,20 @@ fn write_combined_snapshot(
         return Ok(());
     };
 
-    match cfg.output.format.as_str() {
-        "tecplot_asc" => output::write_global_snapshot_tecplot_asc(
-            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
-        ).with_context(|| format!("failed to write combined Tecplot ASCII snapshot (step {})", step)),
-        "tecplot_bin" => output::write_global_snapshot_tecplot_bin(
-            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
-        ).with_context(|| format!("failed to write combined Tecplot binary snapshot (step {})", step)),
-        _ => output::write_global_snapshot_npz(
-            &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
-        ).with_context(|| format!("failed to write combined NPZ snapshot (step {})", step)),
-    }
+    output::write_global_snapshot_raw(
+        &cfg.output.format, &g_rho, &g_ux, &g_uy, gnx, gny, step, time, &cfg.output.directory,
+    ).with_context(|| format!("failed to write combined snapshot (step {})", step))
 }
 
-/// 计算平均动能并将结果推入 CSV 缓冲区（不执行文件 I/O）。
-///
-/// 调用方负责在适当时机调用 `buf.flush()` 将缓冲数据写盘。
-fn buffer_monitor_csv(
-    _cfg: &Config,
-    grid: &LbmGrid,
-    step: u64,
-    time: f64,
-    buf: &mut output::CsvBuffer,
-    partition: Option<PartitionInfo>,
-) {
+/// 计算物理区域平均动能（纯内存操作，不涉及文件 I/O）。
+fn compute_monitor_ke(grid: &LbmGrid, partition: Option<PartitionInfo>) -> f64 {
     let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
         (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
     } else {
         (0, 0, grid.nx() as usize, grid.ny() as usize, grid.nx() as usize)
     };
     let n_phys = pnx * pny;
-    let ke: f64 = (0..pny)
+    let ke_sum: f64 = (0..pny)
         .flat_map(|j| (0..pnx).map(move |i| (j, i)))
         .map(|(j, i)| {
             let idx = ((py0 + j) * gnx + px0 + i) as i32;
@@ -454,15 +522,14 @@ fn buffer_monitor_csv(
             let v = grid.uy(idx);
             u * u + v * v
         })
-        .sum::<f64>()
-        / (n_phys as f64)
-        * 0.5;
-    buf.push_row(step, time, &[("ke", ke)]);
+        .sum::<f64>();
+    ke_sum / (n_phys as f64) * 0.5
 }
 
 /// 统计固体所受合力（动量交换法）并写入 CSV。
 ///
 /// MPI 模式下各进程的局部贡献通过 `MPI_Allreduce` 求和；仅 rank-0 写文件。
+#[allow(dead_code)]
 fn write_solid_force(
     cfg: &Config,
     grid: &LbmGrid,

@@ -527,6 +527,7 @@ pub fn append_monitor_csv(
 /// single bulk operation when `flush` is called.  The caller should flush
 /// at snapshot intervals (`write_interval`) and at the end of the simulation
 /// to keep memory consumption bounded.
+#[allow(dead_code)]
 pub struct CsvBuffer {
     path:   String,
     /// Lazily-built header line (set on first `push_row` call).
@@ -535,6 +536,7 @@ pub struct CsvBuffer {
     rows:   Vec<String>,
 }
 
+#[allow(dead_code)]
 impl CsvBuffer {
     /// Create a new, empty buffer targeting `path`.
     pub fn new(path: &str) -> Self {
@@ -834,6 +836,149 @@ pub fn write_global_snapshot_tecplot_bin(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 基于预提取数组的快照写出器（异步模式用，无需访问 LbmGrid）
+// ---------------------------------------------------------------------------
+
+/// 从预先提取的物理场数组写出 NPZ 格式快照（不访问 LbmGrid）。
+pub fn write_snapshot_npz_raw(
+    rho: &[f64], ux: &[f64], uy: &[f64],
+    nx: usize, ny: usize,
+    step: u64, time: f64, directory: &str,
+    part: Option<PartitionInfo>,
+) -> Result<()> {
+    let path = format!("{}/fluid_{:06}.npz", directory, step);
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("Cannot create snapshot file: {path}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("rho.npy", options)?;
+    zip.write_all(&npy_f64(rho, &[ny, nx]))?;
+    zip.start_file("ux.npy", options)?;
+    zip.write_all(&npy_f64(ux, &[ny, nx]))?;
+    zip.start_file("uy.npy", options)?;
+    zip.write_all(&npy_f64(uy, &[ny, nx]))?;
+    zip.start_file("step.npy", options)?;
+    zip.write_all(&npy_i64(&[step as i64], &[]))?;
+    zip.start_file("time.npy", options)?;
+    zip.write_all(&npy_f64(&[time], &[]))?;
+    if let Some(p) = part {
+        zip.start_file("x_start.npy", options)?;
+        zip.write_all(&npy_i64(&[p.x_start as i64], &[]))?;
+        zip.start_file("y_start.npy", options)?;
+        zip.write_all(&npy_i64(&[p.y_start as i64], &[]))?;
+        zip.start_file("global_nx.npy", options)?;
+        zip.write_all(&npy_i64(&[p.global_nx as i64], &[]))?;
+        zip.start_file("global_ny.npy", options)?;
+        zip.write_all(&npy_i64(&[p.global_ny as i64], &[]))?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+/// 从预先提取的物理场数组写出 ASCII Tecplot (.dat) 格式快照。
+pub fn write_snapshot_tecplot_asc_raw(
+    rho: &[f64], ux: &[f64], uy: &[f64],
+    nx: usize, ny: usize,
+    step: u64, time: f64, directory: &str,
+    part: Option<PartitionInfo>,
+) -> Result<()> {
+    let (x0, y0) = part.map(|p| (p.x_start, p.y_start)).unwrap_or((0, 0));
+    let path = format!("{}/fluid_{:06}.dat", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create Tecplot ASCII file: {path}"))?;
+    writeln!(file, "TITLE = \"LBM Flow Field step={step:06} time={time:.3}\"")?;
+    writeln!(file, "VARIABLES = \"X\" \"Y\" \"RHO\" \"UX\" \"UY\"")?;
+    writeln!(file, "ZONE T=\"fluid\", I={nx}, J={ny}, K=1, DATAPACKING=POINT, SOLUTIONTIME={time}")?;
+    for j in 0..ny {
+        for i in 0..nx {
+            let idx = j * nx + i;
+            writeln!(file, "{:.4} {:.4} {:.8e} {:.8e} {:.8e}",
+                (x0 + i) as f64 + 0.5, (y0 + j) as f64 + 0.5,
+                rho[idx], ux[idx], uy[idx])?;
+        }
+    }
+    Ok(())
+}
+
+/// 从预先提取的物理场数组写出二进制 Tecplot PLT（TDV112）格式快照。
+pub fn write_snapshot_tecplot_bin_raw(
+    rho: &[f64], ux: &[f64], uy: &[f64],
+    nx: usize, ny: usize,
+    step: u64, time: f64, directory: &str,
+    part: Option<PartitionInfo>,
+) -> Result<()> {
+    use std::io::Write as _;
+    let (x0, y0) = part.map(|p| (p.x_start, p.y_start)).unwrap_or((0, 0));
+    let path = format!("{}/fluid_{:06}.plt", directory, step);
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create Tecplot binary file: {path}"))?;
+    file.write_all(b"#!TDV112")?;
+    file.write_all(&1_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    let title = format!("LBM Flow Field step={step:06} time={time:.3}");
+    write_tec_string(&mut file, &title)?;
+    file.write_all(&5_i32.to_le_bytes())?;
+    for name in &["X", "Y", "RHO", "UX", "UY"] { write_tec_string(&mut file, name)?; }
+    file.write_all(&299.0_f32.to_le_bytes())?;
+    write_tec_string(&mut file, "fluid")?;
+    for v in &[-1_i32, -1_i32] { file.write_all(&v.to_le_bytes())?; }
+    file.write_all(&time.to_le_bytes())?;
+    for v in &[-1_i32, 0_i32, 0_i32, 0_i32, 0_i32] { file.write_all(&v.to_le_bytes())?; }
+    file.write_all(&(nx as i32).to_le_bytes())?;
+    file.write_all(&(ny as i32).to_le_bytes())?;
+    file.write_all(&1_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&357.0_f32.to_le_bytes())?;
+    file.write_all(&299.0_f32.to_le_bytes())?;
+    for _ in 0..5 { file.write_all(&2_i32.to_le_bytes())?; }
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&0_i32.to_le_bytes())?;
+    file.write_all(&(-1_i32).to_le_bytes())?;
+    for _j in 0..ny {
+        for i in 0..nx { file.write_all(&((x0 + i) as f64 + 0.5).to_le_bytes())?; }
+    }
+    for j in 0..ny {
+        let y = (y0 + j) as f64 + 0.5;
+        for _ in 0..nx { file.write_all(&y.to_le_bytes())?; }
+    }
+    for v in rho { file.write_all(&v.to_le_bytes())?; }
+    for v in ux  { file.write_all(&v.to_le_bytes())?; }
+    for v in uy  { file.write_all(&v.to_le_bytes())?; }
+    Ok(())
+}
+
+/// 根据格式字符串从预提取数组写出快照（异步模式通用入口）。
+pub fn write_snapshot_raw(
+    format: &str,
+    rho: &[f64], ux: &[f64], uy: &[f64],
+    nx: usize, ny: usize,
+    step: u64, time: f64, directory: &str,
+    part: Option<PartitionInfo>,
+) -> Result<()> {
+    match format {
+        "tecplot_asc" => write_snapshot_tecplot_asc_raw(rho, ux, uy, nx, ny, step, time, directory, part),
+        "tecplot_bin" => write_snapshot_tecplot_bin_raw(rho, ux, uy, nx, ny, step, time, directory, part),
+        _             => write_snapshot_npz_raw        (rho, ux, uy, nx, ny, step, time, directory, part),
+    }
+}
+
+/// 根据格式字符串写出全局（combine_blocks gather 后）快照的通用入口。
+pub fn write_global_snapshot_raw(
+    format: &str,
+    rho: &[f64], ux: &[f64], uy: &[f64],
+    nx: usize, ny: usize,
+    step: u64, time: f64, directory: &str,
+) -> Result<()> {
+    match format {
+        "tecplot_asc" => write_global_snapshot_tecplot_asc(rho, ux, uy, nx, ny, step, time, directory),
+        "tecplot_bin" => write_global_snapshot_tecplot_bin(rho, ux, uy, nx, ny, step, time, directory),
+        _             => write_global_snapshot_npz        (rho, ux, uy, nx, ny, step, time, directory),
+    }
+}
+
 // .npy 格式（v1.0）：
 //   魔数（6 字节）+ 版本号（2 字节）+ HEADER_LEN（u16 小端）+ 头部 + 数据
 // 前导部分共 10 字节；前导 + 头部总长度必须是 64 字节的倍数。

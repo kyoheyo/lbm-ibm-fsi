@@ -499,6 +499,26 @@ pub struct OutputConfig {
     /// 在非 MPI 模式（nprocs=1）或 `mode="independent"` 时此选项被忽略。
     #[serde(default)]
     pub combine_blocks: bool,
+    /// 是否启用异步 I/O 输出线程。
+    ///
+    /// ## `true`（异步模式）
+    ///
+    /// 所有文件写出任务（NPZ/dat/plt 快照、CSV 监控日志、MPI 合并快照等）
+    /// 在主线程提取完数据后移交给专用后台 I/O 线程执行，仿真主循环不阻塞于文件 I/O。
+    ///
+    /// MPI 集合通信（`MPI_Gatherv`、`MPI_Allreduce`）仍在主线程同步执行；
+    /// 通信完成后的文件写出操作才由后台线程异步完成。
+    ///
+    /// ## `false`（阻塞模式，默认）
+    ///
+    /// 保持原有行为：每次写出操作在主线程内同步完成后才继续推进仿真。
+    ///
+    /// ```toml
+    /// [output]
+    /// async_io = true   # 启用异步输出（默认 false）
+    /// ```
+    #[serde(default)]
+    pub async_io: bool,
 }
 
 /// Python 集成配置。
