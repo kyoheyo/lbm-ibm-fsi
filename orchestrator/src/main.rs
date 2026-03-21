@@ -64,9 +64,19 @@ fn run() -> Result<()> {
 
     // When LBM_ENABLE_MPI is OFF, mpi_rank()/mpi_size() always return 0/1.
     // If the binary is launched under mpiexec anyway, every process would
-    // think it is rank-0 and print the header N times.  Read the launcher
-    // environment variables as a fallback so only the true rank-0 prints.
+    // think it is rank-0 and run a full independent simulation (allocating
+    // grids, stepping, writing output — N redundant runs).
+    // Detect the true process index via launcher env vars; any process that
+    // is not rank-0 exits immediately so only one simulation is performed.
     let rank = if nprocs == 1 { launcher_rank(rank) } else { rank };
+    if nprocs == 1 && rank > 0 {
+        eprintln!(
+            "[warn] Binary compiled without MPI support (LBM_ENABLE_MPI=OFF), \
+             but launched with mpiexec (detected rank={rank}). \
+             Only rank-0 runs the simulation; this process exits."
+        );
+        return Ok(());
+    }
 
     // Apply parallel config (OpenMP thread count must be set on all ranks)
     if cfg.parallel.omp_num_threads > 0 {
@@ -521,15 +531,18 @@ fn parse_collision_model(s: &str) -> CollisionModel {
 ///
 /// When MPI support is not compiled in, `mpi_rank()` always returns 0 and
 /// `mpi_size()` always returns 1.  If the binary is still launched via
-/// `mpiexec -n N`, every process would believe it is rank-0 and produce
-/// duplicate header output.
+/// `mpiexec -n N`, all N processes would believe they are rank-0 and each
+/// run a full independent simulation (allocate grid, step, write output).
 ///
 /// This function reads the standard MPI launcher environment variables set
 /// by OpenMPI (`OMPI_COMM_WORLD_RANK`), MPICH/PMI (`PMI_RANK`),
 /// MVAPICH2 (`MV2_COMM_WORLD_RANK`), and PMIx/Slurm (`PMIX_RANK`) as a
-/// fallback.  If any of these variables is present and parses to a
-/// non-negative integer, that value is returned; otherwise `fallback` (the
-/// value from `mpi_rank()`) is returned unchanged.
+/// fallback.  If any variable is present and parses to a non-negative
+/// integer, that value is returned; otherwise `fallback` (the value from
+/// `mpi_rank()`) is returned unchanged.
+///
+/// The caller must exit non-zero processes immediately after this call when
+/// `nprocs == 1 && rank > 0` to ensure only rank-0 runs the simulation.
 fn launcher_rank(fallback: i32) -> i32 {
     for var in &[
         "OMPI_COMM_WORLD_RANK",
