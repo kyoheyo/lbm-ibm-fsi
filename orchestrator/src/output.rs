@@ -513,6 +513,91 @@ pub fn append_monitor_csv(
 }
 
 // ---------------------------------------------------------------------------
+// CSV 监控日志内存缓冲区
+// ---------------------------------------------------------------------------
+
+/// In-memory write buffer for the CSV monitor log.
+///
+/// `append_monitor_csv` opens, writes, and closes the output file on every
+/// call.  When called once per time step (typical for kinetic-energy
+/// monitoring), this produces O(n_steps) file-system syscalls per MPI rank,
+/// causing measurable CPU-utilization spikes between compute phases.
+///
+/// `CsvBuffer` accumulates data rows in memory and writes them all in a
+/// single bulk operation when `flush` is called.  The caller should flush
+/// at snapshot intervals (`write_interval`) and at the end of the simulation
+/// to keep memory consumption bounded.
+pub struct CsvBuffer {
+    path:   String,
+    /// Lazily-built header line (set on first `push_row` call).
+    header: Option<String>,
+    /// Accumulated formatted data rows (no trailing newline).
+    rows:   Vec<String>,
+}
+
+impl CsvBuffer {
+    /// Create a new, empty buffer targeting `path`.
+    pub fn new(path: &str) -> Self {
+        Self { path: path.to_owned(), header: None, rows: Vec::new() }
+    }
+
+    /// Append one data row to the in-memory buffer (no I/O).
+    ///
+    /// The header is built lazily from `fields` column names the first time
+    /// this method is called — subsequent calls must supply the same columns
+    /// in the same order.
+    pub fn push_row(&mut self, step: u64, time: f64, fields: &[(&str, f64)]) {
+        if self.header.is_none() {
+            let mut h = "step,time".to_string();
+            for (name, _) in fields {
+                h.push(',');
+                h.push_str(name);
+            }
+            self.header = Some(h);
+        }
+        let mut row = format!("{step},{time:.6}");
+        for (_, v) in fields {
+            row.push_str(&format!(",{v:.10e}"));
+        }
+        self.rows.push(row);
+    }
+
+    /// Write all buffered rows to the target CSV file in one operation.
+    ///
+    /// * If the file does not yet exist the header line is prepended.
+    /// * The internal buffer is cleared on success.
+    /// * Returns immediately (no-op) when the buffer is empty.
+    pub fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let p = Path::new(&self.path);
+        let needs_header = !p.exists();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .with_context(|| format!("Cannot open monitor CSV: {}", self.path))?;
+
+        if needs_header {
+            if let Some(ref h) = self.header {
+                file.write_all(h.as_bytes())?;
+                file.write_all(b"\n")?;
+            }
+        }
+        // Write all buffered rows in one call to minimise syscall count.
+        let mut content = String::with_capacity(self.rows.len() * 64);
+        for row in &self.rows {
+            content.push_str(row);
+            content.push('\n');
+        }
+        file.write_all(content.as_bytes())?;
+        self.rows.clear();
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MPI 块合并 → 全局场 gather 工具
 // ---------------------------------------------------------------------------
 
@@ -964,5 +1049,49 @@ mod tests {
         assert_eq!(a, 'A' as i32);
         assert_eq!(b, 'B' as i32);
         assert_eq!(z, 0); // 空字符终止
+    }
+
+    /// Verify that CsvBuffer accumulates rows in memory and only writes on flush.
+    #[test]
+    fn test_csv_buffer_flush() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbm_csvbuf_test_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("buf_monitor.csv");
+        let p = csv_path.to_str().unwrap();
+
+        let mut buf = CsvBuffer::new(p);
+
+        // Before flush the file must not exist
+        assert!(!csv_path.exists(), "file should not be created before flush");
+
+        buf.push_row(1, 0.1, &[("ke", 1.0e-3)]);
+        buf.push_row(2, 0.2, &[("ke", 2.0e-3)]);
+
+        // Still no file
+        assert!(!csv_path.exists(), "file should not be created before flush");
+
+        buf.flush().unwrap();
+
+        // Now the file should exist with header + 2 data rows
+        let text = std::fs::read_to_string(&csv_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "expected header + 2 rows");
+        assert!(lines[0].starts_with("step,time,ke"));
+        assert!(lines[1].starts_with("1,0.100000"));
+        assert!(lines[2].starts_with("2,0.200000"));
+
+        // Buffer should be empty after flush; a second flush is a no-op
+        buf.flush().unwrap();
+        let text2 = std::fs::read_to_string(&csv_path).unwrap();
+        assert_eq!(text, text2, "second flush should not add rows");
+
+        // Rows pushed after flush append correctly
+        buf.push_row(3, 0.3, &[("ke", 3.0e-3)]);
+        buf.flush().unwrap();
+        let text3 = std::fs::read_to_string(&csv_path).unwrap();
+        let lines3: Vec<&str> = text3.lines().collect();
+        assert_eq!(lines3.len(), 4, "expected header + 3 rows after second flush");
     }
 }

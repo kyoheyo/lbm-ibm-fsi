@@ -83,6 +83,19 @@ fn run() -> Result<()> {
         lbm_bindings::set_omp_num_threads(cfg.parallel.omp_num_threads as i32);
     }
 
+    // MPI + OpenMP hybrid mode: prefer passive thread waiting so that OpenMP
+    // worker threads yield the CPU (rather than spin-polling) while MPI
+    // synchronisation is in progress.  This eliminates the artificial high-CPU
+    // plateau visible on CPU-utilisation monitors between compute phases.
+    //
+    // OMP_WAIT_POLICY must be set before the first parallel region is entered.
+    // Setting it here via std::env::set_var is safe because we are still
+    // single-threaded at this point (mpi_init has been called but no OpenMP
+    // threads have been spawned yet).
+    if nprocs > 1 && std::env::var("OMP_WAIT_POLICY").is_err() {
+        std::env::set_var("OMP_WAIT_POLICY", "passive");
+    }
+
     // Print header (rank-0 only, prevents duplicate output in MPI mode)
     if rank == 0 { print_header(&cfg, &args.config, nprocs); }
 
@@ -237,7 +250,7 @@ fn main() {
 /// - LBM 步进 + IBM 步进
 /// - 快照写出（NPZ / Tecplot ASC / Tecplot BIN）
 /// - combine_blocks 全局快照聚合（MPI 块模式，可选）
-/// - CSV 监控日志（动能等标量量）
+/// - CSV 监控日志（动能等标量量；内存缓冲后批量写出，避免逐步 syscall 开销）
 /// - 固体受力统计（BB/IBB 动量交换法）
 /// - IBM 固体受力统计（Lagrangian 力密度积分，多体逐体写出）
 /// - Python FFI 等值线图（`python-ffi` 特性，可选）
@@ -252,6 +265,15 @@ fn run_time_loop(
     combine_blocks: bool,
     rank: i32,
 ) -> Result<()> {
+    // CSV monitor: accumulate rows in memory; flush at snapshot intervals.
+    // This replaces the previous per-step file open/write/close that caused
+    // measurable CPU-utilization spikes (O(n_steps) syscalls per rank).
+    let mut csv_buf: Option<output::CsvBuffer> = if cfg.output.enable_csv_monitor {
+        Some(output::CsvBuffer::new(csv_path))
+    } else {
+        None
+    };
+
     for step in 0..cfg.simulation.n_steps {
         solver.step(grid);
 
@@ -261,9 +283,11 @@ fn run_time_loop(
         }
 
         let time = (step + 1) as f64 * cfg.simulation.dt;
+        let is_snapshot = step % cfg.output.write_interval == 0
+            || step == cfg.simulation.n_steps - 1;
 
         // 高频：欧拉场快照（每 write_interval 步或最后一步）
-        if step % cfg.output.write_interval == 0 || step == cfg.simulation.n_steps - 1 {
+        if is_snapshot {
             if rank == 0 {
                 println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
             }
@@ -274,8 +298,14 @@ fn run_time_loop(
         }
 
         // 逐步：CSV 监控日志（动能等标量量）
-        if cfg.output.enable_csv_monitor {
-            write_monitor_csv(cfg, grid, step + 1, time, csv_path, partition)?;
+        // 数据行写入内存缓冲区；每次写出快照时一并刷盘（批量 write 替代逐步 open/close）。
+        if let Some(ref mut buf) = csv_buf {
+            buffer_monitor_csv(cfg, grid, step + 1, time, buf, partition);
+            if is_snapshot {
+                buf.flush().with_context(|| {
+                    format!("Failed to flush monitor CSV at step {}", step + 1)
+                })?;
+            }
         }
 
         // 固体受力输出（BB/IBB 动量交换法）
@@ -313,6 +343,12 @@ fn run_time_loop(
             }
         }
     }
+
+    // 仿真结束后刷写 CSV 缓冲区中剩余数据（write_interval 不能整除 n_steps 时可能残留）
+    if let Some(ref mut buf) = csv_buf {
+        buf.flush().context("Failed to flush final monitor CSV")?;
+    }
+
     Ok(())
 }
 
@@ -393,15 +429,17 @@ fn write_combined_snapshot(
     }
 }
 
-/// 计算平均动能并追加到 CSV 监控日志。
-fn write_monitor_csv(
+/// 计算平均动能并将结果推入 CSV 缓冲区（不执行文件 I/O）。
+///
+/// 调用方负责在适当时机调用 `buf.flush()` 将缓冲数据写盘。
+fn buffer_monitor_csv(
     _cfg: &Config,
     grid: &LbmGrid,
     step: u64,
     time: f64,
-    csv_path: &str,
+    buf: &mut output::CsvBuffer,
     partition: Option<PartitionInfo>,
-) -> Result<()> {
+) {
     let (px0, py0, pnx, pny, gnx) = if let Some(p) = partition {
         (p.phys_x0, p.phys_y0, p.local_nx, p.local_ny, grid.nx() as usize)
     } else {
@@ -419,8 +457,7 @@ fn write_monitor_csv(
         .sum::<f64>()
         / (n_phys as f64)
         * 0.5;
-    output::append_monitor_csv(csv_path, step, time, &[("ke", ke)])
-        .with_context(|| format!("Failed to write monitor CSV at step {}", step))
+    buf.push_row(step, time, &[("ke", ke)]);
 }
 
 /// 统计固体所受合力（动量交换法）并写入 CSV。

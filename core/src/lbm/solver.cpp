@@ -210,7 +210,11 @@ void Solver::collide_bgk()
 
     if (grid_.model == LatticeModel::D2Q9) {
 #ifdef LBM_ENABLE_OPENMP
-#pragma omp parallel for schedule(static)
+// schedule(guided): decreasing chunk sizes give better load balance when
+// some iterations are skipped via is_ghost() (2-D / 3-D MPI ghost layers).
+// For 1-D MPI and non-MPI runs the work is already uniform, so guided
+// behaves nearly identically to static with negligible scheduling overhead.
+#pragma omp parallel for schedule(guided)
 #endif
         for (int i = guard.n_start; i < guard.n_end; ++i) {
 #ifdef LBM_ENABLE_MPI
@@ -238,7 +242,7 @@ void Solver::collide_bgk()
         }
     } else {
 #ifdef LBM_ENABLE_OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(guided)
 #endif
         for (int i = guard.n_start; i < guard.n_end; ++i) {
             const double* ui = &grid_.u[i * d];
@@ -296,7 +300,9 @@ void Solver::collide_mrt()
     const CollideGuard guard = make_collide_guard();
 
 #ifdef LBM_ENABLE_OPENMP
-#pragma omp parallel for schedule(static)
+// schedule(guided) instead of schedule(static): handles load imbalance from
+// is_ghost() early-continue in 2-D / 3-D MPI decompositions.
+#pragma omp parallel for schedule(guided)
 #endif
     for (int i = guard.n_start; i < guard.n_end; ++i) {
 #ifdef LBM_ENABLE_MPI
