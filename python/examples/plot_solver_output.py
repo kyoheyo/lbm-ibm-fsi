@@ -79,8 +79,9 @@ if str(_PYTHON_DIR) not in sys.path:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "可视化 LBM 求解器输出（支持 .npz / .dat / .plt 快照格式）。"
-            "生成速度幅值、流线、涡量及剖面图，保存到指定输出目录。"
+            "Visualise LBM solver output (supports .npz / .dat / .plt snapshot formats). "
+            "Generates velocity-magnitude, streamlines, vorticity, and profile plots "
+            "and saves them to the specified output directory."
         )
     )
     p.add_argument(
@@ -88,8 +89,8 @@ def _parse_args() -> argparse.Namespace:
         nargs="?",
         metavar="INPUT_DIR",
         help=(
-            "包含快照文件的目录"
-            "（作为 post_script 调用时由求解器自动传入）。"
+            "Directory containing snapshot files "
+            "(passed automatically by the solver when called as post_script)."
         ),
     )
     p.add_argument(
@@ -97,8 +98,8 @@ def _parse_args() -> argparse.Namespace:
         metavar="INPUT_DIR",
         default=None,
         help=(
-            "包含快照文件的目录。"
-            "默认：仓库根目录下的 'output/lid_cavity'。"
+            "Directory containing snapshot files. "
+            "Default: 'output/lid_cavity' under the repository root."
         ),
     )
     p.add_argument(
@@ -106,8 +107,8 @@ def _parse_args() -> argparse.Namespace:
         metavar="OUTPUT_DIR",
         default=None,
         help=(
-            "图像文件的保存目录。"
-            "默认：与 INPUT_DIR 相同。"
+            "Directory to save image files. "
+            "Default: same as INPUT_DIR."
         ),
     )
     p.add_argument(
@@ -116,8 +117,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         choices=["npz", "tecplot_asc", "tecplot_bin"],
         help=(
-            "输入文件格式：npz（默认）、tecplot_asc（.dat）或 tecplot_bin（.plt）。"
-            "若不指定则自动检测（先找 .npz，再找 .dat，最后找 .plt）。"
+            "Input file format: npz (default), tecplot_asc (.dat), or tecplot_bin (.plt). "
+            "If omitted, format is auto-detected (npz > dat > plt)."
         ),
     )
     p.add_argument(
@@ -126,8 +127,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help=(
-            "指定绘制某个时间步（而不是最后一帧）。"
-            "对应文件名 fluid_NNNNNN.{npz|dat|plt}。"
+            "Plot a specific time step instead of the last snapshot. "
+            "Corresponds to filename fluid_NNNNNN.{npz|dat|plt}."
         ),
     )
     p.add_argument(
@@ -135,14 +136,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         metavar="I",
-        help="竖向速度剖面的 x 格点索引（默认：nx//2）。",
+        help="Lattice x-index for the vertical velocity profile (default: nx//2).",
     )
     p.add_argument(
         "--centre-y",
         type=int,
         default=None,
         metavar="J",
-        help="横向速度剖面的 y 格点索引（默认：ny//2）。",
+        help="Lattice y-index for the horizontal velocity profile (default: ny//2).",
     )
     args = p.parse_args()
 

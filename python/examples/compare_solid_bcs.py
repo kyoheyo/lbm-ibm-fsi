@@ -111,27 +111,27 @@ def _parse_args() -> argparse.Namespace:
         "--input", "-i",
         metavar="INPUT_DIR",
         default=None,
-        help="包含仿真输出的目录（默认：output/solid_bc_comparison）。",
+        help="Directory containing simulation output (default: output/solid_bc_comparison).",
     )
     p.add_argument(
         "--output", "-o",
         metavar="OUTPUT_DIR",
         default=None,
-        help="图像文件的保存目录（默认：与 INPUT_DIR 相同）。",
+        help="Directory to save image files (default: same as INPUT_DIR).",
     )
     p.add_argument(
         "--fmt",
         metavar="FORMAT",
         default=None,
         choices=["tecplot_asc", "npz", "tecplot_bin"],
-        help="快照格式（默认自动检测）。",
+        help="Snapshot format (default: auto-detect).",
     )
     p.add_argument(
         "--step",
         type=int,
         default=None,
         metavar="N",
-        help="指定绘制某个时间步（默认：最后一帧）。",
+        help="Plot a specific time step (default: last frame).",
     )
     args = p.parse_args()
     if args.positional_input is not None:

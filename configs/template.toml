@@ -90,11 +90,13 @@ bc_type = "interpolated_bounce_back"
 # 支持的 shape 类型：
 #   "cylinder"  — 圆柱（需 cx, cy, radius）
 #   "rectangle" — 矩形（需 i0, j0, i1, j1）
+#   "mesh"      — 从外部 CSV 文件加载边界点（需 mesh_file；文件格式：每行 x, y [, q]，q 为 IBB 壁面距离分数，可选）
 [[solid.bodies]]
 shape  = "cylinder"   # 几何类型
 cx     = 50.0         # 圆心 x 坐标（格子单位）
 cy     = 50.0         # 圆心 y 坐标（格子单位）
 radius = 10.0         # 半径（格子单位）
+label  = ""           # 可选标签（用于区分多固体输出；空 = 自动编号）
 
 # [[solid.bodies]]
 # shape = "rectangle"
@@ -103,27 +105,72 @@ radius = 10.0         # 半径（格子单位）
 # i1    = 30    # 东北角 x（格子单位）
 # j1    = 40    # 东北角 y（格子单位）
 
+# [[solid.bodies]]
+# shape     = "mesh"
+# mesh_file = "path/to/solid_boundary.csv"   # 格式：每行 x, y [, q]
+# label     = "wall"
+
+# 固体受力输出配置（可选）
+# 启用后，每隔 force_output.interval 步将所有固体所受的动量交换力写入 CSV 文件
+[solid.force_output]
+enabled  = false          # 是否启用受力输出（默认 false）
+interval = 100            # 每隔多少步输出一次（默认 1，即每步）
+filename = "solid_force"  # CSV 文件名前缀（不含扩展名；默认 "solid_force"）
+
 # -----------------------------------------------------------------------------
 # [ibm] 浸没边界法（仅含固体或柔性体的算例需要此节）
 # -----------------------------------------------------------------------------
 [ibm]
-geometry     = "filament"    # 几何类型："filament"（丝状体）| "circle"（刚性圆柱）
-x0           = 50.0          # 起点 x（丝状体）或圆心 x（圆形），格子单位
-y0           = 30.0          # 起点 y（丝状体）或圆心 y（圆形），格子单位
-size         = 30.0          # 长度（丝状体）或半径（圆形），格子单位
-n_markers    = 30            # 拉格朗日标记点数量
-delta_kernel = "four_point"  # Delta 核函数："two_point" | "four_point"
+geometry     = "filament"    # 几何类型："filament"（丝状体）| "circle"（刚性圆柱）| "file"（外部 CSV 文件）
+x0           = 50.0          # 起点 x（丝状体）或圆心 x（圆形），格子单位；geometry="file" 时忽略
+y0           = 30.0          # 起点 y（丝状体）或圆心 y（圆形），格子单位；geometry="file" 时忽略
+size         = 30.0          # 长度（丝状体）或半径（圆形），格子单位；geometry="file" 时忽略
+n_markers    = 30            # 拉格朗日标记点数量；geometry="file" 时由文件决定，忽略此值
+mesh_file    = ""            # 外部标记点 CSV 文件路径（仅 geometry="file" 时有效；格式：每行 x, y [, z [, ds]]）
+delta_kernel = "four_point"  # Delta 核函数："two_point" | "four_point"（默认，支撑宽度 2 格）
+
+# IBM 力计算方法（对所有 IBM 体生效）：
+#   "mdf"     — 多重直接力法（默认，推荐；Luo 2007）
+#   "penalty" — 罚函数反馈力法（需配合 alpha/beta 参数）
+#   "mls"     — 移动最小二乘速度插值 + 直接力
+method  = "mdf"   # IBM 力计算方法
+alpha   = 8.0     # 罚函数法比例增益（仅 method="penalty" 时有效；推荐 2/dt²–10/dt²）
+beta    = 0.0     # 罚函数法积分增益（仅 method="penalty" 时有效；非负，可设 0.0）
+n_iter  = 3       # MDF 子迭代次数（仅 method="mdf" 时有效；默认 3，建议范围 2–4）
+
+# IBM 固体受力输出配置（全局默认，对所有无独立配置的 IBM 体生效）
+[ibm.force_output]
+enabled  = false          # 是否启用受力输出（默认 false）
+interval = 100            # 每隔多少步输出一次
+filename = "ibm_force"    # CSV 文件名前缀（不含扩展名）
+
+# 多体 IBM（[[ibm.bodies]]）：若本列表非空，则以此为准，顶层单体字段被忽略。
+# 每个条目独立描述一个 IBM 固体体；method/alpha/beta/n_iter/force_output 默认继承顶层设置，可在此处覆盖。
+# [[ibm.bodies]]
+# geometry   = "circle"
+# x0         = 50.0
+# y0         = 50.0
+# size       = 10.0
+# n_markers  = 40
+# label      = "cylinder_1"
+# method     = "mdf"       # 可覆盖顶层 method
+# n_iter     = 3           # 可覆盖顶层 n_iter
+# [ibm.bodies.force_output]
+# enabled  = true
+# interval = 50
+# filename = "ibm_force_body1"
 
 # -----------------------------------------------------------------------------
 # [output] 输出控制
 # -----------------------------------------------------------------------------
 [output]
-write_interval    = 500              # 每隔多少步写出一次流场快照（密度场 ρ、速度场 ux/uy）
-directory         = "output/case"   # 快照输出目录（相对路径或绝对路径均可）
-format            = "npz"           # 输出格式："npz"（NumPy 压缩，默认）| "tecplot_asc"（.dat）| "tecplot_bin"（.plt）
-plot_interval     = 2000            # 每隔多少步通过 Python FFI 生成实时云图（需 --features python-ffi 编译）
-enable_csv_monitor = false          # 是否每步向 directory/monitor.csv 追加监控量（step, time, ke）
-combine_blocks    = false           # MPI 模式下是否由 rank-0 将各分区拼合为全局场后统一写出
+write_interval     = 500              # 每隔多少步写出一次流场快照（密度场 ρ、速度场 ux/uy）
+directory          = "output/case"   # 快照输出目录（相对路径或绝对路径均可）
+format             = "npz"           # 输出格式："npz"（NumPy 压缩，默认）| "tecplot_asc"（.dat）| "tecplot_bin"（.plt）
+plot_interval      = 2000            # 每隔多少步通过 Python FFI 生成实时云图（需 --features python-ffi 编译；省略或不设置则禁用）
+enable_csv_monitor = false           # 是否每步向 directory/monitor.csv 追加监控量（step, time, ke）
+combine_blocks     = false           # MPI 模式下是否由 rank-0 将各分区拼合为全局场后统一写出
+async_io           = false           # 是否启用异步 I/O 输出线程（true = 文件写出在后台线程执行，仿真主循环不阻塞）
 
 # -----------------------------------------------------------------------------
 # [python] Python 集成
@@ -157,7 +204,8 @@ omp_num_threads = 0   # OpenMP 线程数；0 = 使用全部 CPU 核心；正整�
 #   "block"       — XY 块分解（nx_blocks × ny_blocks，1D 切片为其特例）
 #   "independent" — 每进程独立仿真，无通信（适合参数扫描）
 #   "multigrid"   — 嵌套式多重网格（框架预留）
-mode      = "block"   # 域分解模式
-nx_blocks = 1         # X 方向进程块数（默认 1）
-ny_blocks = 0         # Y 方向进程块数（0 = 自动，等于 mpirun -n N 的 N）
-nz_blocks = 1         # Z 方向进程块数（3D 扩展预留，2D 仿真设 1）
+mode         = "block"   # 域分解模式
+nx_blocks    = 1         # X 方向进程块数（默认 1）
+ny_blocks    = 0         # Y 方向进程块数（0 = 自动，等于 mpirun -n N 的 N）
+nz_blocks    = 1         # Z 方向进程块数（3D 扩展预留，2D 仿真设 1）
+ibm_halo_width = 1       # IBM 幽灵层宽度（默认 1）；使用 "four_point" delta 核且标记点靠近块边界时建议设 2

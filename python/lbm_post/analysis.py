@@ -1,19 +1,19 @@
 """
 lbm_post.analysis
 =================
-Quantitative post-processing routines for LBM+IBM+FSI simulation data.
+用于 LBM+IBM+FSI 仿真数据的定量后处理例程。
 
 Public API
 ----------
-drag_lift_coefficients()  — compute Cd and Cl on an immersed body
-compute_vorticity()       — full vorticity field (delegates to FieldSnapshot)
-compute_divergence()      — ∇·u (should be ≈ 0 for incompressible flow)
-compute_q_criterion()     — Q-criterion for vortex identification (2-D)
-monitor_point()           — extract time-series at a single grid point
-l2_error()                — L2 error between two field snapshots
-linf_error()              — L∞ error between two field snapshots
-convergence_rate()        — estimate spatial order of convergence
-compute_bulk_quantities() — volume-averaged kinetic energy, enstrophy
+drag_lift_coefficients()  — 计算沉浸体上的阻力系数 Cd 和升力系数 Cl
+compute_vorticity()       — 完整涡量场（委托给 FieldSnapshot）
+compute_divergence()      — ∇·u（不可压缩流应 ≈ 0）
+compute_q_criterion()     — 用于涡旋识别的 Q 准则（二维）
+monitor_point()           — 在单个格点提取时间序列
+l2_error()                — 两个场快照之间的 L2 误差
+linf_error()              — 两个场快照之间的 L∞ 误差
+convergence_rate()        — 估算空间收敛阶次
+compute_bulk_quantities() — 体积平均动能、拟能等统计量
 """
 
 from __future__ import annotations
@@ -45,23 +45,23 @@ __all__ = [
 
 @dataclass
 class ForceSummary:
-    """IBM force summary on the immersed body."""
+    """沉浸体上的 IBM 合力汇总。"""
     step: int
-    fx_total: float   #: total force in x-direction
-    fy_total: float   #: total force in y-direction
-    cd: Optional[float] = None   #: drag coefficient  Cd = Fx / (0.5 ρ U² D)
-    cl: Optional[float] = None   #: lift coefficient  Cl = Fy / (0.5 ρ U² D)
+    fx_total: float   #: x 方向总力
+    fy_total: float   #: y 方向总力
+    cd: Optional[float] = None   #: 阻力系数  Cd = Fx / (0.5 ρ U² D)
+    cl: Optional[float] = None   #: 升力系数  Cl = Fy / (0.5 ρ U² D)
 
 
 @dataclass
 class BulkQuantities:
-    """Volume-averaged quantities for a single snapshot."""
+    """单快照的体积平均流场统计量。"""
     step: int
-    ke: float        #: mean kinetic energy  E = 0.5 * mean(|u|²)
-    enstrophy: float #: mean enstrophy  Z = 0.5 * mean(ωz²)
-    rho_mean: float  #: volume-averaged density
-    rho_std: float   #: density standard deviation (≈ 0 for incompressible)
-    div_max: float   #: maximum |∇·u| (incompressibility residual)
+    ke: float        #: 平均动能  E = 0.5 * mean(|u|²)
+    enstrophy: float #: 平均拟能  Z = 0.5 * mean(ωz²)
+    rho_mean: float  #: 体积平均密度
+    rho_std: float   #: 密度标准差（不可压缩时 ≈ 0）
+    div_max: float   #: 最大 |∇·u|（不可压缩性残差）
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +76,18 @@ def drag_lift_coefficients(
     D_ref: float = 1.0,
 ) -> ForceSummary:
     """
-    Compute drag and lift coefficients from IBM marker forces.
+    计算 IBM 标记力的阻力系数和升力系数。
 
-    The IBM force on the fluid at each marker is ``(fx, fy) * ds``.
-    The reaction force on the body is the negative:
+    IBM 对每个标记处流体施加的力为 ``(fx, fy) * ds``。
+    物体所受反力为其负值：
         Fx = -∑ fx·ds,   Fy = -∑ fy·ds
 
     Parameters
     ----------
-    markers : Lagrangian marker snapshot with fx, fy populated
-    rho_ref : reference density
-    U_ref   : reference velocity (e.g. inlet velocity)
-    D_ref   : reference length (e.g. cylinder diameter)
+    markers : 含 fx、fy 的拉格朗日标记快照
+    rho_ref : 参考密度
+    U_ref   : 参考速度（如进口速度）
+    D_ref   : 参考长度（如圆柱直径）
 
     Returns
     -------
@@ -98,7 +98,7 @@ def drag_lift_coefficients(
                             fx_total=float("nan"),
                             fy_total=float("nan"))
 
-    # The reaction force on the body is the negative of the force on the fluid
+    # 物体所受反力是流体所受力的负值
     fx_total = -float(np.sum(markers.fx))
     fy_total = -float(np.sum(markers.fy))
 
@@ -118,14 +118,14 @@ def drag_lift_coefficients(
 
 def compute_divergence(snap: FieldSnapshot) -> np.ndarray:
     """
-    Compute the velocity divergence  ∇·u = ∂ux/∂x + ∂uy/∂y.
+    计算速度散度 ∇·u = ∂ux/∂x + ∂uy/∂y。
 
-    For a perfectly incompressible solver this should be identically zero;
-    for LBM it is proportional to the Mach number squared.
+    对于完全不可压缩求解器，此值应恒为零；
+    对于 LBM，其量级正比于马赫数的平方。
 
     Returns
     -------
-    div_u : ndarray of shape (ny, nx)
+    div_u : 形状为 (ny, nx) 的数组
     """
     dux_dx = np.gradient(snap.ux, axis=1)
     duy_dy = np.gradient(snap.uy, axis=0)
@@ -134,29 +134,30 @@ def compute_divergence(snap: FieldSnapshot) -> np.ndarray:
 
 def compute_q_criterion(snap: FieldSnapshot) -> np.ndarray:
     """
-    Compute the 2-D Q-criterion for vortex identification.
+    计算用于涡旋识别的二维 Q 准则。
 
-    In 2-D, Q = -0.5 * (∂ux/∂x · ∂uy/∂y − ∂ux/∂y · ∂uy/∂x)
-             = 0.5 * (|Ω|² − |S|²)
-    where Ω is the antisymmetric part and S is the symmetric part of ∇u.
-    Regions with Q > 0 are dominated by rotation (vortex cores).
+    二维 Q 准则定义为：
+        Q = -0.5 * (∂ux/∂x · ∂uy/∂y − ∂ux/∂y · ∂uy/∂x)
+          = 0.5 * (|Ω|² − |S|²)
+    其中 Ω 为 ∇u 的反对称部分，S 为对称部分。
+    Q > 0 的区域以旋转为主（涡核）。
 
     Returns
     -------
-    Q : ndarray of shape (ny, nx)
+    Q : 形状为 (ny, nx) 的数组
     """
     dux_dx = np.gradient(snap.ux, axis=1)
     dux_dy = np.gradient(snap.ux, axis=0)
     duy_dx = np.gradient(snap.uy, axis=1)
     duy_dy = np.gradient(snap.uy, axis=0)
 
-    # Symmetric rate-of-strain  S
+    # 对称应变率张量 S
     Sxx = dux_dx
     Sxy = 0.5 * (dux_dy + duy_dx)
     Syy = duy_dy
     S2 = Sxx**2 + 2 * Sxy**2 + Syy**2
 
-    # Antisymmetric rotation rate  Ω
+    # 反对称旋转率张量 Ω
     Oxy = 0.5 * (duy_dx - dux_dy)
     O2 = 2 * Oxy**2
 
@@ -174,18 +175,18 @@ def monitor_point(
     field: str = "ux",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract a time-series of ``field`` at the single grid point ``(xi, yj)``.
+    提取单个格点 ``(xi, yj)`` 处 ``field`` 的时间序列。
 
     Parameters
     ----------
-    snapshots : iterable of FieldSnapshot (sorted by step)
-    xi, yj    : grid indices (x-index, y-index)
-    field     : one of 'ux', 'uy', 'rho', 'magnitude', 'vorticity'
+    snapshots : FieldSnapshot 的可迭代序列（按时间步排序）
+    xi, yj    : 格点索引（x 索引，y 索引）
+    field     : 'ux'、'uy'、'rho'、'magnitude' 或 'vorticity' 之一
 
     Returns
     -------
-    steps  : 1-D int array of time-step indices
-    values : 1-D float array of field values
+    steps  : 时间步索引的一维 int 数组
+    values : 场值的一维 float 数组
     """
     steps_list: list[int] = []
     values_list: list[float] = []
@@ -215,15 +216,15 @@ def monitor_point(
 def l2_error(snap: FieldSnapshot, ref: FieldSnapshot,
              field: str = "ux") -> float:
     """
-    Compute the relative L2 error between *snap* and a reference solution.
+    计算 *snap* 与参考解之间的相对 L2 误差。
 
     ``err = ‖snap.field − ref.field‖₂ / ‖ref.field‖₂``
 
     Parameters
     ----------
-    snap  : computed snapshot
-    ref   : reference (analytic or fine-grid) snapshot
-    field : 'ux', 'uy', 'rho', or 'magnitude'
+    snap  : 计算快照
+    ref   : 参考（解析或细网格）快照
+    field : 'ux'、'uy'、'rho' 或 'magnitude'
     """
     def _get(s: FieldSnapshot) -> np.ndarray:
         if field == "magnitude":
@@ -241,7 +242,7 @@ def l2_error(snap: FieldSnapshot, ref: FieldSnapshot,
 def linf_error(snap: FieldSnapshot, ref: FieldSnapshot,
                field: str = "ux") -> float:
     """
-    Compute the relative L∞ error between *snap* and a reference solution.
+    计算 *snap* 与参考解之间的相对 L∞ 误差。
     """
     def _get(s: FieldSnapshot) -> np.ndarray:
         if field == "magnitude":
@@ -261,20 +262,20 @@ def convergence_rate(
     errors: Sequence[float],
 ) -> float:
     """
-    Estimate the spatial order of convergence via a log-log least-squares fit.
+    通过对数-对数最小二乘拟合估算空间收敛阶次。
 
     Parameters
     ----------
-    grid_spacings : Δx values (decreasing)
-    errors        : corresponding error norms
+    grid_spacings : Δx 值（递减顺序）
+    errors        : 对应的误差范数
 
     Returns
     -------
-    p : estimated convergence order  (error ∝ Δxᵖ)
+    p : 估算的收敛阶次（error ∝ Δxᵖ）
     """
     log_dx = np.log(np.array(grid_spacings, dtype=float))
     log_e  = np.log(np.array(errors, dtype=float))
-    # Least-squares slope
+    # 最小二乘斜率
     A = np.column_stack([log_dx, np.ones_like(log_dx)])
     p, _ = np.linalg.lstsq(A, log_e, rcond=None)[:2]
     return float(p[0])
@@ -286,7 +287,7 @@ def convergence_rate(
 
 def compute_bulk_quantities(snap: FieldSnapshot) -> BulkQuantities:
     """
-    Compute volume-averaged flow statistics for a snapshot.
+    计算单个快照的体积平均流场统计量。
 
     Returns
     -------

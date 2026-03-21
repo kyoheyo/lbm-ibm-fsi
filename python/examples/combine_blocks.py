@@ -53,7 +53,7 @@ def main() -> int:
     _add_python_path()
 
     parser = argparse.ArgumentParser(
-        description="将 MPI 块分解计算后各分区的 NPZ 快照合并为全局完整流场文件。",
+        description="Merge per-rank NPZ snapshots from an MPI block-decomposition run into a single global flow-field file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -61,19 +61,19 @@ def main() -> int:
         "--dir", "-d",
         required=True,
         metavar="OUTPUT_DIR",
-        help="包含 rank_0/、rank_1/ … 子目录的求解器输出目录",
+        help="Solver output directory containing rank_0/, rank_1/, ... subdirectories.",
     )
     parser.add_argument(
         "--fmt", "-f",
         default="npz",
         choices=["npz", "dat", "plt"],
-        help="输出文件格式：npz（默认）/ dat（ASCII Tecplot）/ plt（二进制 Tecplot TDV112）",
+        help="Output file format: npz (default) / dat (ASCII Tecplot) / plt (binary Tecplot TDV112).",
     )
     parser.add_argument(
         "--out", "-o",
         default=None,
         metavar="OUT_DIR",
-        help="合并文件写出目录（默认：<dir>/combined/）",
+        help="Directory to write merged files (default: <dir>/combined/).",
     )
     args = parser.parse_args()
 

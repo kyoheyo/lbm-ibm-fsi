@@ -1,16 +1,15 @@
 """
 lbm_post.bridge
 ===============
-FFI-friendly entry points called by the Rust orchestrator via pyo3.
+供 Rust 编排器通过 pyo3 调用的 FFI 接口入口。
 
-All functions accept plain Python scalars / lists rather than high-level
-dataclasses so that they remain easy to call from Rust without marshalling
-complex objects.  The functions remain independently usable from pure
-Python code as well.
+所有函数接受普通 Python 标量/列表而非高层数据类，
+以便无需复杂对象编组即可从 Rust 调用。
+这些函数同样可直接从纯 Python 代码中使用。
 
 Public API
 ----------
-plot_field_raw()  — reshape raw flat arrays into a FieldSnapshot and save a PNG
+plot_field_raw()  — 将原始平坦数组重塑为 FieldSnapshot 并保存为 PNG
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from .plot import (
 
 __all__ = ["plot_field_raw"]
 
-# Map field name → plot function
+# 字段名 → 绘图函数的映射
 _PLOTTERS = {
     "velocity_magnitude": plot_velocity_magnitude,
     "vorticity":          plot_vorticity,
@@ -52,28 +51,27 @@ def plot_field_raw(
     field: str = "velocity_magnitude",
 ) -> None:
     """
-    Render a contour PNG from raw flat field arrays and save it to disk.
+    从原始平坦场数组渲染等值线 PNG 并保存到磁盘。
 
-    This is the primary entry point for the Rust pyo3 FFI bridge; it can
-    also be called directly from Python.
+    这是 Rust pyo3 FFI 桥接的主要入口；也可直接从 Python 调用。
 
-    No intermediate ``.npz`` file is created — the arrays are reshaped into
-    NumPy 2-D arrays in-process.
+    不会创建中间 ``.npz`` 文件——数组在进程内直接重塑为
+    NumPy 二维数组。
 
     Parameters
     ----------
-    rho, ux, uy : flat row-major sequences of length ``nx * ny``
-    nx, ny      : grid dimensions
-    step        : time-step index (used in file name and title)
-    time        : physical time (used as an axis label)
-    out_dir     : output directory; created automatically if absent
-    field       : which field to plot:
+    rho, ux, uy : 长度为 ``nx * ny`` 的行主序平坦序列
+    nx, ny      : 网格维度
+    step        : 时间步索引（用于文件名和标题）
+    time        : 物理时间（用于坐标轴标签）
+    out_dir     : 输出目录；不存在时自动创建
+    field       : 要绘制的字段：
                   ``"velocity_magnitude"`` | ``"vorticity"`` |
                   ``"pressure"``           | ``"streamlines"``
 
     Output
     ------
-    Saves ``<out_dir>/<field>_<NNNNNN>.png``.
+    保存至 ``<out_dir>/<field>_<NNNNNN>.png``。
     """
     rho_arr = np.asarray(rho, dtype=np.float64).reshape(ny, nx)
     ux_arr  = np.asarray(ux,  dtype=np.float64).reshape(ny, nx)

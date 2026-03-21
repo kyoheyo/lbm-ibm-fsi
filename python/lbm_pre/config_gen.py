@@ -1,18 +1,18 @@
 """
 lbm_pre.config_gen
 ==================
-Generate solver TOML configuration files from Python, avoiding manual
-editing and enabling parameter sweeps.
+通过 Python 生成求解器 TOML 配置文件，避免手动编辑，
+并支持参数扫描。
 
 Public API
 ----------
-SimConfig      — dataclass mirroring the TOML [simulation] section
-FluidConfig    — dataclass mirroring the TOML [fluid] section
-StructureConfig— dataclass mirroring the TOML [structure] section
-IbmConfig      — dataclass mirroring the TOML [ibm] section
-OutputConfig   — dataclass mirroring the TOML [output] section
-SolverConfig   — top-level container; write() → TOML file
-reynolds_to_nu()— compute lattice viscosity from Re and velocity
+SimConfig      — 与 TOML [simulation] 段对应的数据类
+FluidConfig    — 与 TOML [fluid] 段对应的数据类
+StructureConfig— 与 TOML [structure] 段对应的数据类
+IbmConfig      — 与 TOML [ibm] 段对应的数据类
+OutputConfig   — 与 TOML [output] 段对应的数据类
+SolverConfig   — 顶层容器；write() → TOML 文件
+reynolds_to_nu()— 由 Re 和速度计算格子粘度
 """
 
 from __future__ import annotations
@@ -42,10 +42,10 @@ __all__ = [
 
 def reynolds_to_nu(Re: float, U: float, L: float) -> float:
     """
-    Return the kinematic viscosity ν = U·L / Re.
+    返回运动粘度 ν = U·L / Re。
 
-    For LBM stability we need  0.5 < τ < 2  ⟹  0.05 < ν < 0.5.
-    A warning is printed when ν is outside the stable range.
+    LBM 稳定性要求  0.5 < τ < 2  ⟹  0.05 < ν < 0.5。
+    当 ν 超出稳定范围时打印警告。
     """
     nu = U * L / Re
     if not (0.05 <= nu <= 0.5):
@@ -134,16 +134,16 @@ class SolverConfig:
     # ------------------------------------------------------------------
     def write(self, path: str | Path, *, comment: str = "") -> Path:
         """
-        Serialise to a TOML file understood by the Rust orchestrator.
+        序列化为 Rust 编排器可读的 TOML 文件。
 
         Parameters
         ----------
-        path    : output file path
-        comment : optional comment line added at the top of the file
+        path    : 输出文件路径
+        comment : 写入文件顶部的可选注释行
 
         Returns
         -------
-        Path of the written file.
+        已写入文件的 Path。
         """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -172,13 +172,13 @@ class SolverConfig:
                            Re: float = 100.0,
                            U_lid: float = 0.1) -> "SolverConfig":
         """
-        Create a lid-driven cavity configuration.
+        创建顶盖驱动方腔配置。
 
         Parameters
         ----------
-        nx, ny  : grid resolution
-        Re      : Reynolds number  (Re = U·L / ν, L = ny)
-        U_lid   : lid velocity in lattice units
+        nx, ny  : 网格分辨率
+        Re      : Reynolds 数（Re = U·L / ν，L = ny）
+        U_lid   : 格子单位的顶盖速度
         """
         nu = reynolds_to_nu(Re, U_lid, float(ny))
         cfg = cls(
@@ -203,9 +203,9 @@ class SolverConfig:
                               Re: float = 100.0,
                               U_inlet: float = 0.05) -> "SolverConfig":
         """
-        Create a flow-around-cylinder (von Kármán vortex street) configuration.
+        创建绕圆柱流（冯·卡门涡街）配置。
 
-        The cylinder is centred at (nx/4, ny/2) with radius ny/8.
+        圆柱圆心位于 (nx/4, ny/2)，半径为 ny/8。
         """
         nu = reynolds_to_nu(Re, U_inlet, float(ny // 4))  # D = ny/4
         r = ny // 8
@@ -241,18 +241,17 @@ class SolverConfig:
                                  rho_in: float = 1.005,
                                  rho_out: float = 1.0) -> "SolverConfig":
         """
-        Create a pressure-driven channel (Poiseuille) flow configuration.
+        创建压力驱动通道（Poiseuille）流配置。
 
-        The pressure difference between the west (inlet) and east (outlet) faces
-        drives the flow.  At steady state the velocity profile converges to the
-        parabolic Poiseuille solution  u(y) = ΔP·y·(H−y) / (2ν·ρ).
+        西（进口）面与东（出口）面之间的压力差驱动流动。
+        稳态时速度剖面收敛至抛物线 Poiseuille 解 u(y) = ΔP·y·(H−y) / (2ν·ρ)。
 
         Parameters
         ----------
-        nx, ny   : grid resolution (ny is the channel height H)
-        nu       : kinematic viscosity in lattice units
-        rho_in   : inlet density  (higher pressure side)
-        rho_out  : outlet density (reference pressure side)
+        nx, ny   : 网格分辨率（ny 为通道高度 H）
+        nu       : 格子单位的运动粘度
+        rho_in   : 进口密度（高压侧）
+        rho_out  : 出口密度（参考压力侧）
         """
         cfg = cls(
             simulation=SimConfig(n_steps=20000, collision_model="MRT"),
@@ -277,18 +276,16 @@ class SolverConfig:
                                 Re: float = 30.0,
                                 U_inlet: float = 0.05) -> "SolverConfig":
         """
-        Create a velocity-inlet channel flow configuration.
+        创建速度进口通道流配置。
 
-        A uniform velocity is prescribed at the west face (inlet), the east
-        face uses a fully-developed (zero-gradient) outflow condition, and the
-        south/north faces are no-slip solid walls.  The flow develops from the
-        uniform inlet profile into the Poiseuille parabolic profile downstream.
+        西面（进口）规定均匀速度，东面采用充分发展（零梯度）出流边界条件，
+        南北面为无滑移固壁。流动从均匀进口剖面向下游发展为 Poiseuille 抛物线剖面。
 
         Parameters
         ----------
-        nx, ny    : grid resolution (ny is the channel height H)
-        Re        : Reynolds number  (Re = U·H / ν)
-        U_inlet   : inlet velocity in lattice units
+        nx, ny    : 网格分辨率（ny 为通道高度 H）
+        Re        : Reynolds 数（Re = U·H / ν）
+        U_inlet   : 格子单位的进口速度
         """
         nu = reynolds_to_nu(Re, U_inlet, float(ny))
         cfg = cls(
@@ -313,21 +310,18 @@ class SolverConfig:
                                     Re: float = 80.0,
                                     U_inlet: float = 0.05) -> "SolverConfig":
         """
-        Create a velocity-inlet / pressure-outlet configuration with free-outlet
-        walls on the south and north faces.
+        创建速度进口/压力出口配置，南北面采用自由出口边界条件。
 
-        Useful for open-domain or jet-like problems where fluid may leave through
-        the top and bottom boundaries.  Because the south and north faces use
-        ``free_outlet`` (a non-solid-wall BC), the corner nodes (SW/SE/NW/NE)
-        whose two adjacent faces are both non-solid-wall BCs will automatically
-        skip the corner bounce-back correction, avoiding an unphysical u = 0
-        constraint at those open corners.
+        适用于流体可从顶部和底部边界流出的开放域或射流类问题。
+        由于南北面使用 ``free_outlet``（非固壁 BC），相邻两面均为
+        非固壁 BC 的角节点（SW/SE/NW/NE）将自动跳过角落反弹修正，
+        避免在开放角落施加非物理的 u = 0 约束。
 
         Parameters
         ----------
-        nx, ny    : grid resolution
-        Re        : Reynolds number  (Re = U·H / ν, H = ny)
-        U_inlet   : inlet velocity in lattice units
+        nx, ny    : 网格分辨率
+        Re        : Reynolds 数（Re = U·H / ν，H = ny）
+        U_inlet   : 格子单位的进口速度
         """
         nu = reynolds_to_nu(Re, U_inlet, float(ny))
         cfg = cls(
@@ -353,7 +347,7 @@ class SolverConfig:
                      Re: float = 200.0,
                      U_inlet: float = 0.05) -> "SolverConfig":
         """
-        Create a flexible-filament FSI configuration.
+        创建柔性细丝 FSI 配置。
         """
         nu = reynolds_to_nu(Re, U_inlet, float(ny))
         cfg = cls(
@@ -394,13 +388,13 @@ class SolverConfig:
 
 def load_config(path: str | Path) -> dict:
     """
-    Load a solver TOML config file and return it as a plain dict.
+    加载求解器 TOML 配置文件并以普通 dict 返回。
 
-    Uses the stdlib ``tomllib`` module (Python ≥ 3.11).
+    使用标准库 ``tomllib`` 模块（Python ≥ 3.11）。
 
     Parameters
     ----------
-    path : path to the TOML file
+    path : TOML 文件路径
 
     Returns
     -------
