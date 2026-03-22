@@ -229,8 +229,19 @@ pub fn setup_solid_bodies(
                 }
             }
         }
+
+        // --- 逐体反弹方案：以局部 body.bc_type 为优先，缺省继承全局 ---
+        let effective_bc_str = body.bc_type.as_deref()
+            .unwrap_or(&cfg.solid.bc_type);
+        let body_bc_mode = match effective_bc_str.to_lowercase().as_str() {
+            "bounce_back" | "bb"                             => 1_i32,
+            "interpolated_bounce_back" | "ibb" | "bouzidi"  => 2_i32,
+            _                                                => 0_i32,
+        };
+        lbm_bindings::assign_solid_bc_unmarked(grid, body_bc_mode);
     }
 
+    // 全局方案：供所有 solid_bc_node==0 的节点（即未被逐体覆盖的节点）使用。
     let bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
         "bounce_back"                                    => 1_i32,
         "interpolated_bounce_back" | "ibb" | "bouzidi"  => 2_i32,

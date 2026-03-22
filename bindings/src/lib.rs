@@ -233,6 +233,10 @@ mod ffi {
                                               filename: *const c_char);
         /// 设置固体反弹方案：0=None, 1=BB, 2=IBB。
         pub fn lbm_solver_set_solid_bc(s: *mut SolverHandle, bc_mode: c_int);
+        /// 将当前所有已标记固体节点（solid==1 且 solid_bc_node==0）的逐节点反弹方案设为 bc_mode。
+        /// 应在每个固体体 lbm_mark_solid_*() 调用后立即调用，以实现逐体方案分配。
+        /// bc_mode: 1=BB, 2=IBB, 0=无操作。
+        pub fn lbm_grid_assign_solid_bc_unmarked(g: *mut LatticeGridHandle, bc_mode: c_int);
         /// 用动量交换法（MEA）计算固体受力。
         /// 调用时机：apply_solid_bounce_back()/apply_solid_ibb() 之后（即 step() 之后）。
         /// phys_i0/j0/i1/j1：本进程物理区域范围（非 MPI 时传 0/0/nx-1/ny-1）。
@@ -1014,6 +1018,21 @@ pub fn mark_solid_from_mesh_file(grid: &mut LbmGrid, filename: &str) {
 /// | `2` | `InterpolatedBounceBack` | Bouzidi 插值反弹（2001；精确 q，二阶精度） |
 pub fn mark_solid_bc(solver: &mut LbmSolver, bc_mode: i32) {
     unsafe { ffi::lbm_solver_set_solid_bc(solver.ptr, bc_mode) };
+}
+
+/// 将当前所有已标记固体节点（`solid==1` 且 `solid_bc_node==0`）的逐节点反弹方案设为 `bc_mode`。
+///
+/// 应在每个固体体 `mark_solid_*()` 调用后立即调用，以实现多固体混合 BC 场景下的逐体方案分配。
+/// 先调用 `mark_solid_*()` 标记一个固体体，再调用本函数写入该体的方案；
+/// 下一个固体体标记后再次调用，则只会填充新标记节点（`solid_bc_node==0` 的节点）。
+///
+/// | `bc_mode` | 方案 |
+/// |-----------|------|
+/// | `0` | 无操作（节点保留 0，运行时以全局 `set_solid_bc_type` 为准） |
+/// | `1` | BounceBack（半步长反弹） |
+/// | `2` | InterpolatedBounceBack（Bouzidi 插值反弹） |
+pub fn assign_solid_bc_unmarked(grid: &mut LbmGrid, bc_mode: i32) {
+    unsafe { ffi::lbm_grid_assign_solid_bc_unmarked(grid.ptr, bc_mode as std::os::raw::c_int) };
 }
 
 /// 用动量交换法（Momentum Exchange Algorithm，MEA）计算固体所受的合力。

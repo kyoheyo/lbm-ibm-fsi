@@ -307,6 +307,12 @@ pub struct SolidBodyConfig {
     /// 可选标签（用于区分多固体输出；若为空则自动编号）
     #[serde(default)]
     pub label: String,
+    /// 该固体体的反弹方案（可选；覆盖顶层 `[solid].bc_type` 的全局设置）：
+    ///   `"bounce_back"` / `"bb"`                    — 半步长反弹（一阶）
+    ///   `"interpolated_bounce_back"` / `"ibb"` / `"bouzidi"` — Bouzidi 插值反弹（二阶）
+    /// 未设置时继承全局 `[solid].bc_type`。
+    #[serde(default)]
+    pub bc_type: Option<String>,
 }
 
 /// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
