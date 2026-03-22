@@ -242,10 +242,11 @@ void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp)
         std::vector<double> send_buf(col_size), recv_buf(col_size);
 
         for (int k = 0; k < n_gh; ++k) {
-            // 向西发送（西方向：发送我的最西 n_ghost 物理列中的第 k 列）
+            // 发送最西第 k 物理列 i=px0+k → 西邻存入其东幽灵列 k
+            // 接收东邻的最西第 k 物理列 i=px0+k → 存入本进程东幽灵列 px0+lnx+k
             for (int j = 0; j < gny_all; ++j) {
                 const double* src = &g.f[static_cast<std::size_t>(
-                    g.idx(px0 + lnx - n_gh + k, j)) * Q];
+                    g.idx(px0 + k, j)) * Q];
                 for (int a = 0; a < Q; ++a) send_buf[j*Q+a] = src[a];
             }
             MPI_Sendrecv(
@@ -261,10 +262,11 @@ void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp)
                 }
             }
 
-            // 向东发送（东方向：发送我的最东 n_ghost 物理列中的第 k 列）
+            // 发送最东第 k 物理列 i=px0+lnx-n_gh+k → 东邻存入其西幽灵列 k
+            // 接收西邻的最东第 k 物理列 → 存入本进程西幽灵列 k
             for (int j = 0; j < gny_all; ++j) {
                 const double* src = &g.f[static_cast<std::size_t>(
-                    g.idx(px0 + k, j)) * Q];
+                    g.idx(px0 + lnx - n_gh + k, j)) * Q];
                 for (int a = 0; a < Q; ++a) send_buf[j*Q+a] = src[a];
             }
             MPI_Sendrecv(
@@ -565,10 +567,11 @@ void halo_exchange_u_2d(LatticeGrid& grid, const MpiDecomp2D& decomp)
         std::vector<double> send_buf(col_size), recv_buf(col_size, 0.0);
 
         for (int k = 0; k < n_gh; ++k) {
-            // 向西发送我的近西端第 k 物理列，从东邻接收填入东幽灵列 k
+            // 发送最西第 k 物理列 i=px0+k → 西邻存入其东幽灵列 k
+            // 接收东邻的最西第 k 物理列 → 存入本进程东幽灵列 px0+lnx+k
             for (int j = 0; j < gny; ++j) {
                 const double* s = &grid.u[static_cast<std::size_t>(
-                    grid.idx(px0 + lnx - n_gh + k, j)) * d];
+                    grid.idx(px0 + k, j)) * d];
                 for (int c = 0; c < d; ++c) send_buf[j*d+c] = s[c];
             }
             MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2200 + k,
@@ -582,10 +585,11 @@ void halo_exchange_u_2d(LatticeGrid& grid, const MpiDecomp2D& decomp)
                 }
             }
 
-            // 向东发送我的近东端第 k 物理列，从西邻接收填入西幽灵列 k
+            // 发送最东第 k 物理列 i=px0+lnx-n_gh+k → 东邻存入其西幽灵列 k
+            // 接收西邻的最东第 k 物理列 → 存入本进程西幽灵列 k
             for (int j = 0; j < gny; ++j) {
                 const double* s = &grid.u[static_cast<std::size_t>(
-                    grid.idx(px0 + k, j)) * d];
+                    grid.idx(px0 + lnx - n_gh + k, j)) * d];
                 for (int c = 0; c < d; ++c) send_buf[j*d+c] = s[c];
             }
             MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2300 + k,
