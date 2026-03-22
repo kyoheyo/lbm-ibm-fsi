@@ -97,6 +97,7 @@ cx     = 50.0         # 圆心 x 坐标（格子单位）
 cy     = 50.0         # 圆心 y 坐标（格子单位）
 radius = 10.0         # 半径（格子单位）
 label  = ""           # 可选标签（用于区分多固体输出；空 = 自动编号）
+# bc_type = "interpolated_bounce_back"  # 可选：覆盖全局 [solid].bc_type（逐体方案）
 
 # [[solid.bodies]]
 # shape = "rectangle"
@@ -104,6 +105,7 @@ label  = ""           # 可选标签（用于区分多固体输出；空 = 自�
 # j0    = 20    # 西南角 y（格子单位）
 # i1    = 30    # 东北角 x（格子单位）
 # j1    = 40    # 东北角 y（格子单位）
+# bc_type = "bounce_back"  # 可选：此体单独使用 BB，其他体继承全局方案
 
 # [[solid.bodies]]
 # shape     = "mesh"
