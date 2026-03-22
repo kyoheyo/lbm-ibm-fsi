@@ -125,13 +125,14 @@ static void uniform_partition(int total, int nprocs, int r, int& local_n, int& s
 //   全局网格被均匀切分为 px × py 块
 //   px * py == nprocs（进程总数），否则抛出 std::invalid_argument
 // ---------------------------------------------------------------------------
-MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
+MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py, int in_n_ghost)
 {
     MpiDecomp2D d;
     d.global_nx = gnx;
     d.global_ny = gny;
     d.px        = in_px;
     d.py        = in_py;
+    d.n_ghost   = (in_n_ghost >= 1) ? in_n_ghost : 1;
 
     MPI_Comm_rank(MPI_COMM_WORLD, &d.rank);
     MPI_Comm_size(MPI_COMM_WORLD, &d.nprocs);
@@ -162,111 +163,120 @@ MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
 // ---------------------------------------------------------------------------
 // 二维模式：D2Q9 幽灵层交换
 //
-// 本地网格布局（phys_x0 = 0 or 1，phys_y0 = 0 or 1）：
-//   j=0              : 南幽灵行（row_rank>0 时存在）
-//   j=phys_y0..+lny-1: 物理行
-//   j=phys_y0+lny    : 北幽灵行（row_rank<py-1 时存在）
-//   i=0              : 西幽灵列（col_rank>0 时存在）
-//   i=phys_x0..+lnx-1: 物理列
-//   i=phys_x0+lnx    : 东幽灵列（col_rank<px-1 时存在）
+// 本地网格布局（phys_x0 = 0 或 n_ghost，phys_y0 = 0 或 n_ghost）：
+//   j=0..n_ghost-1        : 南幽灵行（row_rank>0 时存在，共 n_ghost 行）
+//   j=phys_y0..+lny-1     : 物理行
+//   j=phys_y0+lny..+n_ghost-1 : 北幽灵行（row_rank<py-1 时存在，共 n_ghost 行）
+//   i=0..n_ghost-1        : 西幽灵列（col_rank>0 时存在，共 n_ghost 列）
+//   i=phys_x0..+lnx-1     : 物理列
+//   i=phys_x0+lnx..+n_ghost-1 : 东幽灵列（col_rank<px-1 时存在，共 n_ghost 列）
 //
-// 交换顺序（避免死锁）：先南北后东西，均使用 MPI_Sendrecv。
+// 交换 n_ghost 层（每层一次 Sendrecv）：先南北后东西。
+// 南北方向第 k 层（k=0..n_ghost-1）：
+//   - 发送物理行 j=phys_y0+lny-n_ghost+k → 北邻，填入北邻南幽灵第 k 行 j=k
+//   - 接收南邻同一层 → 存入本进程南幽灵第 k 行 j=k
+//   - 发送物理行 j=phys_y0+k → 南邻，填入南邻北幽灵第 k 行 j=phys_y0+lny+k
+//   - 接收北邻同一层 → 存入本进程北幽灵第 k 行 j=phys_y0+lny+k
 // ---------------------------------------------------------------------------
 void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp)
 {
     if (decomp.nprocs == 1) return;
 
-    const int Q    = d2q9::Q;      // = 9
-    const int gnx  = g.nx;         // 含幽灵层的本地 nx
+    const int Q       = d2q9::Q;      // = 9
+    const int gnx     = g.nx;         // 含幽灵层的本地 nx
     const int lnx  = decomp.local_nx;
     const int lny  = decomp.local_ny;
     const int px0  = decomp.phys_x0();   // 物理区域在 x 方向的偏移
     const int py0  = decomp.phys_y0();   // 物理区域在 y 方向的偏移
+    const int n_gh = decomp.n_ghost;     // 每侧幽灵层数
 
     const int row_size = gnx * Q;   // 一整行（含幽灵列）所有节点的 f 数据量
 
     MPI_Status st;
 
     // -----------------------------------------------------------------------
-    // 南北方向交换（整行，row_size 个 double）
+    // 南北方向交换（n_ghost 层，每层一次 Sendrecv）
+    //
+    // 第 k 层（k = 0..n_ghost-1）：
+    //   南：发送物理行 j=py0+lny-n_ghost+k → 北邻幽灵行 j=k
+    //       接收南邻物理行 j=py0+lny-n_ghost+k（南邻视角）→ 本进程幽灵行 j=k
+    //   北：发送物理行 j=py0+k → 南邻幽灵行 j=py0+lny+k
+    //       接收北邻物理行 j=py0+k（北邻视角）→ 本进程幽灵行 j=py0+lny+k
     // -----------------------------------------------------------------------
-    {
-        // 顶物理行 j = py0 + lny - 1
-        double* top_phys    = &g.f[static_cast<std::size_t>(g.idx(0, py0 + lny - 1)) * Q];
-        // 底物理行 j = py0
-        double* bot_phys    = &g.f[static_cast<std::size_t>(g.idx(0, py0))            * Q];
-        // 南幽灵行 j = 0（仅 row_rank>0 时存在，否则 Sendrecv 到 MPI_PROC_NULL 为 no-op）
-        double* south_ghost = &g.f[static_cast<std::size_t>(g.idx(0, 0))              * Q];
-        // 北幽灵行 j = py0 + lny（仅 row_rank<py-1 时存在）
-        double* north_ghost = &g.f[static_cast<std::size_t>(g.idx(0, py0 + lny))      * Q];
-
-        // 向北邻发送顶物理行，从南邻接收南幽灵行
+    for (int k = 0; k < n_gh; ++k) {
+        double* send_to_north = &g.f[static_cast<std::size_t>(
+            g.idx(0, py0 + lny - n_gh + k)) * Q];
+        double* south_ghost_k = &g.f[static_cast<std::size_t>(
+            g.idx(0, k)) * Q];
+        // 向北邻发送近北端第 k 层物理行，从南邻接收对应层数据填入南幽灵行 k
         MPI_Sendrecv(
-            top_phys,    row_size, MPI_DOUBLE, decomp.rank_north, 10,
-            south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 10,
+            send_to_north, row_size, MPI_DOUBLE, decomp.rank_north, 10 + k,
+            south_ghost_k, row_size, MPI_DOUBLE, decomp.rank_south, 10 + k,
             MPI_COMM_WORLD, &st
         );
-        // 向南邻发送底物理行，从北邻接收北幽灵行
+
+        double* send_to_south = &g.f[static_cast<std::size_t>(
+            g.idx(0, py0 + k)) * Q];
+        double* north_ghost_k = &g.f[static_cast<std::size_t>(
+            g.idx(0, py0 + lny + k)) * Q];
+        // 向南邻发送近南端第 k 层物理行，从北邻接收对应层数据填入北幽灵行 k
         MPI_Sendrecv(
-            bot_phys,    row_size, MPI_DOUBLE, decomp.rank_south, 11,
-            north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 11,
+            send_to_south, row_size, MPI_DOUBLE, decomp.rank_south, 20 + k,
+            north_ghost_k, row_size, MPI_DOUBLE, decomp.rank_north, 20 + k,
             MPI_COMM_WORLD, &st
         );
     }
 
     // -----------------------------------------------------------------------
-    // 东西方向交换（需将列数据打包到连续缓冲区，因列在行主序中不连续）
+    // 东西方向交换（n_ghost 列，每列一次 Sendrecv，需打包非连续列数据）
+    //
+    // 第 k 列（k = 0..n_ghost-1）：
+    //   西：发送物理列 i=px0+k → 东邻幽灵列 i=px0+lnx+k（东邻视角幽灵列 k+1）
+    //       接收西邻物理列 i=px0+lnx-n_ghost+k → 本进程幽灵列 i=k
+    //   东：发送物理列 i=px0+lnx-n_ghost+k → 西邻幽灵列（西邻视角）
+    //       接收东邻物理列 i=px0+k → 本进程幽灵列 i=px0+lnx+k
     // -----------------------------------------------------------------------
     {
-        // 缓冲区大小：一列 g.ny 行 × Q 方向
-        const int gny_all = g.ny;
+        const int gny_all  = g.ny;
         const int col_size = gny_all * Q;
-        std::vector<double> send_west(col_size), recv_west(col_size);
-        std::vector<double> send_east(col_size), recv_east(col_size);
+        std::vector<double> send_buf(col_size), recv_buf(col_size);
 
-        // 打包最西物理列（i=px0）到 send_west
-        for (int j = 0; j < gny_all; ++j) {
-            const double* src = &g.f[static_cast<std::size_t>(g.idx(px0, j)) * Q];
-            for (int a = 0; a < Q; ++a) {
-                send_west[j * Q + a] = src[a];
-            }
-        }
-        // 打包最东物理列（i=px0+lnx-1）到 send_east
-        for (int j = 0; j < gny_all; ++j) {
-            const double* src = &g.f[static_cast<std::size_t>(g.idx(px0 + lnx - 1, j)) * Q];
-            for (int a = 0; a < Q; ++a) {
-                send_east[j * Q + a] = src[a];
-            }
-        }
-
-        // 向西邻发送最西物理列，从东邻接收东幽灵列
-        MPI_Sendrecv(
-            send_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 20,
-            recv_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 20,
-            MPI_COMM_WORLD, &st
-        );
-        // 向东邻发送最东物理列，从西邻接收西幽灵列
-        MPI_Sendrecv(
-            send_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 21,
-            recv_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 21,
-            MPI_COMM_WORLD, &st
-        );
-
-        // 解包西幽灵列（i=0，仅 col_rank>0 时有意义）
-        if (decomp.has_west_ghost()) {
+        for (int k = 0; k < n_gh; ++k) {
+            // 向西发送（西方向：发送我的最西 n_ghost 物理列中的第 k 列）
             for (int j = 0; j < gny_all; ++j) {
-                double* dst = &g.f[static_cast<std::size_t>(g.idx(0, j)) * Q];
-                for (int a = 0; a < Q; ++a) {
-                    dst[a] = recv_west[j * Q + a];
+                const double* src = &g.f[static_cast<std::size_t>(
+                    g.idx(px0 + lnx - n_gh + k, j)) * Q];
+                for (int a = 0; a < Q; ++a) send_buf[j*Q+a] = src[a];
+            }
+            MPI_Sendrecv(
+                send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 30 + k,
+                recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 30 + k,
+                MPI_COMM_WORLD, &st
+            );
+            if (decomp.has_east_ghost()) {
+                for (int j = 0; j < gny_all; ++j) {
+                    double* dst = &g.f[static_cast<std::size_t>(
+                        g.idx(px0 + lnx + k, j)) * Q];
+                    for (int a = 0; a < Q; ++a) dst[a] = recv_buf[j*Q+a];
                 }
             }
-        }
-        // 解包东幽灵列（i=px0+lnx，仅 col_rank<px-1 时有意义）
-        if (decomp.has_east_ghost()) {
+
+            // 向东发送（东方向：发送我的最东 n_ghost 物理列中的第 k 列）
             for (int j = 0; j < gny_all; ++j) {
-                double* dst = &g.f[static_cast<std::size_t>(g.idx(px0 + lnx, j)) * Q];
-                for (int a = 0; a < Q; ++a) {
-                    dst[a] = recv_east[j * Q + a];
+                const double* src = &g.f[static_cast<std::size_t>(
+                    g.idx(px0 + k, j)) * Q];
+                for (int a = 0; a < Q; ++a) send_buf[j*Q+a] = src[a];
+            }
+            MPI_Sendrecv(
+                send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 40 + k,
+                recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 40 + k,
+                MPI_COMM_WORLD, &st
+            );
+            if (decomp.has_west_ghost()) {
+                for (int j = 0; j < gny_all; ++j) {
+                    double* dst = &g.f[static_cast<std::size_t>(
+                        g.idx(k, j)) * Q];
+                    for (int a = 0; a < Q; ++a) dst[a] = recv_buf[j*Q+a];
                 }
             }
         }
@@ -507,7 +517,7 @@ MpiDecomp3D MpiDecomp3D::create(int gnx, int gny, int gnz,
 }
 
 // ---------------------------------------------------------------------------
-// 宏観速度場幽霊層交換（2D 分区、MPI 启用时）
+// 宏观速度场幽灵层交换（2D 分区，n_ghost 层，MPI 启用时）
 // 见 mpi_decomp.hpp 中的文档注释。
 // ---------------------------------------------------------------------------
 void halo_exchange_u_2d(LatticeGrid& grid, const MpiDecomp2D& decomp)
@@ -521,53 +531,72 @@ void halo_exchange_u_2d(LatticeGrid& grid, const MpiDecomp2D& decomp)
     const int lny  = decomp.local_ny;
     const int px0  = decomp.phys_x0();
     const int py0  = decomp.phys_y0();
+    const int n_gh = decomp.n_ghost;
 
     MPI_Status st;
 
-    // S/N 行交换（行连续，直接发送）
+    // S/N 行交换（n_ghost 层，行连续，直接发送）
     {
         const int row_size = gnx * d;
-        double* top_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny - 1)) * d];
-        double* bot_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0))            * d];
-        double* south_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, 0))              * d];
-        double* north_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny))      * d];
+        for (int k = 0; k < n_gh; ++k) {
+            // 向北邻发送近北端第 k 层物理行，从南邻接收填入南幽灵行 k
+            double* send_n = &grid.u[static_cast<std::size_t>(
+                grid.idx(0, py0 + lny - n_gh + k)) * d];
+            double* sg_k   = &grid.u[static_cast<std::size_t>(
+                grid.idx(0, k)) * d];
+            MPI_Sendrecv(send_n, row_size, MPI_DOUBLE, decomp.rank_north, 2000 + k,
+                         sg_k,   row_size, MPI_DOUBLE, decomp.rank_south, 2000 + k,
+                         MPI_COMM_WORLD, &st);
 
-        MPI_Sendrecv(top_phys,    row_size, MPI_DOUBLE, decomp.rank_north, 2000,
-                     south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 2000,
-                     MPI_COMM_WORLD, &st);
-        MPI_Sendrecv(bot_phys,    row_size, MPI_DOUBLE, decomp.rank_south, 2001,
-                     north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 2001,
-                     MPI_COMM_WORLD, &st);
+            // 向南邻发送近南端第 k 层物理行，从北邻接收填入北幽灵行 k
+            double* send_s = &grid.u[static_cast<std::size_t>(
+                grid.idx(0, py0 + k)) * d];
+            double* ng_k   = &grid.u[static_cast<std::size_t>(
+                grid.idx(0, py0 + lny + k)) * d];
+            MPI_Sendrecv(send_s, row_size, MPI_DOUBLE, decomp.rank_south, 2100 + k,
+                         ng_k,   row_size, MPI_DOUBLE, decomp.rank_north, 2100 + k,
+                         MPI_COMM_WORLD, &st);
+        }
     }
 
-    // W/E 列交换（列不连续，需打包）
+    // W/E 列交换（n_ghost 列，列不连续，需打包）
     if (decomp.has_west_ghost() || decomp.has_east_ghost()) {
         const int col_size = gny * d;
-        std::vector<double> send_west(col_size), recv_west(col_size, 0.0);
-        std::vector<double> send_east(col_size), recv_east(col_size, 0.0);
+        std::vector<double> send_buf(col_size), recv_buf(col_size, 0.0);
 
-        for (int j = 0; j < gny; ++j) {
-            const double* sw = &grid.u[static_cast<std::size_t>(grid.idx(px0,           j)) * d];
-            const double* se = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx - 1, j)) * d];
-            for (int c = 0; c < d; ++c) { send_west[j*d+c] = sw[c]; send_east[j*d+c] = se[c]; }
-        }
-        MPI_Sendrecv(send_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2002,
-                     recv_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2002,
-                     MPI_COMM_WORLD, &st);
-        MPI_Sendrecv(send_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2003,
-                     recv_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2003,
-                     MPI_COMM_WORLD, &st);
-
-        if (decomp.has_west_ghost()) {
+        for (int k = 0; k < n_gh; ++k) {
+            // 向西发送我的近西端第 k 物理列，从东邻接收填入东幽灵列 k
             for (int j = 0; j < gny; ++j) {
-                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(0, j)) * d];
-                for (int c = 0; c < d; ++c) dst[c] = recv_west[j*d+c];
+                const double* s = &grid.u[static_cast<std::size_t>(
+                    grid.idx(px0 + lnx - n_gh + k, j)) * d];
+                for (int c = 0; c < d; ++c) send_buf[j*d+c] = s[c];
             }
-        }
-        if (decomp.has_east_ghost()) {
+            MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2200 + k,
+                         recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2200 + k,
+                         MPI_COMM_WORLD, &st);
+            if (decomp.has_east_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    double* dst = &grid.u[static_cast<std::size_t>(
+                        grid.idx(px0 + lnx + k, j)) * d];
+                    for (int c = 0; c < d; ++c) dst[c] = recv_buf[j*d+c];
+                }
+            }
+
+            // 向东发送我的近东端第 k 物理列，从西邻接收填入西幽灵列 k
             for (int j = 0; j < gny; ++j) {
-                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx, j)) * d];
-                for (int c = 0; c < d; ++c) dst[c] = recv_east[j*d+c];
+                const double* s = &grid.u[static_cast<std::size_t>(
+                    grid.idx(px0 + k, j)) * d];
+                for (int c = 0; c < d; ++c) send_buf[j*d+c] = s[c];
+            }
+            MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2300 + k,
+                         recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2300 + k,
+                         MPI_COMM_WORLD, &st);
+            if (decomp.has_west_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    double* dst = &grid.u[static_cast<std::size_t>(
+                        grid.idx(k, j)) * d];
+                    for (int c = 0; c < d; ++c) dst[c] = recv_buf[j*d+c];
+                }
             }
         }
     }
@@ -592,13 +621,14 @@ MpiDecomp MpiDecomp::create(int gnx, int gny)
     return d;
 }
 
-MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py)
+MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py, int in_n_ghost)
 {
     MpiDecomp2D d;
     d.global_nx = gnx;
     d.global_ny = gny;
     d.px        = in_px;
     d.py        = in_py;
+    d.n_ghost   = (in_n_ghost >= 1) ? in_n_ghost : 1;
     d.local_nx  = gnx;
     d.local_ny  = gny;
     d.x_start   = 0;

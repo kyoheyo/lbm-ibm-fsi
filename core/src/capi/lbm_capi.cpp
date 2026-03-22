@@ -350,13 +350,36 @@ MpiDecomp2DHandle* lbm_mpi_decomp2d_new(int global_nx, int global_ny,
     if (!initialized) return nullptr;
     try {
         auto* d = new lbm::MpiDecomp2D(
-            lbm::MpiDecomp2D::create(global_nx, global_ny, px, py));
+            lbm::MpiDecomp2D::create(global_nx, global_ny, px, py, 1));
         return reinterpret_cast<MpiDecomp2DHandle*>(d);
     } catch (...) {
         return nullptr;
     }
 #else
     (void)global_nx; (void)global_ny; (void)px; (void)py;
+    return nullptr;
+#endif
+}
+
+/// 与 lbm_mpi_decomp2d_new 相同，但额外指定每侧幽灵层数 n_ghost（≥1）。
+/// n_ghost=2 为 FourPoint IBM 核在 MPI 边界附近提供正确的 2 层幽灵行/列。
+/// Rust 封装: LbmMpiDecomp2D::new_n() — bindings/src/lib.rs
+MpiDecomp2DHandle* lbm_mpi_decomp2d_new_n(int global_nx, int global_ny,
+                                            int px, int py, int n_ghost)
+{
+#ifdef LBM_ENABLE_MPI
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized) return nullptr;
+    try {
+        auto* d = new lbm::MpiDecomp2D(
+            lbm::MpiDecomp2D::create(global_nx, global_ny, px, py, n_ghost));
+        return reinterpret_cast<MpiDecomp2DHandle*>(d);
+    } catch (...) {
+        return nullptr;
+    }
+#else
+    (void)global_nx; (void)global_ny; (void)px; (void)py; (void)n_ghost;
     return nullptr;
 #endif
 }

@@ -174,8 +174,9 @@ Solver::CollideGuard Solver::make_collide_guard() const
     // 二维（XY 方向）幽灵层
     g.use_mpi2d = (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1);
     if (g.use_mpi2d) {
-        g.gnx2d = grid_.nx;
-        g.gny2d = grid_.ny;
+        g.gnx2d      = grid_.nx;
+        g.gny2d      = grid_.ny;
+        g.n_ghost_2d = mpi_decomp2d_->n_ghost;
         g.sg2d  = mpi_decomp2d_->has_south_ghost();
         g.ng2d  = mpi_decomp2d_->has_north_ghost();
         g.wg2d  = mpi_decomp2d_->has_west_ghost();

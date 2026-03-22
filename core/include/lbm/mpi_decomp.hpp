@@ -153,6 +153,12 @@ struct MpiDecomp2D {
     int rank_west  = -1;            ///< 西邻 rank（col_rank-1，无邻居时为 MPI_PROC_NULL）
     int rank_east  = -1;            ///< 东邻 rank（col_rank+1，无邻居时为 MPI_PROC_NULL）
 
+    /// 每侧幽灵层数（默认 1；设为 2 时支持 FourPoint IBM 核在 MPI 边界附近的标记点）
+    /// 对应 TOML 配置 [mpi] ibm_halo_width。
+    /// 影响：grid_ny/nx()、phys_y0/x0()、halo_exchange_d2q9_2d()、
+    ///        halo_exchange_u_2d() 以及 ibm_halo_reduce_force_2d() 的行为。
+    int n_ghost    = 1;
+
     /// 是否持有全局南物理壁（y=0）
     bool has_south_wall() const { return y_start == 0; }
     /// 是否持有全局北物理壁（y=global_ny-1）
@@ -171,22 +177,28 @@ struct MpiDecomp2D {
     /// 是否存在东幽灵列（非最东 rank）
     bool has_east_ghost()  const { return col_rank < px - 1; }
 
-    /// 本地网格含幽灵层的 nx
+    /// 本地网格含幽灵层的 nx（每侧最多 n_ghost 列）
     int grid_nx() const {
-        return local_nx + (has_west_ghost() ? 1 : 0) + (has_east_ghost() ? 1 : 0);
+        return local_nx
+             + (has_west_ghost()  ? n_ghost : 0)
+             + (has_east_ghost()  ? n_ghost : 0);
     }
-    /// 本地网格含幽灵层的 ny
+    /// 本地网格含幽灵层的 ny（每侧最多 n_ghost 行）
     int grid_ny() const {
-        return local_ny + (has_south_ghost() ? 1 : 0) + (has_north_ghost() ? 1 : 0);
+        return local_ny
+             + (has_south_ghost() ? n_ghost : 0)
+             + (has_north_ghost() ? n_ghost : 0);
     }
-    /// 物理区域在本地网格中的 x 偏移（0 或 1）
-    int phys_x0() const { return has_west_ghost()  ? 1 : 0; }
-    /// 物理区域在本地网格中的 y 偏移（0 或 1）
-    int phys_y0() const { return has_south_ghost() ? 1 : 0; }
+    /// 物理区域在本地网格中的 x 偏移（0 或 n_ghost）
+    int phys_x0() const { return has_west_ghost()  ? n_ghost : 0; }
+    /// 物理区域在本地网格中的 y 偏移（0 或 n_ghost）
+    int phys_y0() const { return has_south_ghost() ? n_ghost : 0; }
 
     /// 由全局尺寸和块数创建 MpiDecomp2D（需先调用 MPI_Init）。
     /// px * py 必须等于 MPI 进程总数，否则抛出 std::invalid_argument。
-    static MpiDecomp2D create(int global_nx, int global_ny, int px, int py);
+    /// n_ghost 指定每侧幽灵层数（默认 1；ibm_halo_width=2 时传入 2）。
+    static MpiDecomp2D create(int global_nx, int global_ny, int px, int py,
+                               int n_ghost = 1);
 };
 
 // ---------------------------------------------------------------------------

@@ -743,13 +743,15 @@ fn print_header(cfg: &Config, config_path: &std::path::Path, nprocs: i32) {
         if cfg.ibm.is_some() {
             println!(
                 "MPI IBM  : ibm_halo_width={} \
-                 (u-halo exchange before interpolation + force halo reduce after spread; \
-                 {})",
+                 (u-halo exchange {n_gh} layer(s) before interpolation + \
+                 force halo reduce {n_gh} layer(s) after spread; \
+                 {note})",
                 ibm_halo,
-                if ibm_halo >= 2 {
-                    "FourPoint kernel: 1 ghost layer available — markers must be ≥2 cells from boundary"
+                n_gh = ibm_halo,
+                note = if ibm_halo >= 2 {
+                    "FourPoint kernel fully supported at MPI boundaries"
                 } else {
-                    "TwoPoint kernel supported; FourPoint kernel requires markers ≥2 cells from boundary"
+                    "TwoPoint kernel supported; FourPoint kernel requires ibm_halo_width=2"
                 }
             );
         }

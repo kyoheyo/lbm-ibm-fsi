@@ -54,6 +54,8 @@ impl MpiDecomp {
         let use_3d_decomp = cfg.fluid.nz > 1 && cfg.mpi.nz_blocks > 1;
         let mut decomp2d: Option<LbmMpiDecomp2D> = None;
         let mut decomp3d: Option<LbmMpiDecomp3D> = None;
+        // ibm_halo_width 控制每侧幽灵层数：1 = 默认（TwoPoint），2 = FourPoint
+        let n_ghost = (cfg.mpi.ibm_halo_width.max(1)) as i32;
 
         match effective_mode {
             "block" => {
@@ -69,8 +71,8 @@ impl MpiDecomp {
                              Falling back to 1D Y slice.",
                             px, py, pz, px as i32 * py as i32 * pz as i32, nprocs
                         );
-                        decomp2d = LbmMpiDecomp2D::new(
-                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+                        decomp2d = LbmMpiDecomp2D::new_n(
+                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs, n_ghost);
                     } else {
                         decomp3d = LbmMpiDecomp3D::new(
                             cfg.fluid.nx as i32, cfg.fluid.ny as i32, cfg.fluid.nz as i32,
@@ -88,11 +90,11 @@ impl MpiDecomp {
                              Falling back to 1D Y slice (nx_blocks=1, ny_blocks=nprocs).",
                             px, py, px as i32 * py as i32, nprocs
                         );
-                        decomp2d = LbmMpiDecomp2D::new(
-                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+                        decomp2d = LbmMpiDecomp2D::new_n(
+                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs, n_ghost);
                     } else {
-                        decomp2d = LbmMpiDecomp2D::new(
-                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32);
+                        decomp2d = LbmMpiDecomp2D::new_n(
+                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32, n_ghost);
                     }
                 }
             }
@@ -108,8 +110,8 @@ impl MpiDecomp {
             }
             _ => {
                 eprintln!("[warn] unknown mpi.mode {:?}; defaulting to 1D Y slice.", effective_mode);
-                decomp2d = LbmMpiDecomp2D::new(
-                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs);
+                decomp2d = LbmMpiDecomp2D::new_n(
+                    cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs, n_ghost);
             }
         }
 

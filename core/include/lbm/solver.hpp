@@ -91,11 +91,12 @@ private:
 
     /// MPI 幽灵层跳过控制（供 collide_bgk/collide_mrt 共用）
     struct CollideGuard {
-        int  n_start   = 0;
-        int  n_end     = 0;
-        bool use_mpi2d = false;
-        int  gnx2d     = 0;
-        int  gny2d     = 0;
+        int  n_start    = 0;
+        int  n_end      = 0;
+        bool use_mpi2d  = false;
+        int  gnx2d      = 0;
+        int  gny2d      = 0;
+        int  n_ghost_2d = 1;    ///< 每侧幽灵层数（2D 模式）
         bool sg2d = false, ng2d = false, wg2d = false, eg2d = false;
 
         // 三维 MPI 扩展
@@ -122,8 +123,10 @@ private:
             if (!use_mpi2d) return false;
             const int ix = i % gnx2d;
             const int iy = i / gnx2d;
-            if ((sg2d && iy == 0) || (ng2d && iy == gny2d - 1)) return true;
-            if ((wg2d && ix == 0) || (eg2d && ix == gnx2d - 1)) return true;
+            if (sg2d && iy < n_ghost_2d) return true;
+            if (ng2d && iy >= gny2d - n_ghost_2d) return true;
+            if (wg2d && ix < n_ghost_2d) return true;
+            if (eg2d && ix >= gnx2d - n_ghost_2d) return true;
             return false;
         }
     };

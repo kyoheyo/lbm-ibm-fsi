@@ -125,6 +125,11 @@ mod ffi {
         /// 创建 2D 块分解（px×py）；px*py 必须等于 MPI 进程数，否则返回 null。
         pub fn lbm_mpi_decomp2d_new(global_nx: c_int, global_ny: c_int,
                                      px: c_int, py: c_int) -> *mut MpiDecomp2DHandle;
+        /// 同 lbm_mpi_decomp2d_new，但额外指定每侧幽灵层数 n_ghost（≥1）。
+        /// n_ghost=2 为 FourPoint IBM 核在 MPI 边界附近提供 2 层幽灵行/列。
+        pub fn lbm_mpi_decomp2d_new_n(global_nx: c_int, global_ny: c_int,
+                                       px: c_int, py: c_int,
+                                       n_ghost: c_int) -> *mut MpiDecomp2DHandle;
         pub fn lbm_mpi_decomp2d_free(h: *mut MpiDecomp2DHandle);
         /// 将 MpiDecomp2D 绑定到求解器（启用 2D 幽灵层自动交换）。
         pub fn lbm_solver_attach_mpi2d(s: *mut SolverHandle, h: *mut MpiDecomp2DHandle);
@@ -733,7 +738,7 @@ pub struct LbmMpiDecomp2D {
 unsafe impl Send for LbmMpiDecomp2D {}
 
 impl LbmMpiDecomp2D {
-    /// 创建 MPI 二维块分解（需先调用 `mpi_init()`）。
+    /// 创建 MPI 二维块分解（需先调用 `mpi_init()`），每侧使用 1 个幽灵层。
     ///
     /// - `global_nx`：全局 X 方向节点数
     /// - `global_ny`：全局 Y 方向节点数
@@ -744,6 +749,18 @@ impl LbmMpiDecomp2D {
     /// 未启用 MPI 时也返回 `None`。
     pub fn new(global_nx: i32, global_ny: i32, px: i32, py: i32) -> Option<Self> {
         let ptr = unsafe { ffi::lbm_mpi_decomp2d_new(global_nx, global_ny, px, py) };
+        if ptr.is_null() { None } else { Some(LbmMpiDecomp2D { ptr }) }
+    }
+
+    /// 与 [`LbmMpiDecomp2D::new`] 相同，但额外指定每侧幽灵层数 `n_ghost`（≥1）。
+    ///
+    /// - `n_ghost = 1`（默认）：适用于 TwoPoint IBM 核。
+    /// - `n_ghost = 2`：适用于 FourPoint IBM 核在 MPI 边界附近的标记点；
+    ///   此时 `grid_ny()` 增大 `2*(n_ghost-1)` 行，`phys_y0()` 返回 `n_ghost`。
+    ///
+    /// 对应 TOML 配置 `[mpi] ibm_halo_width`。
+    pub fn new_n(global_nx: i32, global_ny: i32, px: i32, py: i32, n_ghost: i32) -> Option<Self> {
+        let ptr = unsafe { ffi::lbm_mpi_decomp2d_new_n(global_nx, global_ny, px, py, n_ghost) };
         if ptr.is_null() { None } else { Some(LbmMpiDecomp2D { ptr }) }
     }
 
@@ -777,12 +794,12 @@ impl LbmMpiDecomp2D {
         unsafe { ffi::lbm_mpi_decomp2d_local_ny(self.ptr as *const _) }
     }
 
-    /// 物理区域在本地网格中的 X 偏移（0 = 无西幽灵列；1 = 有西幽灵列）。
+    /// 物理区域在本地网格中的 X 偏移（0 = 无西幽灵列；n_ghost = 有西幽灵列）。
     pub fn phys_x0(&self) -> i32 {
         unsafe { ffi::lbm_mpi_decomp2d_phys_x0(self.ptr as *const _) }
     }
 
-    /// 物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；1 = 有南幽灵行）。
+    /// 物理区域在本地网格中的 Y 偏移（0 = 无南幽灵行；n_ghost = 有南幽灵行）。
     pub fn phys_y0(&self) -> i32 {
         unsafe { ffi::lbm_mpi_decomp2d_phys_y0(self.ptr as *const _) }
     }
