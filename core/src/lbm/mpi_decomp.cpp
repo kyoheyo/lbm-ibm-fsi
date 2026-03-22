@@ -506,6 +506,73 @@ MpiDecomp3D MpiDecomp3D::create(int gnx, int gny, int gnz,
     return d;
 }
 
+// ---------------------------------------------------------------------------
+// 宏観速度場幽霊層交換（2D 分区、MPI 启用时）
+// 见 mpi_decomp.hpp 中的文档注释。
+// ---------------------------------------------------------------------------
+void halo_exchange_u_2d(LatticeGrid& grid, const MpiDecomp2D& decomp)
+{
+    if (decomp.nprocs == 1) return;
+
+    const int d    = grid.dim();
+    const int gnx  = grid.nx;
+    const int gny  = grid.ny;
+    const int lnx  = decomp.local_nx;
+    const int lny  = decomp.local_ny;
+    const int px0  = decomp.phys_x0();
+    const int py0  = decomp.phys_y0();
+
+    MPI_Status st;
+
+    // S/N 行交换（行连续，直接发送）
+    {
+        const int row_size = gnx * d;
+        double* top_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny - 1)) * d];
+        double* bot_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0))            * d];
+        double* south_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, 0))              * d];
+        double* north_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny))      * d];
+
+        MPI_Sendrecv(top_phys,    row_size, MPI_DOUBLE, decomp.rank_north, 2000,
+                     south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 2000,
+                     MPI_COMM_WORLD, &st);
+        MPI_Sendrecv(bot_phys,    row_size, MPI_DOUBLE, decomp.rank_south, 2001,
+                     north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 2001,
+                     MPI_COMM_WORLD, &st);
+    }
+
+    // W/E 列交换（列不连续，需打包）
+    if (decomp.has_west_ghost() || decomp.has_east_ghost()) {
+        const int col_size = gny * d;
+        std::vector<double> send_west(col_size), recv_west(col_size, 0.0);
+        std::vector<double> send_east(col_size), recv_east(col_size, 0.0);
+
+        for (int j = 0; j < gny; ++j) {
+            const double* sw = &grid.u[static_cast<std::size_t>(grid.idx(px0,           j)) * d];
+            const double* se = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx - 1, j)) * d];
+            for (int c = 0; c < d; ++c) { send_west[j*d+c] = sw[c]; send_east[j*d+c] = se[c]; }
+        }
+        MPI_Sendrecv(send_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2002,
+                     recv_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2002,
+                     MPI_COMM_WORLD, &st);
+        MPI_Sendrecv(send_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 2003,
+                     recv_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 2003,
+                     MPI_COMM_WORLD, &st);
+
+        if (decomp.has_west_ghost()) {
+            for (int j = 0; j < gny; ++j) {
+                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(0, j)) * d];
+                for (int c = 0; c < d; ++c) dst[c] = recv_west[j*d+c];
+            }
+        }
+        if (decomp.has_east_ghost()) {
+            for (int j = 0; j < gny; ++j) {
+                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx, j)) * d];
+                for (int c = 0; c < d; ++c) dst[c] = recv_east[j*d+c];
+            }
+        }
+    }
+}
+
 } // namespace lbm
 
 #else
@@ -566,6 +633,8 @@ MpiDecomp3D MpiDecomp3D::create(int gnx, int gny, int gnz,
     }
     return d;
 }
+
+void halo_exchange_u_2d(LatticeGrid& /*grid*/, const MpiDecomp2D& /*decomp*/) {}
 
 } // namespace lbm
 #endif

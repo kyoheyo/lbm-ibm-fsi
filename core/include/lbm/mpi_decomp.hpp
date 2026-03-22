@@ -310,6 +310,17 @@ void halo_exchange_d2q9_2d(LatticeGrid& g, const MpiDecomp2D& decomp);
 /// 由 Solver::stream() 在 stream 循环之前（碰后）自动调用（若绑定了 MpiDecomp3D）。
 // ---------------------------------------------------------------------------
 void halo_exchange_d3q19_3d(LatticeGrid& g, const MpiDecomp3D& decomp);
+
+// ---------------------------------------------------------------------------
+/// 宏观速度场幽灵层交换（2D 分区，D2Q9）
+///
+/// 在 PUSH 流式迁移之后，幽灵行/列的 u 被本地边界行 f 推入覆盖，导致错误。
+/// 本函数在 compute_macroscopic() 完成后交换物理边界行/列的真实 u 到邻居幽灵行/列，
+/// 使 IBM 插值等需要幽灵层速度的操作可直接使用正确数据，无需再额外调用 IBM 专用函数。
+///
+/// 由 Solver::stream() 在 compute_macroscopic() 之后自动调用（若绑定了 MpiDecomp2D）。
+// ---------------------------------------------------------------------------
+void halo_exchange_u_2d(LatticeGrid& g, const MpiDecomp2D& decomp);
 #endif
 
 } // namespace lbm

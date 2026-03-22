@@ -301,18 +301,14 @@ fn run_time_loop(
 
     for step in 0..cfg.simulation.n_steps {
         solver.step(grid);
+        // solver.step() → stream() 在 compute_macroscopic() 之后自动完成幽灵层 u 交换，
+        // 无需在此显式调用 ibm_halo_exchange_u_2d()。
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
         if !ibm_entries.is_empty() {
-            // MPI 修正 1：solver.step() 完成后幽灵行 u 是本地边界行外推值，不是邻居真实速度。
-            // 在 interpolate_velocity() 之前显式交换 u 场幽灵行，确保跨块插值物理正确。
-            if let Some(ref mut d2) = mpi.decomp2d {
-                lbm_bindings::ibm_halo_exchange_u_2d(grid, d2);
-            }
-
             step_ibm(cfg, grid, ibm_entries);
 
-            // MPI 修正 2：spread_force() 可能向幽灵行写入力贡献；将这些贡献归还邻居并累加。
+            // MPI 修正：spread_force() 可能向幽灵行写入力贡献；将这些贡献归还邻居并累加。
             if let Some(ref mut d2) = mpi.decomp2d {
                 lbm_bindings::ibm_halo_reduce_force_2d(grid, d2);
             }

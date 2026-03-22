@@ -503,89 +503,15 @@ void ibm_marker_set_adapt_to_partition(MarkerSet& ms,
 // ===========================================================================
 // MPI 幽灵层 u 场交换（IBM 插值前调用）
 //
-// solver.step() 完成后，幽灵行的 u 是 PUSH 流式迁移把本地物理边界行 f
-// 推入幽灵行后再 compute_macroscopic() 得到的外推值，不是邻居进程的真实速度。
-// 本函数通过 MPI_Sendrecv 把物理边界行（含 S/N 行与 W/E 列）的 u 发送到
-// 邻居的幽灵行，从而在 interpolate_velocity() 调用前正确填充幽灵层速度。
+// solver.step() → stream() 完成后，幽灵行/列的 u 已由 Solver::stream() 自动修正
+// （stream() 内在 compute_macroscopic() 后调用 lbm::halo_exchange_u_2d()）。
+// 本函数保留为外部调用接口，直接代理到底层通用实现。
 // ===========================================================================
 void ibm_halo_exchange_u_2d(lbm::LatticeGrid& grid,
                               const lbm::MpiDecomp2D& decomp)
 {
 #ifdef LBM_ENABLE_MPI
-    if (decomp.nprocs == 1) return;
-
-    const int d    = grid.dim();   // = 2 for D2Q9
-    const int gnx  = grid.nx;     // local grid width (includes ghost cols)
-    const int gny  = grid.ny;     // local grid height (includes ghost rows)
-    const int lnx  = decomp.local_nx;
-    const int lny  = decomp.local_ny;
-    const int px0  = decomp.phys_x0();
-    const int py0  = decomp.phys_y0();
-
-    MPI_Status st;
-
-    // -----------------------------------------------------------------------
-    // S/N 方向：整行 u（行连续，可直接传）
-    // -----------------------------------------------------------------------
-    {
-        const int row_size = gnx * d;
-
-        double* top_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny - 1)) * d];
-        double* bot_phys    = &grid.u[static_cast<std::size_t>(grid.idx(0, py0))            * d];
-        double* south_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, 0))              * d];
-        double* north_ghost = &grid.u[static_cast<std::size_t>(grid.idx(0, py0 + lny))      * d];
-
-        // 向北邻发送顶物理行 u，从南邻接收南幽灵行 u
-        MPI_Sendrecv(top_phys,    row_size, MPI_DOUBLE, decomp.rank_north, 1000,
-                     south_ghost, row_size, MPI_DOUBLE, decomp.rank_south, 1000,
-                     MPI_COMM_WORLD, &st);
-        // 向南邻发送底物理行 u，从北邻接收北幽灵行 u
-        MPI_Sendrecv(bot_phys,    row_size, MPI_DOUBLE, decomp.rank_south, 1001,
-                     north_ghost, row_size, MPI_DOUBLE, decomp.rank_north, 1001,
-                     MPI_COMM_WORLD, &st);
-    }
-
-    // -----------------------------------------------------------------------
-    // W/E 方向：列 u（列不连续，需打包）
-    // -----------------------------------------------------------------------
-    if (decomp.has_west_ghost() || decomp.has_east_ghost()) {
-        const int col_size = gny * d;
-        std::vector<double> send_west(col_size), recv_west(col_size, 0.0);
-        std::vector<double> send_east(col_size), recv_east(col_size, 0.0);
-
-        // 打包最西物理列 i=px0 → send_west
-        for (int j = 0; j < gny; ++j) {
-            const double* src = &grid.u[static_cast<std::size_t>(grid.idx(px0, j)) * d];
-            for (int c = 0; c < d; ++c) send_west[j * d + c] = src[c];
-        }
-        // 打包最东物理列 i=px0+lnx-1 → send_east
-        for (int j = 0; j < gny; ++j) {
-            const double* src = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx - 1, j)) * d];
-            for (int c = 0; c < d; ++c) send_east[j * d + c] = src[c];
-        }
-
-        // 向西邻发送最西物理列，从东邻接收东幽灵列
-        MPI_Sendrecv(send_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 1002,
-                     recv_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 1002,
-                     MPI_COMM_WORLD, &st);
-        // 向东邻发送最东物理列，从西邻接收西幽灵列
-        MPI_Sendrecv(send_east.data(), col_size, MPI_DOUBLE, decomp.rank_east, 1003,
-                     recv_west.data(), col_size, MPI_DOUBLE, decomp.rank_west, 1003,
-                     MPI_COMM_WORLD, &st);
-
-        if (decomp.has_west_ghost()) {
-            for (int j = 0; j < gny; ++j) {
-                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(0, j)) * d];
-                for (int c = 0; c < d; ++c) dst[c] = recv_west[j * d + c];
-            }
-        }
-        if (decomp.has_east_ghost()) {
-            for (int j = 0; j < gny; ++j) {
-                double* dst = &grid.u[static_cast<std::size_t>(grid.idx(px0 + lnx, j)) * d];
-                for (int c = 0; c < d; ++c) dst[c] = recv_east[j * d + c];
-            }
-        }
-    }
+    lbm::halo_exchange_u_2d(grid, decomp);
 #else
     (void)grid; (void)decomp;
 #endif

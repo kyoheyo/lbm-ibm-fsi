@@ -482,6 +482,15 @@ void Solver::stream()
     std::swap(grid_.f, grid_.f_tmp);
 
     grid_.compute_macroscopic();
+
+#ifdef LBM_ENABLE_MPI
+    // 幽灵层 u 修正：compute_macroscopic() 用 PUSH 流式覆盖后的幽灵 f 计算了错误的
+    // 幽灵行/列 u。在此立即与邻居交换真实物理边界行/列的 u，使幽灵层 u 在 stream()
+    // 返回后就已正确——IBM 插值无需再额外调用专用幽灵层函数。
+    if (mpi_decomp2d_ && mpi_decomp2d_->nprocs > 1) {
+        halo_exchange_u_2d(grid_, *mpi_decomp2d_);
+    }
+#endif
 }
 
 } // namespace lbm
