@@ -124,6 +124,15 @@ struct LatticeGrid {
     /// 由 mark_solid_cylinder() / compute_ibb_distances() 填充。
     std::vector<float> q_ibb;
 
+    /// 逐节点固体反弹方案标记（用于多固体混合 BC 场景）。
+    /// 存储格式：solid_bc_node[node]，值含义：
+    ///   0 = 无单独方案（由求解器全局 solid_bc_type_ 决定）
+    ///   1 = 半步长反弹（BounceBack）
+    ///   2 = 插值反弹（InterpolatedBounceBack）
+    /// 由 assign_solid_bc_unmarked() 填充（每个固体标记后立即调用）。
+    /// 若为空则退化为全局方案（向后兼容）。
+    std::vector<int8_t> solid_bc_node;
+
     LatticeGrid() = default;
     LatticeGrid(int nx, int ny, int nz, LatticeModel model);
 

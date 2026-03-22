@@ -898,6 +898,17 @@ void lbm_mark_solid_from_mesh_file(lbm::LatticeGrid* g, const char* filename)
     lbm::mark_solid_from_mesh_file(*g, filename);
 }
 
+/// 将当前所有已标记固体节点（solid==1 且 solid_bc_node==0）的逐节点反弹方案设为 bc_mode。
+/// 应在每个固体体 lbm_mark_solid_*() 调用后立即调用，以实现逐体方案分配。
+///
+/// @param g        格子网格句柄
+/// @param bc_mode  1 = BounceBack | 2 = InterpolatedBounceBack | 0 = 无操作
+void lbm_grid_assign_solid_bc_unmarked(lbm::LatticeGrid* g, int bc_mode)
+{
+    if (!g) return;
+    lbm::assign_solid_bc_unmarked(*g, bc_mode);
+}
+
 } // extern "C" (solid)
 
 // ===========================================================================

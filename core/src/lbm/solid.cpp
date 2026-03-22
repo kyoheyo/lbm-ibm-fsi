@@ -296,6 +296,101 @@ void apply_solid_ibb(LatticeGrid& grid)
 }
 
 // ===========================================================================
+// 逐固体节点标记反弹方案
+// ===========================================================================
+void assign_solid_bc_unmarked(LatticeGrid& grid, int bc_mode)
+{
+    if (bc_mode == 0) return;
+    if (grid.solid.empty()) return;
+
+    const int n = grid.size();
+    if (static_cast<int>(grid.solid_bc_node.size()) < n)
+        grid.solid_bc_node.assign(n, 0);
+
+    const auto bc = static_cast<int8_t>(bc_mode);
+    for (int idx = 0; idx < n; ++idx) {
+        if (grid.solid[idx] && grid.solid_bc_node[idx] == 0)
+            grid.solid_bc_node[idx] = bc;
+    }
+}
+
+// ===========================================================================
+// 混合反弹边界条件施加器（BB/IBB 逐节点选择）
+// ===========================================================================
+void apply_solid_bc_mixed(LatticeGrid& grid, int default_bc,
+                           int phys_i0, int phys_j0,
+                           int phys_i1, int phys_j1)
+{
+    if (grid.model != LatticeModel::D2Q9) return;
+    if (grid.solid.empty()) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int Q  = d2q9::Q;
+
+    const bool have_per_node = !grid.solid_bc_node.empty();
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) collapse(2)
+#endif
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
+            const int nf = grid.idx(i, j);
+            if (grid.solid[nf]) continue;  // 跳过固体节点
+
+            for (int a = 1; a < Q; ++a) {
+                const int ca = d2q9::C[a][0];
+                const int cb = d2q9::C[a][1];
+                const int ni = i + ca;
+                const int nj = j + cb;
+                if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
+                const int ns = grid.idx(ni, nj);
+                if (!grid.solid[ns]) continue;  // 邻居非固体
+
+                // 确定该链接使用的反弹方案
+                int bc = default_bc;
+                if (have_per_node && grid.solid_bc_node[ns] != 0)
+                    bc = grid.solid_bc_node[ns];
+
+                const int oa = d2q9::OPP[a];
+
+                if (bc == 1) {
+                    // 半步长反弹（BounceBack）
+                    grid.f[nf * Q + oa] = grid.f_tmp[nf * Q + a];
+                } else if (bc == 2) {
+                    // Bouzidi 插值反弹（IBB）
+                    const double q = static_cast<double>(grid.q_ibb[nf * Q + a]);
+                    if (q <= 0.5) {
+                        const int nni = i - ca;
+                        const int nnj = j - cb;
+                        if (nni >= 0 && nni < nx && nnj >= 0 && nnj < ny) {
+                            const int nnn = grid.idx(nni, nnj);
+                            if (!grid.solid[nnn]) {
+                                grid.f[nf * Q + oa] = 2.0 * q * grid.f_tmp[nf * Q + a]
+                                                    + (1.0 - 2.0 * q) * grid.f_tmp[nnn * Q + a];
+                                continue;
+                            }
+                        }
+                        // 退化为 halfway BB
+                        grid.f[nf * Q + oa] = grid.f_tmp[nf * Q + a];
+                    } else {
+                        const double inv2q = 1.0 / (2.0 * q);
+                        grid.f[nf * Q + oa] = inv2q * grid.f_tmp[nf * Q + a]
+                                            + (1.0 - inv2q) * grid.f_tmp[nf * Q + oa];
+                    }
+                }
+                // bc == 0：无方案，跳过
+            }
+        }
+    }
+}
+
+void apply_solid_bc_mixed(LatticeGrid& grid, int default_bc)
+{
+    apply_solid_bc_mixed(grid, default_bc, 0, 0, grid.nx - 1, grid.ny - 1);
+}
+
+// ===========================================================================
 // 固体受力统计：动量交换法（Momentum Exchange Algorithm）—— 物理区域限定版
 //
 // 调用时机：apply_solid_bounce_back() / apply_solid_ibb() 之后，

@@ -139,6 +139,39 @@ void apply_solid_ibb(LatticeGrid& grid,
                      int phys_i1, int phys_j1);
 
 // ---------------------------------------------------------------------------
+// 逐固体节点标记反弹方案（用于多固体混合 BC 场景）
+//
+// 扫描当前已标记的所有固体节点（solid[idx]==1），对其中 solid_bc_node[idx]==0
+// 的节点（尚未分配方案的节点）写入 bc_mode，从而实现"按最近标记的固体体"分配
+// 方案的效果——在每个固体体 mark_solid_*() 调用后立即调用本函数即可。
+//
+// @param grid     格子网格（须已设置 solid 标志）
+// @param bc_mode  1 = BounceBack（BB）| 2 = InterpolatedBounceBack（IBB）| 0 = 跳过
+// ---------------------------------------------------------------------------
+void assign_solid_bc_unmarked(LatticeGrid& grid, int bc_mode);
+
+// ---------------------------------------------------------------------------
+// 混合反弹边界条件施加器（支持同一仿真中不同固体使用不同方案）
+//
+// 对于每个流-固界面链接 (x_f, a)，根据对应固体节点的 solid_bc_node 值选择方案：
+//   solid_bc_node[solid_idx] == 1  → 半步长反弹（BB）
+//   solid_bc_node[solid_idx] == 2  → Bouzidi 插值反弹（IBB）
+//   solid_bc_node[solid_idx] == 0  → 使用 default_bc 参数指定的全局方案
+//
+// 当所有节点的 solid_bc_node 相同时，性能与纯 BB/IBB 版本等价（只增加一次整数比较）。
+//
+// @param grid        格子网格
+// @param default_bc  0=跳过 | 1=BB | 2=IBB（供无逐节点标记时使用的全局方案）
+// @param phys_i0/j0/i1/j1  物理区域（本地坐标，含端点）；非 MPI 模式传全网格范围
+// ---------------------------------------------------------------------------
+void apply_solid_bc_mixed(LatticeGrid& grid, int default_bc,
+                           int phys_i0, int phys_j0,
+                           int phys_i1, int phys_j1);
+
+/// 向后兼容版（非 MPI，覆盖全网格）。
+void apply_solid_bc_mixed(LatticeGrid& grid, int default_bc);
+
+// ---------------------------------------------------------------------------
 // 固体受力统计：动量交换法（Momentum Exchange Algorithm, MEA）
 //
 // 参考：Ladd A.J.C. (1994) J. Fluid Mech. 271, 285-309.

@@ -24,6 +24,7 @@ LatticeGrid::LatticeGrid(int nx_, int ny_, int nz_, LatticeModel model_)
     force.assign(n * d, 0.0);      // 体力初始化为零
     solid.assign(n, 0);            // 固体标记初始化为全流体
     q_ibb.assign(n * q, 0.5f);     // IBB 距离分数默认 0.5（半步长反弹）
+    solid_bc_node.assign(n, 0);    // 逐节点 BC 方案初始化为 0（使用全局方案）
 }
 
 // ---------------------------------------------------------------------------

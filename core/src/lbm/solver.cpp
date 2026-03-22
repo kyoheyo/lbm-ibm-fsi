@@ -106,14 +106,20 @@ void Solver::step()
     }
 #endif
 
-    // 施加固体节点反弹边界条件（BB 或 IBB）
+    // 施加固体节点反弹边界条件（BB、IBB 或逐节点混合方案）
     // 固体 BC 在面 BC 之前施加，以确保面 BC（Zou-He 等）具有更高优先级（最后写入）。
     // MPI 模式下仅对物理区域 [pb.i_w, pb.i_e] × [pb.j_s, pb.j_n] 施加，
     // 跳过幽灵节点，防止幽灵行的 f 被错误覆盖。
-    if (solid_bc_type_ == SolidBCType::BounceBack) {
-        apply_solid_bounce_back(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
-    } else if (solid_bc_type_ == SolidBCType::InterpolatedBounceBack) {
-        apply_solid_ibb(grid_, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
+    //
+    // apply_solid_bc_mixed() 统一处理全局方案与逐节点方案：
+    //   - 若某固体节点 solid_bc_node[ns] != 0，使用该节点的逐节点方案；
+    //   - 否则使用 default_bc（由全局 solid_bc_type_ 转换而来）作为后备。
+    if (solid_bc_type_ != SolidBCType::None) {
+        const int default_bc = (solid_bc_type_ == SolidBCType::BounceBack) ? 1 : 2;
+        apply_solid_bc_mixed(grid_, default_bc, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
+    } else if (!grid_.solid_bc_node.empty()) {
+        // 全局方案为 None，但可能存在逐节点方案（仅通过 assign_solid_bc_unmarked 设置）
+        apply_solid_bc_mixed(grid_, 0, pb.i_w, pb.j_s, pb.i_e, pb.j_n);
     }
 
     // 施加通过 add_boundary_condition() 注册的边界条件
