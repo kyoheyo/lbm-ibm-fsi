@@ -190,6 +190,31 @@ fn run() -> Result<()> {
         Vec::new()
     };
 
+    // MPI 模式下：将 IBM 标记点坐标从全局格子坐标系变换到本地格子坐标系，
+    // 并设置各进程"归属"的物理行/列范围，避免跨块双重计数。
+    if !ibm_entries.is_empty() && nprocs > 1 {
+        if let Some(ref d2) = mpi.decomp2d {
+            let x_start  = d2.x_start();
+            let y_start  = d2.y_start();
+            let phys_x0  = d2.phys_x0();
+            let phys_y0  = d2.phys_y0();
+            let local_nx = d2.local_nx();
+            let local_ny = d2.local_ny();
+            for entry in ibm_entries.iter_mut() {
+                entry.ms.adapt_to_partition(
+                    x_start, y_start, phys_x0, phys_y0, local_nx, local_ny,
+                );
+            }
+            if rank == 0 {
+                println!(
+                    "  [IBM] MPI partition adapt: rank-0 owns y=[{},{}), \
+                     markers shifted to local coords",
+                    phys_y0, phys_y0 + local_ny,
+                );
+            }
+        }
+    }
+
     if rank == 0 && coupling_mode != fsi::FsiCouplingMode::None {
         println!("  [FSI] coupling mode: {}", coupling_mode.description());
     }
@@ -400,7 +425,10 @@ fn run_time_loop(
                 && (step % entry.force_cfg.interval == 0
                     || step == cfg.simulation.n_steps - 1)
             {
-                let (ibm_fx, ibm_fy) = entry.ms.compute_body_force();
+                // MPI 模式下各进程仅处理归属自身的标记点子集，需 Allreduce 求全局合力
+                let (local_ibm_fx, local_ibm_fy) = entry.ms.compute_body_force();
+                let ibm_fx = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fx);
+                let ibm_fy = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fy);
                 if rank == 0 {
                     let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
                     let label = entry.label.clone();

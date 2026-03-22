@@ -284,6 +284,14 @@ mod ffi {
         pub fn lbm_ibm_compute_body_force(ms: *const IbmMarkerSetHandle,
                                            out_fx: *mut f64, out_fy: *mut f64);
 
+        /// IBM 标记点集 MPI 分区适配：坐标系从全局转换到本地，设置归属行/列范围。
+        /// 调用后 interpolate_velocity/spread_force 仅处理"归属"本进程的标记点，
+        /// 避免跨 MPI 块时的 IBM 力双重计数。
+        pub fn lbm_ibm_marker_set_adapt_to_partition(ms: *mut IbmMarkerSetHandle,
+                                                      x_start: c_int, y_start: c_int,
+                                                      phys_x0: c_int, phys_y0: c_int,
+                                                      local_nx: c_int, local_ny: c_int);
+
         /// IBM 幽灵层 u 场交换：step_ibm() 前调用，填充幽灵行/列的真实邻居速度。
         /// 修正 solver.step() 后幽灵行 u 来自本地外推（而非邻居速度）的问题。
         pub fn lbm_ibm_halo_exchange_u_2d(g: *mut LatticeGridHandle,
@@ -1240,8 +1248,9 @@ impl LbmIbmMarkerSet {
     /// 调用时机：任一 `step_*()` 方法调用之后。
     ///
     /// # MPI 说明
-    /// 若所有进程持有相同的完整标记点集（当前实现），此函数返回完整合力，
-    /// 无需额外的 MPI 归约。若将来改为按进程分配标记点，则需 `mpi_allreduce_sum_f64`。
+    /// 在 MPI 模式下，`adapt_to_partition()` 使各进程仅处理归属自身的标记点子集，
+    /// 故此函数仅返回本进程所持有标记点的局部合力；若需全局合力，
+    /// 调用方须额外执行 `MPI_Allreduce` 求和。
     pub fn compute_body_force(&self) -> (f64, f64) {
         let mut fx = 0.0_f64;
         let mut fy = 0.0_f64;
@@ -1249,6 +1258,32 @@ impl LbmIbmMarkerSet {
             ffi::lbm_ibm_compute_body_force(self.ptr as *const _, &mut fx, &mut fy);
         }
         (fx, fy)
+    }
+
+    /// MPI 分区适配：将标记点坐标从全局格子坐标系转换到本进程本地格子坐标系，
+    /// 并设置 IBM 函数所用的"归属"行/列范围，避免跨 MPI 块的双重计数。
+    ///
+    /// # 调用时机
+    /// 在 MPI 初始化并获知分区信息后调用一次（通常在仿真开始前）。
+    /// 非 MPI 或单进程模式下无需调用（默认 owner 范围涵盖全域）。
+    ///
+    /// # 参数
+    /// - `x_start`：本分区物理域在全局 X 方向的起始格点索引
+    /// - `y_start`：本分区物理域在全局 Y 方向的起始格点索引
+    /// - `phys_x0`：本地网格物理列的起始列索引（含幽灵列时 ≥ 1）
+    /// - `phys_y0`：本地网格物理行的起始行索引（含幽灵行时 ≥ 1）
+    /// - `local_nx`：本分区物理列数
+    /// - `local_ny`：本分区物理行数
+    pub fn adapt_to_partition(&mut self,
+                               x_start: i32, y_start: i32,
+                               phys_x0: i32, phys_y0: i32,
+                               local_nx: i32, local_ny: i32) {
+        unsafe {
+            ffi::lbm_ibm_marker_set_adapt_to_partition(
+                self.ptr,
+                x_start, y_start, phys_x0, phys_y0, local_nx, local_ny,
+            );
+        }
     }
 }
 

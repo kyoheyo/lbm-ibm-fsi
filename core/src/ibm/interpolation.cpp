@@ -64,9 +64,13 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
         const double xm = mk.x / dx;
         const double ym = mk.y / dx;
 
-        // 最近格子节点
+        // 最近格子节点（本地坐标）
         const int i0 = static_cast<int>(std::floor(xm));
         const int j0 = static_cast<int>(std::floor(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免跨块重复计算
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
 
         double ux_sum = 0.0, uy_sum = 0.0;
 
@@ -124,6 +128,10 @@ void spread_force(lbm::LatticeGrid& grid,
 
         const int i0 = static_cast<int>(std::floor(xm));
         const int j0 = static_cast<int>(std::floor(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免双重计数
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
 
         for (int dj = -support; dj <= support + 1; ++dj) {
             for (int di = -support; di <= support + 1; ++di) {
@@ -288,6 +296,10 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
         const double ym = mk.y / dx;
         const int    i0 = static_cast<int>(std::round(xm));
         const int    j0 = static_cast<int>(std::round(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免跨块重复计算
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
 
         // MLS 矩阵（3×3）和右端向量
         double M[3][3] = {};
@@ -460,6 +472,32 @@ void compute_ibm_body_force(const MarkerSet& ms,
 
     out_fx = fx;
     out_fy = fy;
+}
+
+// ===========================================================================
+// MPI 分区适配：坐标系转换 + 归属边界设置
+// ===========================================================================
+void ibm_marker_set_adapt_to_partition(MarkerSet& ms,
+                                        int x_start, int y_start,
+                                        int phys_x0, int phys_y0,
+                                        int local_nx, int local_ny)
+{
+    // 从全局坐标到本地坐标的偏移量
+    const double off_x = static_cast<double>(phys_x0 - x_start);
+    const double off_y = static_cast<double>(phys_y0 - y_start);
+
+    for (auto& mk : ms.markers) {
+        mk.x  += off_x;
+        mk.y  += off_y;
+        mk.x0 += off_x;
+        mk.y0 += off_y;
+    }
+
+    // 设置本进程"归属"的物理行/列范围（本地坐标）
+    ms.owner_i_lo = phys_x0;
+    ms.owner_i_hi = phys_x0 + local_nx;
+    ms.owner_j_lo = phys_y0;
+    ms.owner_j_hi = phys_y0 + local_ny;
 }
 
 // ===========================================================================

@@ -1343,6 +1343,29 @@ void lbm_ibm_compute_body_force(const IbmMarkerSetHandle* ms,
     ibm::compute_ibm_body_force(*marker_set, *out_fx, *out_fy);
 }
 
+/// IBM 标记点集 MPI 分区适配：坐标系转换 + 归属边界设置。
+/// 将标记点坐标从全局格子坐标系转换到本进程本地格子坐标系，
+/// 并设置 owner_i_lo/hi 和 owner_j_lo/hi 以避免跨 MPI 块时的双重计数。
+/// 仅在 MPI 初始化并获知分区信息后调用一次；非 MPI 或单进程模式下无需调用。
+///
+/// @param ms        标记点集
+/// @param x_start   本分区全局 X 起始格点索引
+/// @param y_start   本分区全局 Y 起始格点索引
+/// @param phys_x0   本地网格物理列起始列索引（含幽灵列时 ≥ 1）
+/// @param phys_y0   本地网格物理行起始行索引（含幽灵行时 ≥ 1）
+/// @param local_nx  本分区物理列数
+/// @param local_ny  本分区物理行数
+void lbm_ibm_marker_set_adapt_to_partition(IbmMarkerSetHandle* ms,
+                                             int x_start, int y_start,
+                                             int phys_x0, int phys_y0,
+                                             int local_nx, int local_ny)
+{
+    if (!ms) return;
+    ibm::ibm_marker_set_adapt_to_partition(
+        *reinterpret_cast<ibm::MarkerSet*>(ms),
+        x_start, y_start, phys_x0, phys_y0, local_nx, local_ny);
+}
+
 /// IBM 幽灵层 u 场交换：在 step_ibm() 调用 interpolate_velocity() 之前调用。
 /// solver.step() 完成后幽灵行 u 来自本地边界行外推（非邻居真实速度），
 /// 本函数通过 MPI_Sendrecv 将物理边界行/列的 u 正确填充到邻居的幽灵行/列中，

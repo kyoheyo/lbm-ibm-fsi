@@ -212,6 +212,42 @@ void compute_ibm_body_force(const MarkerSet& ms,
                              double& out_fx, double& out_fy);
 
 // ===========================================================================
+// MPI 分区适配：坐标系转换 + 归属边界设置
+//
+// 将标记点坐标从 **全局格子坐标系** 转换到本进程的 **本地格子坐标系**，
+// 并在 MarkerSet 中记录本进程"拥有"的行/列范围：
+//
+//   offset_x = phys_x0 - x_start
+//   offset_y = phys_y0 - y_start
+//   mk.x  += offset_x,  mk.x0 += offset_x
+//   mk.y  += offset_y,  mk.y0 += offset_y
+//   ms.owner_i_lo = phys_x0,   ms.owner_i_hi = phys_x0 + local_nx
+//   ms.owner_j_lo = phys_y0,   ms.owner_j_hi = phys_y0 + local_ny
+//
+// 此后 interpolate_velocity / spread_force / mls_interpolate_velocity 仅
+// 处理标记中心落入 [owner_i_lo,owner_i_hi) × [owner_j_lo,owner_j_hi) 的点，
+// 防止跨块重复计算导致的 IBM 力双重计数。
+//
+// 对于近分区边界的"归属"标记点，其 δ 核支撑域可跨入幽灵行；幽灵行速度和
+// 力分量由 ibm_halo_exchange_u_2d / ibm_halo_reduce_force_2d 正确同步。
+//
+// 【注意】此函数只应在 MPI 初始化并获知分区信息后调用一次；
+//         非 MPI 或单进程模式下无需调用（默认 owner 范围涵盖全域）。
+//
+// @param ms        标记点集（将被原地修改：坐标偏移 + owner 范围设置）
+// @param x_start   本分区物理域在全局 X 方向的起始格点索引
+// @param y_start   本分区物理域在全局 Y 方向的起始格点索引
+// @param phys_x0   本地网格中物理列的起始列索引（含幽灵列时 ≥ 1）
+// @param phys_y0   本地网格中物理行的起始行索引（含幽灵行时 ≥ 1）
+// @param local_nx  本分区物理列数
+// @param local_ny  本分区物理行数
+// ===========================================================================
+void ibm_marker_set_adapt_to_partition(MarkerSet& ms,
+                                        int x_start, int y_start,
+                                        int phys_x0, int phys_y0,
+                                        int local_nx, int local_ny);
+
+// ===========================================================================
 // MPI 幽灵层 u 场交换（IBM 插值前调用）
 //
 // solver.step() 中 PUSH 流式迁移会覆盖幽灵行的 f 值，导致 compute_macroscopic()

@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <climits>
 
 namespace ibm {
 
@@ -20,6 +21,20 @@ struct Marker {
 // ---------------------------------------------------------------------------
 struct MarkerSet {
     std::vector<Marker> markers;
+
+    // MPI 分区归属范围（本地坐标系）。
+    //
+    // 由 ibm_marker_set_adapt_to_partition() 设置。
+    // 在 interpolate_velocity / spread_force / mls_interpolate_velocity 中，
+    // 仅处理标记中心 floor(mk.x/dx) ∈ [owner_i_lo, owner_i_hi) 且
+    //                  floor(mk.y/dx) ∈ [owner_j_lo, owner_j_hi) 的标记点，
+    // 以避免跨 MPI 块时对同一标记点的重复计算（双重计数）。
+    //
+    // 默认值 0 / INT_MAX 表示不过滤（非 MPI 或单进程模式）。
+    int owner_i_lo = 0;
+    int owner_i_hi = INT_MAX;
+    int owner_j_lo = 0;
+    int owner_j_hi = INT_MAX;
 
     /// 标记点总数
     [[nodiscard]] int size() const {
