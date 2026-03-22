@@ -1240,7 +1240,12 @@ void lbm_ibm_compute_mdf(lbm::LatticeGrid* g,
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    // 多体支持：compute_ibm_forces_mdf 内部会将 g->force 替换为本体力；
+    // 先保存已有体力（来自前序 IBM 体），计算后累加到结果中。
+    std::vector<double> pre_force = g->force;
     ibm::compute_ibm_forces_mdf(*g, *marker_set, dx, dt, n_iter);
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,10 +1282,14 @@ void lbm_ibm_compute_penalty(lbm::LatticeGrid* g,
     std::vector<double> vx(integral_x, integral_x + nm);
     std::vector<double> vy(integral_y, integral_y + nm);
 
+    // 多体支持：spread_force 内部会先清零 g->force；先保存已有体力，计算后累加。
+    std::vector<double> pre_force = g->force;
     ibm::compute_ibm_forces_penalty(*g, *marker_set, dx, dt,
                                      alpha, beta, vx, vy,
                                      ibm::DeltaKernel::FourPoint,
                                      u_target_x, u_target_y);
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
 
     // 将更新后的积分写回 C 数组
     std::copy(vx.begin(), vx.end(), integral_x);
@@ -1309,6 +1318,9 @@ void lbm_ibm_compute_mls(lbm::LatticeGrid* g,
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
 
+    // 多体支持：spread_force 内部会先清零 g->force；先保存已有体力，计算后累加。
+    std::vector<double> pre_force = g->force;
+
     // 1. MLS 速度插值
     ibm::mls_interpolate_velocity(*g, *marker_set, dx);
 
@@ -1318,8 +1330,12 @@ void lbm_ibm_compute_mls(lbm::LatticeGrid* g,
         mk.fy = -mk.uy / dt;
     }
 
-    // 3. 展布力到欧拉网格
+    // 3. 展布力到欧拉网格（内部先清零 g->force，再写入本体力贡献）
     ibm::spread_force(*g, *marker_set, dx);
+
+    // 4. 叠加之前已有的体力（来自前序 IBM 体）
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
 }
 
 /// 从 MarkerSet 读取所有标记点的 Lagrangian 力（fx, fy）。

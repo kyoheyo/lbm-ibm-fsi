@@ -425,6 +425,10 @@ fn run_time_loop(
                 let (local_ibm_fx, local_ibm_fy) = entry.ms.compute_body_force();
                 let ibm_fx = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fx);
                 let ibm_fy = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fy);
+                // compute_body_force() 返回 Σ(mk.fx·mk.ds)，即 IBM 体力施加到流体上的合力。
+                // 由牛顿第三定律，固体（圆柱）所受流体合力 = 负值，即阻力 = -ibm_fx。
+                let drag_fx = -ibm_fx;
+                let drag_fy = -ibm_fy;
                 if rank == 0 {
                     let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
                     let label = entry.label.clone();
@@ -432,7 +436,7 @@ fn run_time_loop(
                         w.submit(move || {
                             output::append_monitor_csv(
                                 &force_csv, step + 1, time,
-                                &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                                &[("ibm_fx", drag_fx), ("ibm_fy", drag_fy)],
                             ).with_context(|| format!(
                                 "Failed to write IBM force CSV ({}) at step {}", label, step + 1
                             ))
@@ -440,7 +444,7 @@ fn run_time_loop(
                     } else {
                         output::append_monitor_csv(
                             &force_csv, step + 1, time,
-                            &[("ibm_fx", ibm_fx), ("ibm_fy", ibm_fy)],
+                            &[("ibm_fx", drag_fx), ("ibm_fy", drag_fy)],
                         ).with_context(|| format!(
                             "Failed to write IBM force CSV ({}) at step {}", entry.label, step + 1
                         ))?;
