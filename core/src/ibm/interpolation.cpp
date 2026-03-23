@@ -279,11 +279,15 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
     const int nx = grid.nx;
     const int ny = grid.ny;
 
-    // MLS 支撑半径（格子单位）和 Gaussian 半宽
-    const double h_mls = 2.5 * dx;          // Gaussian 半宽
-    const double R_s   = 2.5 * dx;          // 支撑半径（截断距离）
-    const double h2    = h_mls * h_mls;
-    const int    iR    = static_cast<int>(std::ceil(R_s / dx)) + 1;
+    // 2025 JCP 参数：H_k = 1.5·dx（每方向支撑域半宽），ε = 0.3（Gaussian 集中参数）
+    // 权函数 w(r) = exp(−r²/(H_k·ε)²)，支撑域：|Δx|≤H_k 且 |Δy|≤H_k（矩形支撑域，Fig.2）
+    // 参考：de Tullio & Pascazio (2016) J. Comput. Phys. 325:116-135
+    //       2025 JCP Wu & Fu Eq.(14)：H_k = 1.5·h_k，ε = 0.3
+    const double H_k   = 1.5 * dx;          // 每方向支撑域半宽
+    const double eps   = 0.3;               // Gaussian 集中参数
+    const double h_eff = H_k * eps;         // 有效 Gaussian 宽度 = 0.45·dx
+    const double h2    = h_eff * h_eff;
+    const int    iR    = static_cast<int>(std::ceil(H_k / dx));  // = 2（覆盖半径内所有节点）
 
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -320,11 +324,13 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
 
                 const double ddx = ii * dx - mk.x;
                 const double ddy = jj * dx - mk.y;
+
+                // 矩形支撑域过滤（2025 JCP Fig.2：2H_x × 2H_y 矩形支撑域）
+                if (std::abs(ddx) > H_k || std::abs(ddy) > H_k) continue;
+
                 const double r2  = ddx * ddx + ddy * ddy;
 
-                if (r2 > R_s * R_s) continue;
-
-                // Gaussian 权函数
+                // Gaussian 权函数 w = exp(−r²/(H_k·ε)²)（2025 JCP Eq.14）
                 const double w = std::exp(-r2 / h2);
 
                 // 基函数 p = [1, Δx/dx, Δy/dx]（归一化以改善条件数）
@@ -392,11 +398,12 @@ void mls_spread_force(lbm::LatticeGrid& grid,
     const int nx = grid.nx;
     const int ny = grid.ny;
 
-    // 与 mls_interpolate_velocity 完全相同的 MLS 参数
-    const double h_mls = 2.5 * dx;
-    const double R_s   = 2.5 * dx;
-    const double h2    = h_mls * h_mls;
-    const int    iR    = static_cast<int>(std::ceil(R_s / dx)) + 1;
+    // 与 mls_interpolate_velocity 完全相同的 MLS 参数（2025 JCP Eq.14）
+    const double H_k   = 1.5 * dx;
+    const double eps   = 0.3;
+    const double h_eff = H_k * eps;
+    const double h2    = h_eff * h_eff;
+    const int    iR    = static_cast<int>(std::ceil(H_k / dx));
 
     // 先将体力场清零
     std::fill(grid.force.begin(), grid.force.end(), 0.0);
@@ -429,9 +436,9 @@ void mls_spread_force(lbm::LatticeGrid& grid,
 
                 const double ddx = ii * dx - mk.x;
                 const double ddy = jj * dx - mk.y;
-                const double r2  = ddx * ddx + ddy * ddy;
-                if (r2 > R_s * R_s) continue;
+                if (std::abs(ddx) > H_k || std::abs(ddy) > H_k) continue;
 
+                const double r2  = ddx * ddx + ddy * ddy;
                 const double w   = std::exp(-r2 / h2);
                 const double p[3] = {1.0, ddx / dx, ddy / dx};
 
@@ -462,9 +469,9 @@ void mls_spread_force(lbm::LatticeGrid& grid,
 
                 const double ddx = ii * dx - mk.x;
                 const double ddy = jj * dx - mk.y;
-                const double r2  = ddx * ddx + ddy * ddy;
-                if (r2 > R_s * R_s) continue;
+                if (std::abs(ddx) > H_k || std::abs(ddy) > H_k) continue;
 
+                const double r2  = ddx * ddx + ddy * ddy;
                 const double w   = std::exp(-r2 / h2);
                 const double p[3] = {1.0, ddx / dx, ddy / dx};
 
@@ -560,23 +567,27 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
 }
 
 // ===========================================================================
-// 原始 MLS-IBM（Original MLS）—— MLS 插值 + Peskin δ 函数展布
+// 原始 MLS-IBM（Original MLS）—— MLS 插值 + MLS 形状函数展布（含守恒因子 c_i）
 //
-// 参考：2025 JCP §2.1 "Original MLS method"
+// 参考：2025 JCP §3.1 "Original MLS-IBM"（Algorithm 1）
+//       Vanella & Balaras (2009) J. Comput. Phys. 228:2366-2391
 //
 // 算法（单步直接力法）：
-//   1. MLS 速度插值：U_m = J · u
-//   2. 直接力：F_m = (u_target − U_m) / dt
-//   3. Peskin δ 展布：f(x) = Σ_m F_m · δ(x − X_m) · ds_m
+//   1. 计算 MLS 形状函数 Φ（调用 mls_interpolate_velocity）
+//   2. MLS 速度插值：U_m = Φ^T · u*
+//   3. 直接力：F_m = ρ(u_target − U_m) / dt（ρ=1 格子单位）
+//   4. MLS 形状函数展布（含守恒因子 c_i = ds_i/ΔV_j = ds_i，Eq.16 + Eq.18）：
+//        f_j = Σ_m c_m φ_j^m F_m  ≡  mls_spread_force（ds_m 即 c_m·ΔV_j）
+//   5. 更新速度：u^{n+1} = u* + dt·f/ρ
 //
-// 注意：展布算子 S = δ（非 J^T），不满足离散伴随一致性。
-// 相比显式/隐式 MLS，动量守恒精度偏低，但实现最简单。
+// 注意：展布算子与插值算子非完全伴随（φ_j^m ≠ φ_m^j），因此
+// 原始 MLS-IBM 存在无滑移误差（见 2025 JCP Fig.3a）。
 // ===========================================================================
 void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
                                       double dt,
-                                      DeltaKernel kernel,
+                                      DeltaKernel /*kernel*/,
                                       double u_target_x,
                                       double u_target_y)
 {
@@ -584,7 +595,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
         throw std::runtime_error("Original MLS-IBM: only D2Q9 supported currently");
     }
 
-    // 1. MLS 速度插值：U_m = J · u
+    // 1. MLS 速度插值：U_m = J · u（更新 mk.ux/uy）
     mls_interpolate_velocity(fluid, ms, dx);
 
     // 2. 直接力：F_m = (u_target − U_m) / dt
@@ -593,22 +604,27 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
         mk.fy = (u_target_y - mk.uy) / dt;
     }
 
-    // 3. 标准 Peskin δ 函数展布（S ≠ J^T，非伴随一致）
-    spread_force(fluid, ms, dx, kernel);
+    // 3. MLS 形状函数展布（Eq.16；mls_spread_force 含 ds_m 守恒因子）
+    mls_spread_force(fluid, ms, dx);
 }
 
 // ===========================================================================
-// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 伴随展布，单步
+// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 形状函数展布 + Z 全局修正
 //
-// 参考：2025 JCP §2.2 "Explicit MLS variant"
+// 参考：2025 JCP §3.2 "Explicit variant MLS-IBM"（Algorithm 2）
+//       Chen et al. (2022) Phys. Rev. E 106:015307
 //
-// 算法（单步显式直接力法）：
-//   1. MLS 速度插值：U_m = J · u
+// 算法：
+//   1. 计算 MLS 形状函数 Φ；MLS 速度插值：U_m = Φ^T · u*
 //   2. 直接力：F_m = (u_target − U_m) / dt
-//   3. MLS 伴随展布：f = J^T · F
+//   3. 第一次 MLS 展布：f = J^T · F
+//   4. 重插值：g_k = J · f（用展布后力场重新插值到 Lagrangian 点）
+//   5. 全局修正因子（最小化 ||Z·g − F||² 的最小二乘解，Eq.21）：
+//        Z = Σ_k (F_k · g_k) / Σ_k |g_k|²
+//   6. 修正展布：f → Z · f
 //
-// 满足离散伴随一致性（J 与 J^T 互为转置），相比原始 MLS 动量守恒更好。
-// 等价于 compute_ibm_forces_mls_implicit(n_iter=1)，但语义更明确。
+// 注意：Z 修正因子会破坏力和力矩守恒（见 2025 JCP Table 1），
+// 且无滑移残差仍显著（见 Fig.3b）。推荐使用隐式 MLS（compute_ibm_forces_mls_implicit）。
 // ===========================================================================
 void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
@@ -621,7 +637,7 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
         throw std::runtime_error("Explicit MLS-IBM: only D2Q9 supported currently");
     }
 
-    // 1. MLS 速度插值：U_m = J · u
+    // 1. MLS 速度插值：U_m = J · u（更新 mk.ux/uy）
     mls_interpolate_velocity(fluid, ms, dx);
 
     // 2. 直接力：F_m = (u_target − U_m) / dt
@@ -630,12 +646,36 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
         mk.fy = (u_target_y - mk.uy) / dt;
     }
 
-    // 3. MLS 伴随展布：f = J^T · F（满足离散伴随一致性）
+    // 3. 第一次 MLS 展布：f = J^T · F（写入 fluid.force）
     mls_spread_force(fluid, ms, dx);
+
+    // 4. 重插值：g_k = J · f（将展布后的力场 fluid.force 插值回 Lagrangian 点）
+    //    利用 swap 技巧：临时令 fluid.u = fluid.force，用 mls_interpolate_velocity 读取
+    std::swap(fluid.u, fluid.force);
+    mls_interpolate_velocity(fluid, ms, dx);  // 写入 mk.ux = g_kx, mk.uy = g_ky
+    std::swap(fluid.u, fluid.force);          // 恢复 fluid.u
+
+    // 5. 全局修正因子 Z（最小化 ||Z·g − F||²，Eq.21）：
+    //    Z = Σ_k (F_k · g_k) / Σ_k |g_k|²
+    //    mk.fx/fy 仍持有步骤 2 的 F_b 值；mk.ux/uy 现在持有步骤 4 的 g_k
+    double num = 0.0, den = 0.0;
+    for (int m = 0; m < ms.size(); ++m) {
+        const auto& mk = ms.markers[m];
+        // MPI 过滤（与 mls_interpolate_velocity 相同的归属条件）
+        const int i0 = static_cast<int>(std::round(mk.x / dx));
+        const int j0 = static_cast<int>(std::round(mk.y / dx));
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+        num += mk.fx * mk.ux + mk.fy * mk.uy;
+        den += mk.ux * mk.ux + mk.uy * mk.uy;
+    }
+    const double Z = (den > 1e-30) ? num / den : 1.0;
+
+    // 6. 将 fluid.force 乘以 Z（原地修正）
+    for (auto& f : fluid.force) f *= Z;
 }
 
 
-//
 // 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
 //
 // 每步调用：
