@@ -497,14 +497,6 @@ void mls_spread_force(lbm::LatticeGrid& grid,
     }
 }
 
-// ===========================================================================
-// 内部辅助：MLS 形状函数支撑集结构
-// ===========================================================================
-struct MlsSupportSet {
-    std::vector<int>    idx;   ///< Euler 节点全局索引
-    std::vector<double> phi;   ///< 对应 MLS 形状函数值 φ_j^k
-};
-
 // 内部辅助：计算每个 Lagrangian 点的 MLS 形状函数支撑集
 // 与 mls_interpolate_velocity / mls_spread_force 使用完全相同的参数（2025 JCP Eq.14）
 static void build_mls_shape_functions(const lbm::LatticeGrid& grid,

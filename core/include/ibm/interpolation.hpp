@@ -35,6 +35,7 @@
 #include "marker.hpp"
 #include "../lbm/lattice.hpp"
 #include "../lbm/mpi_decomp.hpp"
+#include <vector>
 
 namespace ibm {
 
@@ -45,6 +46,23 @@ namespace ibm {
 //   4 点（Peskin）— 支撑宽度 4h
 // ---------------------------------------------------------------------------
 enum class DeltaKernel { TwoPoint, FourPoint };
+
+// ===========================================================================
+// MLS 形状函数支撑集（隐式 MLS 方案内部数据结构）
+//
+// 用于缓存每个 Lagrangian 标记点的 MLS 形状函数值，避免固定物体每步重复构建。
+// 由 compute_ibm_forces_mls_implicit_stationary 的 phi_cache 参数持久化。
+//
+// 字段说明：
+//   idx  — 该标记点支撑域内各 Euler 节点的全局索引（行主序 grid.idx(i,j)）
+//   phi  — 对应的 MLS 形状函数值 φ_j^k（2025 JCP Eq.10–14）
+//
+// 注意：对非本进程拥有的标记点，idx 和 phi 均为空（MPI 归属过滤）。
+// ===========================================================================
+struct MlsSupportSet {
+    std::vector<int>    idx;   ///< Euler 节点全局索引
+    std::vector<double> phi;   ///< 对应 MLS 形状函数值 φ_j^k
+};
 
 // ---------------------------------------------------------------------------
 // 速度插值（标准 Peskin δ 函数）：
@@ -303,19 +321,23 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
 //
 // 参考：2025 JCP Wu & Fu §4，Algorithm 3，Scheme I
 //
-// 对于几何固定（stationary）的物体，传递算子 Φ 和相关矩阵 A 不随时间变化。
-// 本函数将 LU 分解结果缓存于 A_lu_cache / piv_cache（调用方持久化），
-// 后续每步仅执行 O(N_l²) 的 LU 代换，而非重新构建和求解线性系统。
-// 对 N_l 较大时比 Scheme II（GMRES）更快（2025 JCP Table 2）。
+// 对于几何固定（stationary）的物体，传递算子 Φ（phi_cache）和相关矩阵 A 不随时间变化。
+// 本函数将 LU 分解结果缓存于 A_lu_cache / piv_cache，将 MLS 形状函数集缓存于
+// phi_cache（调用方持久化），后续每步仅需：
+//   1. 用 phi_cache 插值速度（O(N_l·N_e)）
+//   2. 构建右端向量 B（O(N_l)）
+//   3. LU 代换求解（O(N_l²)）
+// 与 Scheme II（每步 GMRES）相比，消除了 phi_data 重建和矩阵构建两处重复开销。
 //
 // 用法示例（在时间循环外声明缓存，在循环内每步调用）：
 // @code
-//   std::vector<double> A_lu_cache;
-//   std::vector<int>    piv_cache;
+//   std::vector<double>           A_lu_cache;
+//   std::vector<int>              piv_cache;
+//   std::vector<ibm::MlsSupportSet> phi_cache;
 //   for (int step = 0; step < n_steps; ++step) {
 //       solver.step();
 //       compute_ibm_forces_mls_implicit_stationary(
-//           fluid, ms, dx, dt, A_lu_cache, piv_cache);
+//           fluid, ms, dx, dt, A_lu_cache, piv_cache, phi_cache);
 //   }
 // @endcode
 //
@@ -325,6 +347,7 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
 // @param dt           时间步长
 // @param A_lu_cache   LU 分解缓存（首次调用时填充，后续复用；传入空 vector 即自动初始化）
 // @param piv_cache    LU 行主元缓存（与 A_lu_cache 配套）
+// @param phi_cache    MLS 形状函数集缓存（首次调用时填充，后续复用；传入空 vector 即自动初始化）
 // @param u_target_x/y 目标速度（静止固体通常为 0.0）
 // ===========================================================================
 void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
@@ -333,6 +356,7 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
                                                  double dt,
                                                  std::vector<double>& A_lu_cache,
                                                  std::vector<int>&    piv_cache,
+                                                 std::vector<MlsSupportSet>& phi_cache,
                                                  double u_target_x = 0.0,
                                                  double u_target_y = 0.0);
 
