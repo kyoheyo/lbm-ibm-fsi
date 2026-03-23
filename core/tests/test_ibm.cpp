@@ -530,6 +530,153 @@ static int test_marker_make_from_file_no_ds();
 static int test_ibm_body_force_sum();
 static int test_mark_solid_from_mesh_file();
 
+// ===========================================================================
+// MLS 伴随展布测试
+// ===========================================================================
+
+// 测试：mls_spread_force 在均匀力场下产生非零有限力
+static int test_mls_spread_force_finite()
+{
+    const int nx = 32, ny = 32;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 16);
+    for (auto& mk : ms.markers) {
+        mk.fx = 0.1;
+        mk.fy = 0.0;
+    }
+
+    ibm::mls_spread_force(g, ms, 1.0);
+
+    double max_force = 0.0;
+    for (int i = 0; i < g.size(); ++i) {
+        max_force = std::max(max_force, std::abs(g.force[i * 2 + 0]));
+    }
+    const bool ok = std::isfinite(max_force) && max_force > 1e-10;
+    std::printf("[IBM] MLS spread_force produces non-zero finite force: max=%.2e → %s\n",
+                max_force, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：MLS 伴随展布的分区性质——均匀力场的展布和恒等于 Σ mk.fx * mk.ds
+// (验证展布算子的"全局积分守恒"：Σ_i f[x_i] = Σ_m F_m · ds_m)
+static int test_mls_spread_force_integral_conservation()
+{
+    const int nx = 32, ny = 32;
+    const double dx = 1.0;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    for (auto& mk : ms.markers) {
+        mk.fx = 0.05;
+        mk.fy = 0.03;
+    }
+
+    ibm::mls_spread_force(g, ms, dx);
+
+    // 计算 Eulerian 力场的总和（应接近 Σ_m mk.fx * mk.ds）
+    double sum_fx = 0.0, sum_fy = 0.0;
+    for (int i = 0; i < g.size(); ++i) {
+        sum_fx += g.force[i * 2 + 0];
+        sum_fy += g.force[i * 2 + 1];
+    }
+    // 计算 Lagrangian 力的总积分
+    double lag_sum_fx = 0.0, lag_sum_fy = 0.0;
+    for (const auto& mk : ms.markers) {
+        lag_sum_fx += mk.fx * mk.ds;
+        lag_sum_fy += mk.fy * mk.ds;
+    }
+
+    // 允许较宽的容差（MLS 截断误差 < 5%）
+    const bool ok = std::abs(sum_fx - lag_sum_fx) < 0.05 * std::abs(lag_sum_fx) + 1e-10
+                 && std::abs(sum_fy - lag_sum_fy) < 0.05 * std::abs(lag_sum_fy) + 1e-10;
+    std::printf("[IBM] MLS spread integral conservation: sum_fx=%.4f lag=%.4f → %s\n",
+                sum_fx, lag_sum_fx, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：隐式 MLS-IBM 产生非零体力
+static int test_mls_implicit_force_nonzero()
+{
+    const int nx = 32, ny = 32;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    // 初始化均匀来流
+    const double u0 = 0.05;
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2 + 0] = u0;
+        g.u[i * 2 + 1] = 0.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_mls_implicit(g, ms, 1.0, 1.0, 3);
+
+    double max_force = 0.0;
+    for (int i = 0; i < g.size(); ++i) {
+        max_force = std::max(max_force, std::abs(g.force[i * 2 + 0]));
+    }
+    const bool ok = std::isfinite(max_force) && max_force > 1e-8;
+    std::printf("[IBM] Implicit MLS-IBM force non-zero: max_force=%.2e → %s\n",
+                max_force, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：隐式 MLS-IBM 比单次直接力法残差更小
+// （多次迭代应更接近无滑移条件 u_IB ≈ 0）
+static int test_mls_implicit_vs_explicit_residual()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    // 方案 1：单步显式 MLS（不迭代）
+    lbm::LatticeGrid g1(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g1.size(); ++i) {
+        g1.u[i * 2 + 0] = u0;
+        g1.u[i * 2 + 1] = 0.0;
+    }
+    auto ms1 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_mls_implicit(g1, ms1, 1.0, 1.0, /*n_iter=*/1);
+
+    // 再次插值验证残差
+    lbm::LatticeGrid g1_check = g1;
+    for (int i = 0; i < g1_check.size(); ++i) {
+        g1_check.u[i * 2 + 0] = u0 + g1.force[i * 2 + 0];
+        g1_check.u[i * 2 + 1] = 0.0 + g1.force[i * 2 + 1];
+    }
+    auto ms1c = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::mls_interpolate_velocity(g1_check, ms1c, 1.0);
+    double res1 = 0.0;
+    for (const auto& mk : ms1c.markers) {
+        res1 = std::max(res1, std::abs(mk.ux));
+    }
+
+    // 方案 2：3 步迭代隐式 MLS
+    lbm::LatticeGrid g3(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g3.size(); ++i) {
+        g3.u[i * 2 + 0] = u0;
+        g3.u[i * 2 + 1] = 0.0;
+    }
+    auto ms3 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_mls_implicit(g3, ms3, 1.0, 1.0, /*n_iter=*/3);
+
+    lbm::LatticeGrid g3_check = g3;
+    for (int i = 0; i < g3_check.size(); ++i) {
+        g3_check.u[i * 2 + 0] = u0 + g3.force[i * 2 + 0];
+        g3_check.u[i * 2 + 1] = 0.0 + g3.force[i * 2 + 1];
+    }
+    auto ms3c = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::mls_interpolate_velocity(g3_check, ms3c, 1.0);
+    double res3 = 0.0;
+    for (const auto& mk : ms3c.markers) {
+        res3 = std::max(res3, std::abs(mk.ux));
+    }
+
+    // 3 次迭代后的残差应小于 1 次迭代
+    const bool ok = std::isfinite(res1) && std::isfinite(res3) && (res3 <= res1 + 1e-10);
+    std::printf("[IBM] Implicit MLS 3-iter residual ≤ 1-iter: res1=%.3e res3=%.3e → %s\n",
+                res1, res3, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_ibm_main()
 {
     int failures = 0;
@@ -554,6 +701,11 @@ int test_ibm_main()
     failures += test_marker_make_from_file_no_ds();
     failures += test_ibm_body_force_sum();
     failures += test_mark_solid_from_mesh_file();
+    // 隐式 MLS-IBM 新测试（JCP 2025）
+    failures += test_mls_spread_force_finite();
+    failures += test_mls_spread_force_integral_conservation();
+    failures += test_mls_implicit_force_nonzero();
+    failures += test_mls_implicit_vs_explicit_residual();
     return failures;
 }
 

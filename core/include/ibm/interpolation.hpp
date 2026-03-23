@@ -186,6 +186,74 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
                                double dx);
 
 // ===========================================================================
+// MLS 力展布（MLS-IBM 的伴随/转置展布算子）
+//
+// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+//       for high fidelity fluid-structure interaction simulations"
+//
+// 使用 MLS 插值算子的转置进行力展布，保证与 mls_interpolate_velocity()
+// 的离散伴随一致性（J^T 伴随属性），从而满足动量守恒条件。
+//
+// 算法（对每个标记点 X_m）：
+//   1. 构造与插值相同的 MLS 矩阵 M = Σ_i w_i p_i ⊗ p_i^T
+//   2. 求解 M · c = e_0，e_0 = [1,0,0]^T（即求第一行的 MLS 系数）
+//   3. 对每个支撑节点 x_i：
+//        φ_i = w_i · (c_0 + c_1·Δx/dx + c_2·Δy/dx)  ← MLS 形状函数
+//        f[x_i] += φ_i · F_m · ds_m
+//
+// 此展布与 mls_interpolate_velocity 互为伴随，满足离散恒等式：
+//   Σ_m F_m · (J·u)_m = Σ_i u_i · (J^T·F)_i
+//
+// 每次调用前自动将 grid.force 清零。
+//
+// @param grid    Eulerian 流体网格（grid.force 将被覆盖为最终 IBM 体力）
+// @param ms      拉格朗日标记点集（读取 mk.fx, mk.fy, mk.ds）
+// @param dx      格子间距
+// ===========================================================================
+void mls_spread_force(lbm::LatticeGrid& grid,
+                      const MarkerSet& ms,
+                      double dx);
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算
+//
+// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+//       for high fidelity fluid-structure interaction simulations"
+//
+// 使用 MLS 插值（J）和 MLS 伴随展布（J^T）通过多步迭代逼近满足无滑移约束
+// 的 IBM 力，比单步直接力法精度更高、无滑移残差更小。
+//
+// 算法（n_iter 次迭代）：
+//   初始化：F = 0，u_work = grid.u
+//   对 k = 0..n_iter-1：
+//     1. MLS 速度插值：U^k = J · u_work（调用 mls_interpolate_velocity）
+//     2. 增量力：δF = (u_target − U^k) / dt
+//     3. MLS 伴随展布：δf = J^T · δF（调用 mls_spread_force）
+//     4. 更新工作速度：u_work += dt · δf
+//     5. 累积总力：F += δF
+//   结束：fluid.force = J^T · F（最终 MLS 展布）
+//
+// 相比单步 MLS-IBM（mls_interpolate_velocity + spread_force），本函数：
+//   - 使用 MLS 伴随展布（而非 Peskin δ），保证离散伴随一致性
+//   - 通过迭代逼近隐式无滑移条件，显著减少界面速度误差
+//
+// @param fluid      Eulerian 流体网格（grid.force 将被覆盖为最终 IBM 体力）
+// @param ms         拉格朗日标记点集（mk.fx/fy 将被写入最终力；mk.ux/uy 写入插值速度）
+// @param dx         格子间距
+// @param dt         时间步长（格子单位通常 = 1）
+// @param n_iter     迭代次数（建议 2–4，默认 3）
+// @param u_target_x 目标 x 速度（静止固体取 0.0；移动边界取壁面速度）
+// @param u_target_y 目标 y 速度
+// ===========================================================================
+void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt         = 1.0,
+                                      int    n_iter     = 3,
+                                      double u_target_x = 0.0,
+                                      double u_target_y = 0.0);
+
+// ===========================================================================
 // IBM 固体受力统计：合力计算
 //
 // 通过对 Lagrangian 标记点的力密度加权求和，计算浸入固体所受的总合力：

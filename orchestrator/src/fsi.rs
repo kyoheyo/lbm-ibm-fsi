@@ -324,7 +324,7 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
                 "Penalty-IBM (Goldstein 1993, α={:.2}, β={:.2})",
                 ibm_cfg.alpha, ibm_cfg.beta,
             ),
-            "mls" => "MLS-IBM (moving least squares, Wang 2009)".to_string(),
+            "mls" => "MLS-IBM (implicit MLS, JCP 2025, n_iter=3)".to_string(),
             _     => format!("MDF-IBM (multi-direct-forcing, Luo 2007, n_iter={})", ibm_cfg.n_iter),
         };
         println!(

@@ -280,10 +280,18 @@ mod ffi {
                                        integral_x: *mut f64,
                                        integral_y: *mut f64,
                                        u_target_x: f64, u_target_y: f64);
-        /// MLS-IBM 一步：移动最小二乘速度插值 + 直接力展布。
+        /// MLS-IBM 隐式一步：MLS 插值 + MLS 伴随展布 + 多步迭代修正（n_iter=3）。
+        /// 相比旧接口，使用 MLS 伴随展布替代 Peskin δ，满足离散伴随一致性。
         pub fn lbm_ibm_compute_mls(g: *mut LatticeGridHandle,
                                    ms: *mut IbmMarkerSetHandle,
                                    dx: f64, dt: f64);
+        /// MLS-IBM 隐式一步（可指定迭代次数和目标速度）。
+        /// n_iter: 迭代次数（建议 2–4）；u_target_x/y: 目标速度（静止固体取 0.0）。
+        pub fn lbm_ibm_compute_mls_implicit(g: *mut LatticeGridHandle,
+                                            ms: *mut IbmMarkerSetHandle,
+                                            dx: f64, dt: f64,
+                                            n_iter: c_int,
+                                            u_target_x: f64, u_target_y: f64);
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
@@ -1250,7 +1258,14 @@ impl LbmIbmMarkerSet {
         }
     }
 
-    /// MLS-IBM 一步（移动最小二乘插值 + 直接力，Wang 2009）。
+    /// 隐式 MLS-IBM 一步（MLS 插值 + MLS 伴随展布 + 多步迭代修正，JCP 2025）。
+    ///
+    /// 相比旧版 `step_mls`，本函数使用：
+    ///   - MLS 伴随展布（J^T）替代 Peskin δ，满足离散伴随一致性
+    ///   - 多步迭代修正（默认 n_iter=3）逼近无滑移条件
+    ///
+    /// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+    ///       for high fidelity fluid-structure interaction simulations"
     ///
     /// @param grid  格子网格
     /// @param dx    格子间距
@@ -1258,6 +1273,24 @@ impl LbmIbmMarkerSet {
     pub fn step_mls(&mut self, grid: &mut LbmGrid, dx: f64, dt: f64) {
         unsafe {
             ffi::lbm_ibm_compute_mls(grid.ptr, self.ptr, dx, dt)
+        }
+    }
+
+    /// 隐式 MLS-IBM 一步（可指定迭代次数和目标速度）。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距
+    /// @param dt         时间步长
+    /// @param n_iter     迭代次数（建议 2–4）
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_mls_implicit(&mut self, grid: &mut LbmGrid,
+                              dx: f64, dt: f64,
+                              n_iter: i32,
+                              u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls_implicit(
+                grid.ptr, self.ptr, dx, dt, n_iter, u_target_x, u_target_y)
         }
     }
 

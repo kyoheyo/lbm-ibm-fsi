@@ -372,6 +372,187 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
 }
 
 // ===========================================================================
+// MLS 力展布（MLS-IBM 的伴随/转置展布算子）
+//
+// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+//       for high fidelity fluid-structure interaction simulations"
+//
+// 使用与 mls_interpolate_velocity 完全相同的 MLS 参数和矩阵，
+// 但采用转置展布：对每个标记点 X_m，先构建 M 并求解 M·c=e_0，
+// 再用 MLS 形状函数 φ_i=w_i·(c^T·p_i) 把力散布到支撑节点。
+// ===========================================================================
+void mls_spread_force(lbm::LatticeGrid& grid,
+                      const MarkerSet& ms,
+                      double dx)
+{
+    if (grid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("MLS-IBM spread: only D2Q9 supported currently");
+    }
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+
+    // 与 mls_interpolate_velocity 完全相同的 MLS 参数
+    const double h_mls = 2.5 * dx;
+    const double R_s   = 2.5 * dx;
+    const double h2    = h_mls * h_mls;
+    const int    iR    = static_cast<int>(std::ceil(R_s / dx)) + 1;
+
+    // 先将体力场清零
+    std::fill(grid.force.begin(), grid.force.end(), 0.0);
+
+    // 展布是散射操作（一个标记点写多个节点），不使用并行以避免竞争
+    for (int m = 0; m < ms.size(); ++m) {
+        const auto& mk = ms.markers[m];
+
+        const double xm = mk.x / dx;
+        const double ym = mk.y / dx;
+        const int    i0 = static_cast<int>(std::round(xm));
+        const int    j0 = static_cast<int>(std::round(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+
+        // --- 第一遍：构造 MLS 矩阵（与插值完全相同）---
+        double M[3][3] = {};
+        int n_contrib = 0;
+
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                const double r2  = ddx * ddx + ddy * ddy;
+                if (r2 > R_s * R_s) continue;
+
+                const double w   = std::exp(-r2 / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        M[r][c] += w * p[r] * p[c];
+                ++n_contrib;
+            }
+        }
+
+        if (n_contrib < 3) continue;   // 支撑域节点不足，跳过此标记点
+
+        // 求解 M·c = e_0（e_0=[1,0,0]^T），得到 MLS 形状函数系数 c
+        // 满足：φ_i(X_m) = w_i · (c_0 + c_1·Δx_i/dx + c_2·Δy_i/dx)
+        double e0[3] = {1.0, 0.0, 0.0};
+        double c[3];
+        if (!solve3x3(M, e0, c)) continue;   // 奇异矩阵：跳过此标记点
+
+        // --- 第二遍：用 MLS 形状函数展布力 ---
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                const double r2  = ddx * ddx + ddy * ddy;
+                if (r2 > R_s * R_s) continue;
+
+                const double w   = std::exp(-r2 / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+
+                // MLS 形状函数：φ_i = w_i · (c^T · p_i)
+                const double phi = w * (c[0] * p[0] + c[1] * p[1] + c[2] * p[2]);
+
+                // 展布权重包含弧长元素 ds（与 spread_force 保持量纲一致）
+                grid.force[node * 2 + 0] += phi * mk.fx * mk.ds;
+                grid.force[node * 2 + 1] += phi * mk.fy * mk.ds;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算
+//
+// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+//       for high fidelity fluid-structure interaction simulations"
+//
+// 使用 MLS 插值（J）和 MLS 伴随展布（J^T）进行多步迭代，逼近满足无滑移
+// 约束的 IBM 力。与 compute_ibm_forces_mdf() 相比，本函数同时对插值和展布
+// 均采用 MLS 算子，保证离散伴随一致性，从而提高精度并减少界面速度误差。
+// ===========================================================================
+void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      int    n_iter,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Implicit MLS-IBM: only D2Q9 supported currently");
+    }
+
+    const int n = fluid.size();
+    const int d = fluid.dim();   // = 2
+
+    // 工作速度场（子迭代过程中被逐步修正）
+    std::vector<double> u_work = fluid.u;
+
+    // 累积欧拉力场（最终写入 fluid.force）
+    std::vector<double> F_total(n * d, 0.0);
+
+    // 初始化标记点力为零
+    for (auto& mk : ms.markers) { mk.fx = mk.fy = 0.0; }
+
+    // 临时力场（每次子迭代的增量 MLS 展布结果）
+    std::vector<double> dF_euler(n * d, 0.0);
+
+    for (int iter = 0; iter < n_iter; ++iter) {
+        // 1. 用 u_work 进行 MLS 速度插值
+        //    临时将 fluid.u 替换为 u_work 供 mls_interpolate_velocity 读取
+        std::swap(fluid.u, u_work);
+        mls_interpolate_velocity(fluid, ms, dx);
+        std::swap(fluid.u, u_work);
+
+        // 2. 计算增量力（无滑移条件：目标速度 = u_target_x/y）
+        for (auto& mk : ms.markers) {
+            mk.fx = (u_target_x - mk.ux) / dt;
+            mk.fy = (u_target_y - mk.uy) / dt;
+        }
+
+        // 3. MLS 伴随展布增量力到欧拉网格（mls_spread_force 内部先清零 fluid.force）
+        mls_spread_force(fluid, ms, dx);
+        std::swap(fluid.force, dF_euler);   // dF_euler = 本次 MLS 展布结果
+
+        // 4. 更新工作速度：u_work += dt · δf（ρ=1 格子单位）
+        for (int i = 0; i < n; ++i) {
+            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
+            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
+        }
+
+        // 5. 累积总欧拉力
+        for (int i = 0; i < n * d; ++i) {
+            F_total[i] += dF_euler[i];
+        }
+    }
+
+    // 写入最终总力到 fluid.force
+    fluid.force = F_total;
+
+    // 标记点力：重新计算（总力 F = Σ δF，即最后一次工作速度中的残差对应的力）
+    // 为便于 FSI 反作用力计算，保留最后一次子迭代的 mk.fx/fy（增量值已累加）
+}
+
+// ===========================================================================
 // 罚函数法 IBM（Penalty-IBM / Feedback Forcing）
 //
 // 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.

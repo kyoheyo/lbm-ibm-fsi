@@ -1307,20 +1307,27 @@ void lbm_ibm_compute_penalty(lbm::LatticeGrid* g,
 }
 
 // ---------------------------------------------------------------------------
-// MLS-IBM（移动最小二乘速度插值 + 直接力展布）
+// MLS-IBM（移动最小二乘速度插值 + 隐式力展布）
 // ---------------------------------------------------------------------------
 
-/// MLS-IBM 一步（插值速度 → 计算直接力 → 展布到欧拉网格）。
+/// MLS-IBM 隐式一步（MLS插值 → 多步迭代修正 → MLS伴随展布）。
 ///
-/// 算法：
+/// 算法（n_iter 次迭代）：
 ///   1. mls_interpolate_velocity(grid, ms, dx) → mk.ux, mk.uy
-///   2. 直接力：mk.fx = (0 − mk.ux) / dt，mk.fy = (0 − mk.uy) / dt
-///   3. spread_force(grid, ms, dx) → grid.force
+///   2. 增量力：mk.fx = (u_target − mk.ux)/dt，mk.fy = (u_target − mk.uy)/dt
+///   3. mls_spread_force(grid, ms, dx) → grid.force（MLS 伴随展布）
+///   4. 修正工作速度 u_work += dt · grid.force
+///   5. 重复 n_iter 次，累积总力写入 grid.force
 ///
-/// @param g    LatticeGrid 指针
-/// @param ms   IbmMarkerSet 句柄
-/// @param dx   格子间距
-/// @param dt   时间步长
+/// 与旧版 lbm_ibm_compute_mls（单步直接力 + Peskin δ 展布）相比：
+///   - 使用 MLS 伴随展布替代 Peskin δ，满足离散伴随一致性
+///   - 多步迭代逼近无滑移条件，降低界面速度误差
+///
+/// @param g      LatticeGrid 指针
+/// @param ms     IbmMarkerSet 句柄
+/// @param dx     格子间距
+/// @param dt     时间步长
+/// @param n_iter 迭代次数（建议 2–4；默认 3）
 void lbm_ibm_compute_mls(lbm::LatticeGrid* g,
                            IbmMarkerSetHandle* ms,
                            double dx, double dt)
@@ -1328,22 +1335,42 @@ void lbm_ibm_compute_mls(lbm::LatticeGrid* g,
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
 
-    // 多体支持：spread_force 内部会先清零 g->force；先保存已有体力，计算后累加。
+    // 多体支持：mls_spread_force 内部会先清零 g->force；先保存已有体力，计算后累加。
     std::vector<double> pre_force = g->force;
 
-    // 1. MLS 速度插值
-    ibm::mls_interpolate_velocity(*g, *marker_set, dx);
+    // 使用隐式 MLS-IBM（MLS 插值 + MLS 伴随展布 + 3 次迭代修正）
+    ibm::compute_ibm_forces_mls_implicit(*g, *marker_set, dx, dt, /*n_iter=*/3);
 
-    // 2. 直接力（无滑移条件：u_target = 0）
-    for (auto& mk : marker_set->markers) {
-        mk.fx = -mk.ux / dt;
-        mk.fy = -mk.uy / dt;
-    }
+    // 叠加之前已有的体力（来自前序 IBM 体）
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
 
-    // 3. 展布力到欧拉网格（内部先清零 g->force，再写入本体力贡献）
-    ibm::spread_force(*g, *marker_set, dx);
+/// MLS-IBM 隐式一步（可指定迭代次数）。
+///
+/// 与 lbm_ibm_compute_mls() 相同，但允许调用方指定迭代次数。
+///
+/// @param g         LatticeGrid 指针
+/// @param ms        IbmMarkerSet 句柄
+/// @param dx        格子间距
+/// @param dt        时间步长
+/// @param n_iter    迭代次数（建议 2–4）
+/// @param u_target_x 目标 x 速度（静止固体取 0.0；移动边界取壁面速度）
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_mls_implicit(lbm::LatticeGrid* g,
+                                    IbmMarkerSetHandle* ms,
+                                    double dx, double dt,
+                                    int n_iter,
+                                    double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
 
-    // 4. 叠加之前已有的体力（来自前序 IBM 体）
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_implicit(*g, *marker_set, dx, dt, n_iter,
+                                          u_target_x, u_target_y);
+
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
 }
