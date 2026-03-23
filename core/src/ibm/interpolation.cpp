@@ -246,7 +246,18 @@ void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
 
 // 正则化下界（MLS 矩阵奇异性保护，避免除以零）
 static constexpr double MLS_REGULARIZATION_EPS = 1e-30;
-// 返回 false 若行列式接近零（奇异）
+
+// Cramér 法则求解 3×3 线性系统 A·x = b（仅适用于**对称矩阵**）
+//
+// 实现说明（对称矩阵 Cramér 等价形式）：
+//   对 x[k]，Cramér 法则要求 det(A_{替换第k列为b}) / det(A)。
+//   利用 det(M) = det(M^T)，对 k=1,2 将 "替换列" 操作等价转换为 "替换行" 操作，
+//   使三个分量的计算结构完全统一（均为沿第一行展开）。
+//   对称矩阵保证了等价性：A[i][j] = A[j][i] ↔ 转置 = 原矩阵。
+//
+//   故此函数**仅对对称矩阵（如 MLS 矩阵 M = Σ wᵢ pᵢ⊗pᵢ^T）正确**。
+//
+// 返回 false 若行列式绝对值 < 1e-30（奇异）
 static bool solve3x3(const double A[3][3], const double b[3], double x[3])
 {
     const double det = A[0][0] * (A[1][1]*A[2][2] - A[1][2]*A[2][1])
@@ -282,7 +293,7 @@ void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
     // 2025 JCP 参数：H_k = 1.5·dx（每方向支撑域半宽），ε = 0.3（Gaussian 集中参数）
     // 权函数 w(r) = exp(−r²/(H_k·ε)²)，支撑域：|Δx|≤H_k 且 |Δy|≤H_k（矩形支撑域，Fig.2）
     // 参考：de Tullio & Pascazio (2016) J. Comput. Phys. 325:116-135
-    //       2025 JCP Wu & Fu Eq.(14)：H_k = 1.5·h_k，ε = 0.3
+    //       2025 JCP Wu & Fu Eq.(14)：H_k = 1.5·dx（论文中 h_k 即格子间距 dx），ε = 0.3
     const double H_k   = 1.5 * dx;          // 每方向支撑域半宽
     const double eps   = 0.3;               // Gaussian 集中参数
     const double h_eff = H_k * eps;         // 有效 Gaussian 宽度 = 0.45·dx
