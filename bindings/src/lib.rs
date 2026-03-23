@@ -292,6 +292,16 @@ mod ffi {
                                             dx: f64, dt: f64,
                                             n_iter: c_int,
                                             u_target_x: f64, u_target_y: f64);
+        /// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+        pub fn lbm_ibm_compute_mls_original(g: *mut LatticeGridHandle,
+                                             ms: *mut IbmMarkerSetHandle,
+                                             dx: f64, dt: f64,
+                                             u_target_x: f64, u_target_y: f64);
+        /// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + Z 修正，Algorithm 2，JCP 2025）。
+        pub fn lbm_ibm_compute_mls_explicit(g: *mut LatticeGridHandle,
+                                             ms: *mut IbmMarkerSetHandle,
+                                             dx: f64, dt: f64,
+                                             u_target_x: f64, u_target_y: f64);
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
@@ -1291,6 +1301,43 @@ impl LbmIbmMarkerSet {
         unsafe {
             ffi::lbm_ibm_compute_mls_implicit(
                 grid.ptr, self.ptr, dx, dt, n_iter, u_target_x, u_target_y)
+        }
+    }
+
+    /// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+    ///
+    /// 单步直接力法，无迭代修正。无滑移残差大于隐式 MLS，但计算量最小。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距
+    /// @param dt         时间步长
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_mls_original(&mut self, grid: &mut LbmGrid,
+                              dx: f64, dt: f64,
+                              u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls_original(
+                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+        }
+    }
+
+    /// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + Z 修正，Algorithm 2，JCP 2025）。
+    ///
+    /// 在原始 MLS 基础上加全局标量修正 Z = Σ(F·g)/Σ|g|²。
+    /// 注意：Z 修正破坏守恒性，推荐使用 `step_mls`（隐式）。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距
+    /// @param dt         时间步长
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_mls_explicit(&mut self, grid: &mut LbmGrid,
+                              dx: f64, dt: f64,
+                              u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls_explicit(
+                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
         }
     }
 

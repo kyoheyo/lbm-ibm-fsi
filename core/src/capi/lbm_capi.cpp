@@ -1375,6 +1375,64 @@ void lbm_ibm_compute_mls_implicit(lbm::LatticeGrid* g,
         g->force[i] += pre_force[i];
 }
 
+/// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+///
+/// 使用 MLS 插值（J）和 MLS 形状函数展布（含守恒因子 c_m = ds_m），单步直接力法。
+/// 与隐式 MLS 相比无迭代修正，无滑移残差较大，但计算量最小。
+///
+/// @param g          LatticeGrid 指针
+/// @param ms         IbmMarkerSet 句柄
+/// @param dx         格子间距
+/// @param dt         时间步长
+/// @param u_target_x 目标 x 速度
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
+                                    IbmMarkerSetHandle* ms,
+                                    double dx, double dt,
+                                    double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_original(*g, *marker_set, dx, dt,
+                                          ibm::DeltaKernel::FourPoint,
+                                          u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + 全局 Z 修正，Algorithm 2，JCP 2025）。
+///
+/// 在原始 MLS 基础上添加全局标量修正因子 Z（Eq.21），
+/// Z = Σ(F·g)/Σ|g|²，将 fluid.force 整体缩放。
+/// 注意：Z 修正破坏力和力矩守恒性（见 Table 1），推荐使用隐式 MLS。
+///
+/// @param g          LatticeGrid 指针
+/// @param ms         IbmMarkerSet 句柄
+/// @param dx         格子间距
+/// @param dt         时间步长
+/// @param u_target_x 目标 x 速度
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_mls_explicit(lbm::LatticeGrid* g,
+                                    IbmMarkerSetHandle* ms,
+                                    double dx, double dt,
+                                    double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt,
+                                          u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
 /// 从 MarkerSet 读取所有标记点的 Lagrangian 力（fx, fy）。
 /// out_fx/out_fy 长度须 ≥ lbm_ibm_marker_set_size()。
 void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* out_fy)

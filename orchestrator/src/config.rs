@@ -406,9 +406,11 @@ pub struct IbmConfig {
     #[serde(default = "default_delta_kernel")]
     pub delta_kernel: String,
     /// IBM 力计算方法（全局，对所有 IBM 体生效）：
-    ///   `"mdf"`     — 多重直接力法（默认，推荐）
-    ///   `"penalty"` — 罚函数反馈力法（需配合 alpha/beta）
-    ///   `"mls"`     — 移动最小二乘速度插值 + 直接力
+    ///   `"mdf"`          — 多重直接力法（默认，推荐）
+    ///   `"penalty"`      — 罚函数反馈力法（需配合 alpha/beta）
+    ///   `"mls"`          — 隐式 MLS-IBM（迭代，JCP 2025 Algorithm 3，推荐）
+    ///   `"mls_original"` — 原始 MLS-IBM（单步，JCP 2025 Algorithm 1）
+    ///   `"mls_explicit"` — 显式 MLS-IBM + Z 修正（JCP 2025 Algorithm 2）
     #[serde(default = "default_ibm_method")]
     pub method: String,
     /// 罚函数法比例增益（仅 `method="penalty"` 时有效）
