@@ -1450,8 +1450,9 @@ void lbm_ibm_compute_mls_explicit(lbm::LatticeGrid* g,
 /// @param cache_handle   指向缓存句柄的指针（in/out；首次调用前 *cache_handle = nullptr）
 /// @param u_target_x/y   目标速度（静止固体取 0.0）
 struct MlsStationaryCache {
-    std::vector<double> A_lu;
-    std::vector<int>    piv;
+    std::vector<double>           A_lu;
+    std::vector<int>              piv;
+    std::vector<ibm::MlsSupportSet> phi;
 };
 
 void lbm_ibm_compute_mls_stationary(lbm::LatticeGrid* g,
@@ -1472,7 +1473,7 @@ void lbm_ibm_compute_mls_stationary(lbm::LatticeGrid* g,
 
     ibm::compute_ibm_forces_mls_implicit_stationary(
         *g, *marker_set, dx, dt,
-        cache->A_lu, cache->piv,
+        cache->A_lu, cache->piv, cache->phi,
         u_target_x, u_target_y);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)

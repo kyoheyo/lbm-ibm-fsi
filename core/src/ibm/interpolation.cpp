@@ -902,6 +902,13 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
     std::vector<double> A_mat;
     build_correlation_matrix(phi_data, ms, fluid.nx * fluid.ny, A_mat);
 
+#ifdef LBM_ENABLE_MPI
+    // MPI：各进程仅持有局部 phi_data（归属过滤），需全局归约得到完整 A 和 B
+    MPI_Allreduce(MPI_IN_PLACE, A_mat.data(), Nl * Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, Bx.data(),    Nl,      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, By.data(),    Nl,      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+
     // GMRES 求解 A·Fx = Bx 和 A·Fy = By（各速度分量独立，矩阵相同）
     const double gmres_tol = 1e-14;   // 相对收敛判据（论文 10⁻¹⁷ 绝对）
     const int    actual_max = std::max(gmres_max_iter, 1);
@@ -945,6 +952,7 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
                                                  double dt,
                                                  std::vector<double>& A_lu_cache,
                                                  std::vector<int>&    piv_cache,
+                                                 std::vector<MlsSupportSet>& phi_cache,
                                                  double u_target_x,
                                                  double u_target_y)
 {
@@ -955,18 +963,25 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
     const int Nl = ms.size();
     if (Nl == 0) return;
 
-    // A1: 计算传递算子 Φ（只在首次调用时真正有效；后续 phi_data 仍需用于插值和展布）
-    std::vector<MlsSupportSet> phi_data;
-    build_mls_shape_functions(fluid, ms, dx, phi_data);
+    // A1: 计算传递算子 Φ（只在首次调用时构建；后续每步直接复用 phi_cache）
+    if (phi_cache.empty()) {
+        build_mls_shape_functions(fluid, ms, dx, phi_cache);
+    }
 
     // C1: 首次调用时构建相关矩阵 A 并完成 LU 分解（缓存 A⁻¹ 于 A_lu_cache）
     if (A_lu_cache.empty()) {
-        build_correlation_matrix(phi_data, ms, fluid.nx * fluid.ny, A_lu_cache);
+        build_correlation_matrix(phi_cache, ms, fluid.nx * fluid.ny, A_lu_cache);
+#ifdef LBM_ENABLE_MPI
+        // MPI：各进程仅持有局部 phi_cache，需全局归约得到完整 A
+        MPI_Allreduce(MPI_IN_PLACE, A_lu_cache.data(), Nl * Nl,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
         // in-place LU 分解（A_lu_cache 被改写为 L\U）
         if (!lu_factor_dense(A_lu_cache, piv_cache, Nl)) {
             // 矩阵奇异：回退到 GMRES（此时 A_lu_cache 部分覆盖，需清空）
             A_lu_cache.clear();
             piv_cache.clear();
+            phi_cache.clear();
             compute_ibm_forces_mls_implicit(fluid, ms, dx, dt,
                                              /*gmres_max_iter=*/Nl,
                                              u_target_x, u_target_y);
@@ -974,8 +989,8 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
         }
     }
 
-    // A2: 重建 Lagrangian 速度 U* = J·u*
-    interpolate_with_phi(fluid, ms, phi_data);
+    // A2: 重建 Lagrangian 速度 U* = J·u*（使用缓存的 phi_cache）
+    interpolate_with_phi(fluid, ms, phi_cache);
 
     // 构建右端向量 B（Eq.24c）
     std::vector<double> Bx(Nl, 0.0), By(Nl, 0.0);
@@ -989,6 +1004,12 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
         By[k] = (u_target_y - mk.uy) / dt;
     }
 
+#ifdef LBM_ENABLE_MPI
+    // MPI：归属过滤后各进程 Bx/By 仅含本地贡献，全局归约得到完整 B
+    MPI_Allreduce(MPI_IN_PLACE, Bx.data(), Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, By.data(), Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+
     // C2: Scheme I — X = A⁻¹·B（LU 代换，O(N_l²)，比 GMRES 更快）
     lu_solve_dense(A_lu_cache, piv_cache, Bx.data(), Nl);   // Bx → Fx
     lu_solve_dense(A_lu_cache, piv_cache, By.data(), Nl);   // By → Fy
@@ -999,8 +1020,8 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
         ms.markers[k].fy = By[k];
     }
 
-    // A4: 展布到 Eulerian 网格（Eq.16）
-    spread_with_phi(fluid, ms, phi_data);
+    // A4: 展布到 Eulerian 网格（Eq.16）——使用缓存的 phi_cache
+    spread_with_phi(fluid, ms, phi_cache);
 }
 
 // ===========================================================================

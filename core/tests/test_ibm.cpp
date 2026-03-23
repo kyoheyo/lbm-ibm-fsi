@@ -746,12 +746,13 @@ static int test_mls_implicit_stationary_scheme_i()
         g1.u[i * 2 + 1] = 0.0;
     }
     auto ms1 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
-    std::vector<double> A_lu_cache;
-    std::vector<int>    piv_cache;
+    std::vector<double>             A_lu_cache;
+    std::vector<int>                piv_cache;
+    std::vector<ibm::MlsSupportSet> phi_cache;
     ibm::compute_ibm_forces_mls_implicit_stationary(g1, ms1, 1.0, 1.0,
-                                                     A_lu_cache, piv_cache);
+                                                     A_lu_cache, piv_cache, phi_cache);
 
-    // ---- Scheme I（第 2 次调用：复用 LU）----
+    // ---- Scheme I（第 2 次调用：复用 LU 和 phi_cache）----
     lbm::LatticeGrid g2(nx, ny, 1, lbm::LatticeModel::D2Q9);
     for (int i = 0; i < g2.size(); ++i) {
         g2.u[i * 2 + 0] = u0;
@@ -759,7 +760,7 @@ static int test_mls_implicit_stationary_scheme_i()
     }
     auto ms2 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
     ibm::compute_ibm_forces_mls_implicit_stationary(g2, ms2, 1.0, 1.0,
-                                                     A_lu_cache, piv_cache);
+                                                     A_lu_cache, piv_cache, phi_cache);
 
     // 验证 Scheme I 结果与 Scheme II 一致（差别 < 1e-12）
     double max_diff = 0.0;
@@ -777,8 +778,8 @@ static int test_mls_implicit_stationary_scheme_i()
                                    std::abs(g1.force[i*2+1] - g2.force[i*2+1]));
     }
 
-    // Scheme I 缓存已填充（A_lu_cache 非空）
-    const bool cache_ok  = !A_lu_cache.empty() && !piv_cache.empty();
+    // Scheme I 缓存已填充（A_lu_cache、piv_cache、phi_cache 均非空）
+    const bool cache_ok  = !A_lu_cache.empty() && !piv_cache.empty() && !phi_cache.empty();
     const bool match_ref = max_diff < 1e-12;
     const bool match_2   = max_diff_call2 < 1e-15;
     const bool ok = cache_ok && match_ref && match_2;
