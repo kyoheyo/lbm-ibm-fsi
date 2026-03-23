@@ -35,18 +35,29 @@ lbm-ibm-fsi/
 │   │   ├── lbm/
 │   │   │   ├── lattice.hpp          # Lattice model (D2Q9 / D3Q19 / D3Q27)
 │   │   │   ├── solver.hpp           # BGK/MRT collision + streaming
-│   │   │   └── boundary.hpp        # Boundary conditions (bounce-back, ZOU-HE, etc.)
+│   │   │   ├── boundary.hpp         # Boundary conditions (bounce-back, ZOU-HE, etc.)
+│   │   │   ├── mpi_decomp.hpp       # MPI 1-D / 2-D / 3-D domain decomposition
+│   │   │   ├── solid.hpp            # Solid-node marking + BB/IBB sharp-interface BC
+│   │   │   ├── stretched_grid.hpp   # Non-uniform grid + IS-LBM correction
+│   │   │   ├── mg_tree.hpp          # Multi-grid nesting tree (AMR 2-D/3-D)
+│   │   │   └── gpu_solver.hpp       # CUDA GPU backend (ENABLE_CUDA=ON)
 │   │   ├── ibm/
 │   │   │   ├── marker.hpp           # Lagrangian marker points
-│   │   │   └── interpolation.hpp   # Delta-function spreading/interpolation
-│   │   └── fsi/
-│   │       ├── structure.hpp        # Flexible beam/shell FEM
-│   │       └── coupling.hpp        # Partitioned FSI coupling
+│   │   │   └── interpolation.hpp    # Delta-function spreading/interpolation
+│   │   ├── fsi/
+│   │   │   ├── structure.hpp        # Flexible beam/shell FEM
+│   │   │   └── coupling.hpp         # Partitioned FSI coupling
+│   │   └── plugins/
+│   │       ├── plugin_registry.hpp  # C function-pointer → C++ virtual adapter
+│   │       ├── boundary_plugin.hpp  # Custom BC plugin interface
+│   │       ├── mesh_plugin.hpp      # Custom mesh-refinement plugin interface
+│   │       ├── motion_plugin.hpp    # Prescribed body-motion plugin interface
+│   │       └── flexible_plugin.hpp  # Flexible-body deformation plugin interface
 │   └── src/
 │       ├── lbm/
 │       ├── ibm/
 │       ├── fsi/
-│       └── capi/                   # C ABI bridge for Rust FFI
+│       └── capi/                    # C ABI bridge for Rust FFI
 │
 ├── bindings/                # Rust crate — thin C ABI + safe Rust wrappers
 │   ├── Cargo.toml
@@ -56,25 +67,49 @@ lbm-ibm-fsi/
 ├── orchestrator/            # Rust crate — CLI driver + simulation loop
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs
-│       └── config.rs
+│       ├── main.rs          # Entry point: arg parsing, MPI init, main loop
+│       ├── config.rs        # TOML config deserialization
+│       ├── output.rs        # NPZ / Tecplot snapshot writing, combine_blocks
+│       ├── sim.rs           # MPI decomp context + per-rank BC registration
+│       ├── fsi.rs           # FSI coupling modes + body setup
+│       └── python_bridge.rs # Optional Python FFI bridge (feature: python-ffi)
 │
 ├── python/                  # Python pre/post-processing
 │   ├── pyproject.toml       # Package metadata & dependencies
 │   ├── lbm_pre/             # Pre-processing package
 │   │   ├── mesh.py          # gmsh domain & obstacle mesh generation
 │   │   ├── geometry.py      # IBM Lagrangian marker constructors
-│   │   └── config_gen.py    # Generate solver TOML configs from Python
+│   │   ├── config_gen.py    # Generate solver TOML configs from Python
+│   │   └── bridge.py        # pyo3 FFI entry point (geometry_markers_raw)
 │   ├── lbm_post/            # Post-processing package
-│   │   ├── vtk_reader.py    # Read .npz / .vtu solver output
+│   │   ├── vtk_reader.py    # Read .npz / .dat / .plt solver output
 │   │   ├── plot.py          # Contour, streamline, vorticity, beam plots
-│   │   └── analysis.py      # Drag/lift, Q-criterion, error norms, convergence
+│   │   ├── analysis.py      # Drag/lift, Q-criterion, error norms, convergence
+│   │   └── bridge.py        # pyo3 FFI entry point (plot_field_raw)
 │   ├── tests/               # pytest suite (105 tests)
 │   └── examples/
-│       └── lid_driven_cavity.py   # End-to-end pre/post example
+│       ├── lid_driven_cavity.py    # End-to-end pre/post example (synthetic data)
+│       ├── plot_solver_output.py   # Visualise real solver NPZ output
+│       ├── combine_blocks.py       # Merge MPI partition snapshots offline
+│       └── compare_solid_bcs.py    # Compare BB / IBB solid boundary conditions
 │
 └── configs/                 # Example TOML configuration files
-    └── lid_driven_cavity.toml
+    ├── template.toml                      # Annotated template with all options
+    ├── lid_driven_cavity.toml             # Re=400 lid-driven cavity
+    ├── pressure_driven_channel.toml       # Poiseuille flow
+    ├── velocity_inlet_channel.toml        # Velocity-inlet channel
+    ├── velocity_inlet_free_outlet.toml    # Free outlet variant
+    ├── velocity_inlet_pressure_outlet.toml# Pressure outlet variant
+    ├── cylinder_in_channel.toml           # Single cylinder (bounce-back)
+    ├── cylinder_ibm_mdf.toml              # Cylinder IBM (multi-direct forcing)
+    ├── cylinder_ibm_mls.toml              # Cylinder IBM (moving least squares)
+    ├── cylinder_ibm_penalty.toml          # Cylinder IBM (penalty method)
+    ├── cylinder_force_output.toml         # Cylinder with drag/lift output
+    ├── multi_cylinder_ibm.toml            # Multiple cylinders
+    ├── hybrid_bb_ibm_channel.toml         # Hybrid BB + IBM channel
+    ├── stretched_grid_channel.toml        # Non-uniform stretched grid
+    ├── solid_bc_comparison.toml           # BB vs IBB solid BC comparison
+    └── mpi_pressure_channel.toml          # MPI block decomposition example
 ```
 
 ## Parallelism Strategy
@@ -115,16 +150,44 @@ mpirun -n 4 ./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml
 ### Build options
 
 ```bash
+# Enable MPI parallel decomposition (requires OpenMPI / MPICH)
+LBM_ENABLE_MPI=ON cargo build --release
+
+# Enable OpenMP threading within each MPI rank
+LBM_ENABLE_OPENMP=ON cargo build --release
+
+# Enable both MPI and OpenMP
+LBM_ENABLE_MPI=ON LBM_ENABLE_OPENMP=ON cargo build --release
+
 # Enable CUDA GPU backend
-cmake -B build -DENABLE_CUDA=ON
-cargo build --release --features cuda
+LBM_ENABLE_CUDA=ON cargo build --release --features cuda
 ```
+
+To drive CMake directly (without Cargo) — for IDE integration, testing, or packaging:
+
+```bash
+# Configure with MPI and OpenMP disabled (safe for machines without them)
+cmake -S . -B build -DBUILD_TESTS=ON -DENABLE_MPI=OFF -DENABLE_OPENMP=OFF
+
+# Configure with MPI enabled
+cmake -S . -B build -DBUILD_TESTS=ON -DENABLE_MPI=ON -DENABLE_OPENMP=ON
+
+# Build and run C++ unit tests
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+> **Note:** When using Cargo, the cmake option names use the `ENABLE_*` prefix (e.g.
+> `ENABLE_MPI`). The corresponding Cargo environment variables use the `LBM_ENABLE_*`
+> prefix (e.g. `LBM_ENABLE_MPI`). The `bindings/build.rs` script maps them automatically.
 
 ## Testing
 
 ```bash
-# Run C++ unit tests
-cmake --build build --target tests && ctest --test-dir build
+# Run C++ unit tests (requires BUILD_TESTS=ON in cmake, MPI/OpenMP optional)
+cmake -S . -B build -DBUILD_TESTS=ON -DENABLE_MPI=OFF -DENABLE_OPENMP=OFF
+cmake --build build
+ctest --test-dir build --output-on-failure
 
 # Run Rust unit + integration tests
 cargo test
@@ -198,6 +261,90 @@ PYTHONPATH=. python3 examples/lid_driven_cavity.py
 
 This generates config, mesh, synthetic snapshots, and five publication-ready plots in
 `python/examples/output/lid_cavity/`.
+
+### Visualising real solver output
+
+After building and running the solver:
+
+```bash
+# Build
+cargo build --release
+
+# Run the lid-driven cavity simulation
+./target/release/lbm-ibm-fsi --config configs/lid_driven_cavity.toml
+```
+
+The solver writes `output/lid_cavity/fluid_NNNNNN.npz` snapshots at every
+`write_interval` step.  To visualise the results:
+
+```bash
+# Plot from anywhere — the script finds the output directory automatically
+python3 python/examples/plot_solver_output.py
+
+# Or point at a specific directory
+python3 python/examples/plot_solver_output.py --input output/lid_cavity
+
+# Save plots to a separate directory
+python3 python/examples/plot_solver_output.py \
+    --input output/lid_cavity --output my_plots/
+```
+
+The `[python]` section already added to `configs/lid_driven_cavity.toml` wires
+`post_script` so that the solver runs this visualisation step automatically
+once the simulation loop finishes.
+
+Plots produced:
+
+| File | Contents |
+|------|----------|
+| `velocity_magnitude.png` | Filled contour of \|u\| = √(ux²+uy²) |
+| `streamlines.png` | Integrated streamlines coloured by \|u\| |
+| `vorticity.png` | Vorticity ωz = ∂uy/∂x − ∂ux/∂y |
+| `ux_profile.png` | ux vertical profile at cavity centre (x = nx/2) |
+| `uy_profile.png` | uy horizontal profile at cavity centre (y = ny/2) |
+| `monitor_velocity.png` | \|u\| time series at the centre monitor point |
+
+### MPI block decomposition output
+
+When running with MPI block decomposition (`mpi.mode = "block"`), each rank writes its
+partition snapshots to `output/<dir>/rank_N/fluid_NNNNNN.npz` with embedded position
+metadata (`x_start`, `y_start`, `global_nx`, `global_ny`).
+
+**Option 1 — In-simulation global output** (`combine_blocks = true` in TOML):
+
+```toml
+[output]
+combine_blocks = true   # rank-0 gathers all partitions and writes global snapshots
+```
+
+This writes complete global snapshots (`<dir>/fluid_*.npz/.dat/.plt`) during the
+simulation. If `plot_interval` is also set (with `--features python-ffi`), the FFI
+plots (velocity magnitude, vorticity, **streamlines**) also use the global combined
+field.
+
+**Option 2 — Post-simulation combining** (offline, after the run):
+
+```bash
+# Combine partition NPZ files into a single global NPZ
+python3 python/examples/combine_blocks.py --dir output/my_run
+
+# Or write combined output as ASCII Tecplot .dat
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt dat
+
+# Or binary Tecplot .plt
+python3 python/examples/combine_blocks.py --dir output/my_run --fmt plt
+```
+
+Or directly from Python:
+
+```python
+from lbm_post.vtk_reader import combine_block_snapshots
+written = combine_block_snapshots("output/my_run", fmt="npz")
+```
+
+> **Note:** Post-simulation combining reads NPZ partition files (which contain position
+> metadata). If the solver wrote `.dat`/`.plt` partition files, use `combine_blocks = true`
+> during the run instead.
 
 ## References
 

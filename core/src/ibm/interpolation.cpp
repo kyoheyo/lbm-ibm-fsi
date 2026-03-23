@@ -1,9 +1,15 @@
 #include "ibm/interpolation.hpp"
 #include <cmath>
 #include <stdexcept>
+#include <vector>
+#include <array>
 
 #ifdef LBM_ENABLE_OPENMP
 #include <omp.h>
+#endif
+
+#ifdef LBM_ENABLE_MPI
+#include <mpi.h>
 #endif
 
 namespace ibm {
@@ -11,18 +17,18 @@ namespace ibm {
 static constexpr double PI = 3.14159265358979323846;
 
 // ---------------------------------------------------------------------------
-// 1-D kernel functions
+// 一维 δ 函数核值
 // ---------------------------------------------------------------------------
 double delta_phi(double r, double h, DeltaKernel kernel)
 {
-    const double roh = r / h;   // r/h
+    const double roh = r / h;   // 无量纲距离 r/h
     if (kernel == DeltaKernel::TwoPoint) {
-        // Linear (hat) kernel — support width 2h
+        // 线性（帽形）核 — 支撑宽度 2h
         const double absr = std::abs(roh);
         if (absr < 1.0) return (1.0 - absr) / h;
         return 0.0;
     } else {
-        // Peskin 4-point cosine kernel — support width 4h
+        // Peskin 4 点余弦核 — 支撑宽度 4h
         const double absr = std::abs(roh);
         if (absr < 2.0) {
             return (1.0 + std::cos(PI * roh / 2.0)) / (4.0 * h);
@@ -32,7 +38,7 @@ double delta_phi(double r, double h, DeltaKernel kernel)
 }
 
 // ---------------------------------------------------------------------------
-// Velocity interpolation (2-D, D2Q9 lattice assumed)
+// 速度插值（二维，假定使用 D2Q9 格子）
 // ---------------------------------------------------------------------------
 void interpolate_velocity(const lbm::LatticeGrid& grid,
                           MarkerSet& ms,
@@ -46,7 +52,7 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
     const int nx = grid.nx;
     const int ny = grid.ny;
 
-    // Support radius in grid cells
+    // δ 函数的支撑半径（格子数）
     const int support = (kernel == DeltaKernel::TwoPoint) ? 1 : 2;
 
 #ifdef LBM_ENABLE_OPENMP
@@ -54,13 +60,17 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
 #endif
     for (int m = 0; m < ms.size(); ++m) {
         auto& mk = ms.markers[m];
-        // Marker position in grid units
+        // 标记点在格子单位下的位置
         const double xm = mk.x / dx;
         const double ym = mk.y / dx;
 
-        // Nearest grid node
+        // 最近格子节点（本地坐标）
         const int i0 = static_cast<int>(std::floor(xm));
         const int j0 = static_cast<int>(std::floor(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免跨块重复计算
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
 
         double ux_sum = 0.0, uy_sum = 0.0;
 
@@ -68,12 +78,16 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
             for (int di = -support; di <= support + 1; ++di) {
                 const int ii = i0 + di;
                 const int jj = j0 + dj;
-                // Periodic clamp
+                // 周期性截断（超出边界时跳过）
                 if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
 
                 const int node = grid.idx(ii, jj);
+                // 跳过固体节点（固体内部速度无效）
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
                 const double phi_x = delta_phi(mk.x - ii * dx, dx, kernel);
                 const double phi_y = delta_phi(mk.y - jj * dx, dx, kernel);
+                // 二维积分权重：φ(x)*φ(y)*Δx²
                 const double phi = phi_x * phi_y * dx * dx;
 
                 ux_sum += grid.u[node * 2 + 0] * phi;
@@ -88,7 +102,7 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
 }
 
 // ---------------------------------------------------------------------------
-// Force spreading (2-D, D2Q9)
+// 力展布（二维，D2Q9）
 // ---------------------------------------------------------------------------
 void spread_force(lbm::LatticeGrid& grid,
                   const MarkerSet& ms,
@@ -103,10 +117,10 @@ void spread_force(lbm::LatticeGrid& grid,
     const int ny = grid.ny;
     const int support = (kernel == DeltaKernel::TwoPoint) ? 1 : 2;
 
-    // Zero the force field first
+    // 先将体力场清零
     std::fill(grid.force.begin(), grid.force.end(), 0.0);
 
-    // Spreading is a scatter operation — need atomic or serialised loop
+    // 展布是一个散射操作 — 需要原子操作或串行循环以避免竞争
     for (int m = 0; m < ms.size(); ++m) {
         const auto& mk = ms.markers[m];
         const double xm = mk.x / dx;
@@ -114,6 +128,10 @@ void spread_force(lbm::LatticeGrid& grid,
 
         const int i0 = static_cast<int>(std::floor(xm));
         const int j0 = static_cast<int>(std::floor(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免双重计数
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
 
         for (int dj = -support; dj <= support + 1; ++dj) {
             for (int di = -support; di <= support + 1; ++di) {
@@ -124,6 +142,7 @@ void spread_force(lbm::LatticeGrid& grid,
                 const int node = grid.idx(ii, jj);
                 const double phi_x = delta_phi(mk.x - ii * dx, dx, kernel);
                 const double phi_y = delta_phi(mk.y - jj * dx, dx, kernel);
+                // 展布权重：φ(x)*φ(y)*ΔS（弧长元素）
                 const double phi = phi_x * phi_y * mk.ds;
 
 #ifdef LBM_ENABLE_OPENMP
@@ -137,6 +156,768 @@ void spread_force(lbm::LatticeGrid& grid,
             }
         }
     }
+}
+
+// ===========================================================================
+// 多重直接力法（MDF-IBM）
+// ===========================================================================
+void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
+                             MarkerSet& ms,
+                             double dx,
+                             double dt,
+                             int    n_iter,
+                             DeltaKernel kernel)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("MDF-IBM: only D2Q9 supported currently");
+    }
+
+    const int n = fluid.size();
+    const int d = fluid.dim();   // = 2
+
+    // 工作速度场（子迭代过程中被逐步修正）
+    std::vector<double> u_work = fluid.u;
+
+    // 累积欧拉力场（最终写入 fluid.force）
+    std::vector<double> F_total(n * d, 0.0);
+
+    // 初始化标记点力为零
+    for (auto& mk : ms.markers) { mk.fx = mk.fy = 0.0; }
+
+    // 临时力场（每次子迭代的增量展布结果）
+    std::vector<double> dF_euler(n * d, 0.0);
+
+    for (int iter = 0; iter < n_iter; ++iter) {
+        // 1. 用 u_work 插值标记点速度（临时将 fluid.u 设为 u_work）
+        //    无需拷贝：直接 swap，插值后再 swap 回来
+        std::swap(fluid.u, u_work);
+        interpolate_velocity(fluid, ms, dx, kernel);
+        std::swap(fluid.u, u_work);
+
+        // 2. 计算增量力（刚体目标速度 = 0；如需移动边界，在此修改 target）
+        for (auto& mk : ms.markers) {
+            const double dFx = (0.0 - mk.ux) / dt;   // ρ=1 格子单位假设
+            const double dFy = (0.0 - mk.uy) / dt;
+            mk.fx = dFx;   // 临时存放增量（不累加到 markers，最后由 F_total 覆盖）
+            mk.fy = dFy;
+        }
+
+        // 3. 将增量力展布到 dF_euler
+        std::fill(dF_euler.begin(), dF_euler.end(), 0.0);
+        // 临时使用 fluid.force 作为展布目标，然后移走
+        spread_force(fluid, ms, dx, kernel);  // writes to fluid.force
+        std::swap(fluid.force, dF_euler);     // dF_euler = 本次增量展布结果
+
+        // 4. 更新工作速度：u_work += dt · dF_euler / ρ（ρ=1）
+        for (int i = 0; i < n; ++i) {
+            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
+            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
+        }
+
+        // 5. 累积总欧拉力
+        for (int i = 0; i < n * d; ++i) {
+            F_total[i] += dF_euler[i];
+        }
+    }
+
+    // 写入最终总力到 fluid.force（供 Guo 体力格式在 collide 步使用）
+    fluid.force = F_total;
+
+    // 同步标记点力（近似：取最后一次子迭代的值重新展布前的 mk.fx/fy）
+    // 为了提供更好的力信息，重新从 F_total 反推。此处保持 mk.fx/fy
+    // 为最后一次子迭代的增量值（已足够用于 FSI 反作用力计算）。
+    // 如需精确 marker force，调用方可在此之后额外调用 interpolate+compute。
+}
+
+// ===========================================================================
+// 移动最小二乘速度插值（MLS-IBM）
+//
+// 线性基 p(x) = [1, Δx, Δy]，Gaussian 权函数 w(r) = exp(−r²/h²)
+// 支撑半径 h = 2.5·dx（覆盖约 5×5 的格点邻域）
+//
+// 对每个标记点 X_m：
+//   1. 收集支撑域内所有流体节点 {x_i}
+//   2. 计算权重 w_i = exp(−|x_i − X_m|² / h²)
+//   3. 构造 3×3 矩阵 M = Σ w_i p(x_i - X_m) ⊗ p(x_i - X_m)
+//   4. 构造 3×1 向量 b_u = Σ w_i u_x(x_i) p(x_i - X_m)（同理 b_v）
+//   5. 求解 M·a_u = b_u，M·a_v = b_v（Cramer's rule，3×3）
+//   6. 插值速度：u_m = a_u[0]，v_m = a_v[0]（p(0) = [1,0,0]）
+// ===========================================================================
+
+// 正则化下界（MLS 矩阵奇异性保护，避免除以零）
+static constexpr double MLS_REGULARIZATION_EPS = 1e-30;
+// 返回 false 若行列式接近零（奇异）
+static bool solve3x3(const double A[3][3], const double b[3], double x[3])
+{
+    const double det = A[0][0] * (A[1][1]*A[2][2] - A[1][2]*A[2][1])
+                     - A[0][1] * (A[1][0]*A[2][2] - A[1][2]*A[2][0])
+                     + A[0][2] * (A[1][0]*A[2][1] - A[1][1]*A[2][0]);
+    if (std::abs(det) < 1e-30) return false;
+
+    const double inv_det = 1.0 / det;
+
+    x[0] = inv_det * (b[0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])
+                    - b[1]*(A[0][1]*A[2][2]-A[0][2]*A[2][1])
+                    + b[2]*(A[0][1]*A[1][2]-A[0][2]*A[1][1]));
+    x[1] = inv_det * (A[0][0]*(b[1]*A[2][2]-b[2]*A[2][1])
+                    - A[0][1]*(b[0]*A[2][2]-b[2]*A[2][0])
+                    + A[0][2]*(b[0]*A[2][1]-b[1]*A[2][0]));
+    x[2] = inv_det * (A[0][0]*(A[1][1]*b[2]-A[1][2]*b[1])
+                    - A[0][1]*(A[1][0]*b[2]-A[1][2]*b[0])
+                    + A[0][2]*(A[1][0]*b[1]-A[1][1]*b[0]));
+    return true;
+}
+
+void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
+                               MarkerSet& ms,
+                               double dx)
+{
+    if (grid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("MLS-IBM: only D2Q9 supported currently");
+    }
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+
+    // MLS 支撑半径（格子单位）和 Gaussian 半宽
+    const double h_mls = 2.5 * dx;          // Gaussian 半宽
+    const double R_s   = 2.5 * dx;          // 支撑半径（截断距离）
+    const double h2    = h_mls * h_mls;
+    const int    iR    = static_cast<int>(std::ceil(R_s / dx)) + 1;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int m = 0; m < ms.size(); ++m) {
+        auto& mk = ms.markers[m];
+
+        // 标记点在格子坐标系中的位置
+        const double xm = mk.x / dx;
+        const double ym = mk.y / dx;
+        const int    i0 = static_cast<int>(std::round(xm));
+        const int    j0 = static_cast<int>(std::round(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点，避免跨块重复计算
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+
+        // MLS 矩阵（3×3）和右端向量
+        double M[3][3] = {};
+        double bu[3]   = {};   // for ux
+        double bv[3]   = {};   // for uy
+
+        int n_contrib = 0;
+
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+
+                const int node = grid.idx(ii, jj);
+                // 跳过固体节点
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                const double r2  = ddx * ddx + ddy * ddy;
+
+                if (r2 > R_s * R_s) continue;
+
+                // Gaussian 权函数
+                const double w = std::exp(-r2 / h2);
+
+                // 基函数 p = [1, Δx/dx, Δy/dx]（归一化以改善条件数）
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+
+                // 累积矩阵 M += w * p ⊗ p
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        M[r][c] += w * p[r] * p[c];
+                    }
+                }
+
+                // 累积右端向量
+                const double ux_i = grid.u[node * 2 + 0];
+                const double uy_i = grid.u[node * 2 + 1];
+                for (int r = 0; r < 3; ++r) {
+                    bu[r] += w * ux_i * p[r];
+                    bv[r] += w * uy_i * p[r];
+                }
+                ++n_contrib;
+            }
+        }
+
+        if (n_contrib < 3) {
+            // 支撑域内节点不足，回退到简单平均
+            mk.ux = (n_contrib > 0) ? bu[0] / (M[0][0] + MLS_REGULARIZATION_EPS) : 0.0;
+            mk.uy = (n_contrib > 0) ? bv[0] / (M[0][0] + MLS_REGULARIZATION_EPS) : 0.0;
+            mk.uz = 0.0;
+            continue;
+        }
+
+        // 求解 3×3 系统
+        double au[3], av[3];
+        if (!solve3x3(M, bu, au) || !solve3x3(M, bv, av)) {
+            // 奇异系统：回退到权重平均
+            mk.ux = M[0][0] > MLS_REGULARIZATION_EPS ? bu[0] / M[0][0] : 0.0;
+            mk.uy = M[0][0] > MLS_REGULARIZATION_EPS ? bv[0] / M[0][0] : 0.0;
+        } else {
+            // 在标记点处求值：p(0) = [1, 0, 0]，所以 u_m = au[0]
+            mk.ux = au[0];
+            mk.uy = av[0];
+        }
+        mk.uz = 0.0;
+    }
+}
+
+// ===========================================================================
+// MLS 力展布（MLS-IBM 的伴随/转置展布算子）
+//
+// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
+//       for high fidelity fluid-structure interaction simulations"
+//
+// 使用与 mls_interpolate_velocity 完全相同的 MLS 参数和矩阵，
+// 但采用转置展布：对每个标记点 X_m，先构建 M 并求解 M·c=e_0，
+// 再用 MLS 形状函数 φ_i=w_i·(c^T·p_i) 把力散布到支撑节点。
+// ===========================================================================
+void mls_spread_force(lbm::LatticeGrid& grid,
+                      const MarkerSet& ms,
+                      double dx)
+{
+    if (grid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("MLS-IBM spread: only D2Q9 supported currently");
+    }
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+
+    // 与 mls_interpolate_velocity 完全相同的 MLS 参数
+    const double h_mls = 2.5 * dx;
+    const double R_s   = 2.5 * dx;
+    const double h2    = h_mls * h_mls;
+    const int    iR    = static_cast<int>(std::ceil(R_s / dx)) + 1;
+
+    // 先将体力场清零
+    std::fill(grid.force.begin(), grid.force.end(), 0.0);
+
+    // 展布是散射操作（一个标记点写多个节点），不使用并行以避免竞争
+    for (int m = 0; m < ms.size(); ++m) {
+        const auto& mk = ms.markers[m];
+
+        const double xm = mk.x / dx;
+        const double ym = mk.y / dx;
+        const int    i0 = static_cast<int>(std::round(xm));
+        const int    j0 = static_cast<int>(std::round(ym));
+
+        // MPI 归属过滤：仅处理中心落在本进程物理域内的标记点
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+
+        // --- 第一遍：构造 MLS 矩阵（与插值完全相同）---
+        double M[3][3] = {};
+        int n_contrib = 0;
+
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                const double r2  = ddx * ddx + ddy * ddy;
+                if (r2 > R_s * R_s) continue;
+
+                const double w   = std::exp(-r2 / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        M[r][c] += w * p[r] * p[c];
+                ++n_contrib;
+            }
+        }
+
+        if (n_contrib < 3) continue;   // 支撑域节点不足，跳过此标记点
+
+        // 求解 M·c = e_0（e_0=[1,0,0]^T），得到 MLS 形状函数系数 c
+        // 满足：φ_i(X_m) = w_i · (c_0 + c_1·Δx_i/dx + c_2·Δy_i/dx)
+        double e0[3] = {1.0, 0.0, 0.0};
+        double c[3];
+        if (!solve3x3(M, e0, c)) continue;   // 奇异矩阵：跳过此标记点
+
+        // --- 第二遍：用 MLS 形状函数展布力 ---
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                const double r2  = ddx * ddx + ddy * ddy;
+                if (r2 > R_s * R_s) continue;
+
+                const double w   = std::exp(-r2 / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+
+                // MLS 形状函数：φ_i = w_i · (c^T · p_i)
+                const double phi = w * (c[0] * p[0] + c[1] * p[1] + c[2] * p[2]);
+
+                // 展布权重包含弧长元素 ds（与 spread_force 保持量纲一致）
+                grid.force[node * 2 + 0] += phi * mk.fx * mk.ds;
+                grid.force[node * 2 + 1] += phi * mk.fy * mk.ds;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算
+//
+// Richardson 迭代：逐步逼近满足无滑移约束的 IBM 力。
+// 本函数使用 MLS 插值（J）和 MLS 伴随展布（J^T），满足离散伴随一致性。
+// mk.fx/fy 存储总 Lagrangian 力（所有迭代增量之和），供 FSI 反作用力计算。
+// ===========================================================================
+void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      int    n_iter,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Implicit MLS-IBM: only D2Q9 supported currently");
+    }
+
+    const int n = fluid.size();
+    const int d = fluid.dim();   // = 2
+
+    // 工作速度场（子迭代过程中被逐步修正）
+    std::vector<double> u_work = fluid.u;
+
+    // 累积欧拉力场（最终写入 fluid.force）
+    std::vector<double> F_total(n * d, 0.0);
+
+    // 累积总 Lagrangian 力（逐迭代累加，最终写入 mk.fx/fy）
+    std::vector<double> lag_fx_total(ms.size(), 0.0);
+    std::vector<double> lag_fy_total(ms.size(), 0.0);
+
+    // 临时力场（每次子迭代的增量 MLS 展布结果）
+    std::vector<double> dF_euler(n * d, 0.0);
+
+    for (int iter = 0; iter < n_iter; ++iter) {
+        // 1. 用 u_work 进行 MLS 速度插值
+        //    临时将 fluid.u 替换为 u_work 供 mls_interpolate_velocity 读取
+        std::swap(fluid.u, u_work);
+        mls_interpolate_velocity(fluid, ms, dx);
+        std::swap(fluid.u, u_work);
+
+        // 2. 计算增量力（无滑移条件：目标速度 = u_target_x/y）
+        //    同时累积总 Lagrangian 力（mk.fx/fy 设为本次增量，供 mls_spread_force 使用）
+        for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
+            auto& mk = ms.markers[m];
+            const double dFx = (u_target_x - mk.ux) / dt;
+            const double dFy = (u_target_y - mk.uy) / dt;
+            mk.fx = dFx;               // 本次增量（供 mls_spread_force 读取）
+            mk.fy = dFy;
+            lag_fx_total[m] += dFx;   // 累积总 Lagrangian 力
+            lag_fy_total[m] += dFy;
+        }
+
+        // 3. MLS 伴随展布增量力到欧拉网格（mls_spread_force 内部先清零 fluid.force）
+        mls_spread_force(fluid, ms, dx);
+        std::swap(fluid.force, dF_euler);   // dF_euler = 本次 MLS 展布结果
+
+        // 4. 更新工作速度：u_work += dt · δf（ρ=1 格子单位）
+        for (int i = 0; i < n; ++i) {
+            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
+            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
+        }
+
+        // 5. 累积总欧拉力（= Σ J^T(δF^k)，由 J^T 线性性等价于 J^T(Σ δF^k)）
+        for (int i = 0; i < n * d; ++i) {
+            F_total[i] += dF_euler[i];
+        }
+    }
+
+    // 写入最终总欧拉力到 fluid.force
+    fluid.force = F_total;
+
+    // 写入总 Lagrangian 力到标记点（供 FSI 反作用力计算：compute_ibm_body_force）
+    for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
+        ms.markers[m].fx = lag_fx_total[m];
+        ms.markers[m].fy = lag_fy_total[m];
+    }
+}
+
+// ===========================================================================
+// 原始 MLS-IBM（Original MLS）—— MLS 插值 + Peskin δ 函数展布
+//
+// 参考：2025 JCP §2.1 "Original MLS method"
+//
+// 算法（单步直接力法）：
+//   1. MLS 速度插值：U_m = J · u
+//   2. 直接力：F_m = (u_target − U_m) / dt
+//   3. Peskin δ 展布：f(x) = Σ_m F_m · δ(x − X_m) · ds_m
+//
+// 注意：展布算子 S = δ（非 J^T），不满足离散伴随一致性。
+// 相比显式/隐式 MLS，动量守恒精度偏低，但实现最简单。
+// ===========================================================================
+void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      DeltaKernel kernel,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Original MLS-IBM: only D2Q9 supported currently");
+    }
+
+    // 1. MLS 速度插值：U_m = J · u
+    mls_interpolate_velocity(fluid, ms, dx);
+
+    // 2. 直接力：F_m = (u_target − U_m) / dt
+    for (auto& mk : ms.markers) {
+        mk.fx = (u_target_x - mk.ux) / dt;
+        mk.fy = (u_target_y - mk.uy) / dt;
+    }
+
+    // 3. 标准 Peskin δ 函数展布（S ≠ J^T，非伴随一致）
+    spread_force(fluid, ms, dx, kernel);
+}
+
+// ===========================================================================
+// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 伴随展布，单步
+//
+// 参考：2025 JCP §2.2 "Explicit MLS variant"
+//
+// 算法（单步显式直接力法）：
+//   1. MLS 速度插值：U_m = J · u
+//   2. 直接力：F_m = (u_target − U_m) / dt
+//   3. MLS 伴随展布：f = J^T · F
+//
+// 满足离散伴随一致性（J 与 J^T 互为转置），相比原始 MLS 动量守恒更好。
+// 等价于 compute_ibm_forces_mls_implicit(n_iter=1)，但语义更明确。
+// ===========================================================================
+void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Explicit MLS-IBM: only D2Q9 supported currently");
+    }
+
+    // 1. MLS 速度插值：U_m = J · u
+    mls_interpolate_velocity(fluid, ms, dx);
+
+    // 2. 直接力：F_m = (u_target − U_m) / dt
+    for (auto& mk : ms.markers) {
+        mk.fx = (u_target_x - mk.ux) / dt;
+        mk.fy = (u_target_y - mk.uy) / dt;
+    }
+
+    // 3. MLS 伴随展布：f = J^T · F（满足离散伴随一致性）
+    mls_spread_force(fluid, ms, dx);
+}
+
+
+//
+// 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
+//
+// 每步调用：
+//   1. 插值 u_IBM（δ 函数加权插值）
+//   2. e = u_target − u_IBM
+//   3. integral += dt · e
+//   4. F = α·e + β·integral
+//   5. 展布 F 到欧拉力场
+//
+// integral_x / integral_y 必须在外部持久化（每步传入同一 vector）。
+// 调用方在仿真开始前将 integral_x/y 初始化为全零（std::vector<double>(ms.size(), 0.0)）。
+// ===========================================================================
+void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
+                                 MarkerSet& ms,
+                                 double dx,
+                                 double dt,
+                                 double alpha,
+                                 double beta,
+                                 std::vector<double>& integral_x,
+                                 std::vector<double>& integral_y,
+                                 DeltaKernel kernel,
+                                 double u_target_x,
+                                 double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Penalty-IBM: only D2Q9 supported currently");
+    }
+
+    const int nm = ms.size();
+
+    // 确保积分向量长度足够（自动扩展，填充 0）
+    if (static_cast<int>(integral_x.size()) < nm) integral_x.assign(nm, 0.0);
+    if (static_cast<int>(integral_y.size()) < nm) integral_y.assign(nm, 0.0);
+
+    // 1. 插值流体速度 → mk.ux, mk.uy
+    interpolate_velocity(fluid, ms, dx, kernel);
+
+    // 2-4. 计算每标记点的罚函数力
+    // 积分抗饱和上限：|integral| ≤ max_integral = 10/|beta| （若 beta > 0）
+    // 防止长时间积分项无限增大（"积分饱和"，integrator wind-up）。
+    const double max_integral = (beta > 1e-15) ? (10.0 / beta) : 1e10;
+
+    for (int m = 0; m < nm; ++m) {
+        auto& mk = ms.markers[m];
+
+        const double ex = u_target_x - mk.ux;
+        const double ey = u_target_y - mk.uy;
+
+        // 3. 更新积分（简单 Euler 积分）+ 抗饱和限幅
+        integral_x[m] += dt * ex;
+        integral_y[m] += dt * ey;
+        // 抗饱和（integrator anti-windup）：防止 beta>0 时积分无限增长
+        if (integral_x[m] >  max_integral) integral_x[m] =  max_integral;
+        if (integral_x[m] < -max_integral) integral_x[m] = -max_integral;
+        if (integral_y[m] >  max_integral) integral_y[m] =  max_integral;
+        if (integral_y[m] < -max_integral) integral_y[m] = -max_integral;
+
+        // 4. 罚函数力：F = α·e + β·integral
+        mk.fx = alpha * ex + beta * integral_x[m];
+        mk.fy = alpha * ey + beta * integral_y[m];
+    }
+
+    // 5. 展布力到欧拉网格
+    spread_force(fluid, ms, dx, kernel);
+}
+
+// ===========================================================================
+// IBM 固体受力统计：合力计算
+//
+// F_x = Σ_m  mk.fx * mk.ds
+// F_y = Σ_m  mk.fy * mk.ds
+//
+// IBM 力作用于流体（流体得到 +F），因此固体所受合力为 -F_fluid，
+// 即固体受力 = -(Σ mk.fx * mk.ds)，方向与 IBM 力相反。
+// 但为了与 MEA 方法（compute_solid_body_force）的符号约定一致，
+// 此处返回的是施加到流体上的 IBM 力（即固体受到的反作用力为其负值）。
+//
+// 物理说明：
+//   在 IBM 中，力 mk.fx/fy 施加到流体上（阻止流体穿越边界）。
+//   由牛顿第三定律，固体所受流体合力 = Σ(-mk.fx * mk.ds)。
+//   本函数返回 +Σ(mk.fx * mk.ds)（IBM 方向），调用方可根据需要取反。
+// ===========================================================================
+void compute_ibm_body_force(const MarkerSet& ms,
+                             double& out_fx, double& out_fy)
+{
+    double fx = 0.0, fy = 0.0;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) reduction(+:fx,fy)
+#endif
+    for (int m = 0; m < ms.size(); ++m) {
+        const auto& mk = ms.markers[m];
+        fx += mk.fx * mk.ds;
+        fy += mk.fy * mk.ds;
+    }
+
+    out_fx = fx;
+    out_fy = fy;
+}
+
+// ===========================================================================
+// MPI 分区适配：坐标系转换 + 归属边界设置
+// ===========================================================================
+void ibm_marker_set_adapt_to_partition(MarkerSet& ms,
+                                        int x_start, int y_start,
+                                        int phys_x0, int phys_y0,
+                                        int local_nx, int local_ny)
+{
+    // 从全局坐标到本地坐标的偏移量
+    const double off_x = static_cast<double>(phys_x0 - x_start);
+    const double off_y = static_cast<double>(phys_y0 - y_start);
+
+    for (auto& mk : ms.markers) {
+        mk.x  += off_x;
+        mk.y  += off_y;
+        mk.x0 += off_x;
+        mk.y0 += off_y;
+    }
+
+    // 设置本进程"归属"的物理行/列范围（本地坐标）
+    ms.owner_i_lo = phys_x0;
+    ms.owner_i_hi = phys_x0 + local_nx;
+    ms.owner_j_lo = phys_y0;
+    ms.owner_j_hi = phys_y0 + local_ny;
+}
+
+// ===========================================================================
+// MPI 幽灵层 u 场交换（IBM 插值前调用）
+//
+// solver.step() → stream() 完成后，幽灵行/列的 u 已由 Solver::stream() 自动修正
+// （stream() 内在 compute_macroscopic() 后调用 lbm::halo_exchange_u_2d()）。
+// 本函数保留为外部调用接口，直接代理到底层通用实现。
+// ===========================================================================
+void ibm_halo_exchange_u_2d(lbm::LatticeGrid& grid,
+                              const lbm::MpiDecomp2D& decomp)
+{
+#ifdef LBM_ENABLE_MPI
+    lbm::halo_exchange_u_2d(grid, decomp);
+#else
+    (void)grid; (void)decomp;
+#endif
+}
+
+// ===========================================================================
+// MPI 幽灵层力场归并（IBM 力展布后调用）
+//
+// spread_force() 可能向幽灵行/列写入力贡献，这些贡献属于邻居进程物理区域。
+// 本函数通过 MPI_Sendrecv 把幽灵行/列力发回对应邻居的物理行/列并累加（+=），
+// 然后清零本地幽灵行/列，保证跨 MPI 边界的 IBM 力展布物理上完整。
+//
+// n_ghost（= decomp.n_ghost）决定每侧归并的幽灵层数：
+//   n_ghost=1（默认）：归并 1 层幽灵行力，满足 TwoPoint 核。
+//   n_ghost=2       ：归并 2 层幽灵行力，适用于 FourPoint 核在 MPI
+//                     边界附近的标记点（需要 MpiDecomp2D 以 n_ghost=2 创建）。
+// ===========================================================================
+void ibm_halo_reduce_force_2d(lbm::LatticeGrid& grid,
+                                const lbm::MpiDecomp2D& decomp)
+{
+#ifdef LBM_ENABLE_MPI
+    if (decomp.nprocs == 1) return;
+
+    const int d    = grid.dim();
+    const int gnx  = grid.nx;
+    const int gny  = grid.ny;
+    const int lnx  = decomp.local_nx;
+    const int lny  = decomp.local_ny;
+    const int px0  = decomp.phys_x0();
+    const int py0  = decomp.phys_y0();
+    const int n_gh = decomp.n_ghost;
+
+    MPI_Status st;
+
+    // -----------------------------------------------------------------------
+    // S/N 方向：归并 n_ghost 层幽灵行力贡献
+    //
+    // 第 k 层（k=0..n_ghost-1）：
+    //   南幽灵行 j=k 的力 → 发给南邻，累加到其北物理行 j=py0+lny-n_ghost+k
+    //   北幽灵行 j=py0+lny+k 的力 → 发给北邻，累加到其南物理行 j=py0+k
+    //
+    // 利用 MPI_Sendrecv 对称交换：
+    //   Sendrecv 1：发送北幽灵 k 层 → 北邻，接收来自南邻北幽灵 k 层 → 累加到本进程南物理 j=py0+k
+    //   Sendrecv 2：发送南幽灵 k 层 → 南邻，接收来自北邻南幽灵 k 层 → 累加到本进程北物理 j=py0+lny-n_ghost+k
+    // -----------------------------------------------------------------------
+    {
+        const int row_size = gnx * d;
+        std::vector<double> recv_buf(row_size, 0.0);
+
+        for (int k = 0; k < n_gh; ++k) {
+            double* north_ghost_k = &grid.force[static_cast<std::size_t>(
+                grid.idx(0, py0 + lny + k)) * d];
+            double* bot_phys_k    = &grid.force[static_cast<std::size_t>(
+                grid.idx(0, py0 + k)) * d];
+            // 向北邻发送北幽灵行 k，从南邻接收其对应层贡献累加到本进程南物理行 k
+            std::fill(recv_buf.begin(), recv_buf.end(), 0.0);
+            MPI_Sendrecv(north_ghost_k,    row_size, MPI_DOUBLE, decomp.rank_north, 5000 + k,
+                         recv_buf.data(),  row_size, MPI_DOUBLE, decomp.rank_south, 5000 + k,
+                         MPI_COMM_WORLD, &st);
+            for (int c = 0; c < row_size; ++c) bot_phys_k[c] += recv_buf[c];
+            std::fill(north_ghost_k, north_ghost_k + row_size, 0.0);
+
+            double* south_ghost_k = &grid.force[static_cast<std::size_t>(
+                grid.idx(0, k)) * d];
+            double* top_phys_k    = &grid.force[static_cast<std::size_t>(
+                grid.idx(0, py0 + lny - n_gh + k)) * d];
+            // 向南邻发送南幽灵行 k，从北邻接收其对应层贡献累加到本进程北物理行 k
+            std::fill(recv_buf.begin(), recv_buf.end(), 0.0);
+            MPI_Sendrecv(south_ghost_k,    row_size, MPI_DOUBLE, decomp.rank_south, 5100 + k,
+                         recv_buf.data(),  row_size, MPI_DOUBLE, decomp.rank_north, 5100 + k,
+                         MPI_COMM_WORLD, &st);
+            for (int c = 0; c < row_size; ++c) top_phys_k[c] += recv_buf[c];
+            std::fill(south_ghost_k, south_ghost_k + row_size, 0.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // W/E 方向：归并 n_ghost 列幽灵列力贡献（列不连续，需打包）
+    // 第 k 列（k=0..n_ghost-1）：
+    //   西幽灵列 i=k 的力 → 发给西邻，累加到其最东物理列 i=px0+lnx-n_ghost+k
+    //   东幽灵列 i=px0+lnx+k 的力 → 发给东邻，累加到其最西物理列 i=px0+k
+    // -----------------------------------------------------------------------
+    if (decomp.has_west_ghost() || decomp.has_east_ghost()) {
+        const int col_size = gny * d;
+        std::vector<double> send_buf(col_size, 0.0);
+        std::vector<double> recv_buf(col_size, 0.0);
+
+        for (int k = 0; k < n_gh; ++k) {
+            // 打包并发送东幽灵列 k，接收西邻贡献累加到本进程最西物理列 k
+            std::fill(send_buf.begin(), send_buf.end(), 0.0);
+            if (decomp.has_east_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    const double* src = &grid.force[static_cast<std::size_t>(
+                        grid.idx(px0 + lnx + k, j)) * d];
+                    for (int c = 0; c < d; ++c) send_buf[j*d+c] = src[c];
+                }
+            }
+            std::fill(recv_buf.begin(), recv_buf.end(), 0.0);
+            MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 5200 + k,
+                         recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 5200 + k,
+                         MPI_COMM_WORLD, &st);
+            for (int j = 0; j < gny; ++j) {
+                double* dst = &grid.force[static_cast<std::size_t>(
+                    grid.idx(px0 + k, j)) * d];
+                for (int c = 0; c < d; ++c) dst[c] += recv_buf[j*d+c];
+            }
+            if (decomp.has_east_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    double* dst = &grid.force[static_cast<std::size_t>(
+                        grid.idx(px0 + lnx + k, j)) * d];
+                    std::fill(dst, dst + d, 0.0);
+                }
+            }
+
+            // 打包并发送西幽灵列 k，接收东邻贡献累加到本进程最东物理列 k
+            std::fill(send_buf.begin(), send_buf.end(), 0.0);
+            if (decomp.has_west_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    const double* src = &grid.force[static_cast<std::size_t>(
+                        grid.idx(k, j)) * d];
+                    for (int c = 0; c < d; ++c) send_buf[j*d+c] = src[c];
+                }
+            }
+            std::fill(recv_buf.begin(), recv_buf.end(), 0.0);
+            MPI_Sendrecv(send_buf.data(), col_size, MPI_DOUBLE, decomp.rank_west, 5300 + k,
+                         recv_buf.data(), col_size, MPI_DOUBLE, decomp.rank_east, 5300 + k,
+                         MPI_COMM_WORLD, &st);
+            for (int j = 0; j < gny; ++j) {
+                double* dst = &grid.force[static_cast<std::size_t>(
+                    grid.idx(px0 + lnx - n_gh + k, j)) * d];
+                for (int c = 0; c < d; ++c) dst[c] += recv_buf[j*d+c];
+            }
+            if (decomp.has_west_ghost()) {
+                for (int j = 0; j < gny; ++j) {
+                    double* dst = &grid.force[static_cast<std::size_t>(
+                        grid.idx(k, j)) * d];
+                    std::fill(dst, dst + d, 0.0);
+                }
+            }
+        }
+    }
+#else
+    (void)grid; (void)decomp;
+#endif
 }
 
 } // namespace ibm

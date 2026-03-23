@@ -1,23 +1,23 @@
 """
 lbm_post.plot
 =============
-Matplotlib-based visualisation for LBM+IBM+FSI simulation results.
+基于 Matplotlib 的 LBM+IBM+FSI 仿真结果可视化模块。
 
-All plotting functions accept a :class:`~lbm_post.vtk_reader.FieldSnapshot`
-and return a ``(fig, ax)`` tuple so the caller can further customise or save.
+所有绘图函数接受 :class:`~lbm_post.vtk_reader.FieldSnapshot`
+并返回 ``(fig, ax)`` 元组，调用者可进一步定制或保存。
 
 Public API
 ----------
-plot_velocity_magnitude()   — filled-contour of |u|
-plot_velocity_vectors()     — quiver or streamplot overlay
-plot_pressure()             — filled-contour of pressure p = cs²·ρ
-plot_vorticity()            — filled-contour of ωz
-plot_streamlines()          — integrated streamlines
-plot_rho()                  — density field
-plot_markers()              — Lagrangian IBM marker positions
-plot_beam_deformation()     — flexible beam deflection curve
-plot_convergence()          — residual / error vs. time-step
-save_figure()               — helper: save with sensible defaults
+plot_velocity_magnitude()   — |u| 的填充等值线图
+plot_velocity_vectors()     — quiver 或流线叠加图
+plot_pressure()             — 压力 p = cs²·ρ 的填充等值线图
+plot_vorticity()            — ωz 的填充等值线图
+plot_streamlines()          — 积分流线图
+plot_rho()                  — 密度场
+plot_markers()              — 拉格朗日 IBM 标记点位置
+plot_beam_deformation()     — 柔性梁挠曲曲线
+plot_convergence()          — 残差/误差随时间步的变化曲线
+save_figure()               — 辅助函数：以合理默认参数保存图形
 """
 
 from __future__ import annotations
@@ -26,10 +26,33 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend (safe in headless environments)
+matplotlib.use("Agg")   # 非交互式后端（在无显示器环境中安全使用）
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.font_manager as _fm
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# CJK 字体检测：若系统中存在支持 CJK 的字体，
+# 则将其添加到 sans-serif 字体列表最前，以确保标题和标签中的
+# 中/日/韩文字正确渲染，而非产生"Glyph missing"警告
+# （或在无 CJK 字体的 Windows 上导致 tight_layout 崩溃）。
+# ---------------------------------------------------------------------------
+_CJK_CANDIDATES = [
+    "Microsoft YaHei",      # Windows
+    "SimHei",               # Windows fallback
+    "PingFang SC",          # macOS
+    "Noto Sans CJK SC",     # Linux (Google Noto)
+    "WenQuanYi Micro Hei",  # Linux (Wen Quan Yi)
+    "Arial Unicode MS",     # cross-platform (if installed)
+]
+_installed_fonts = {f.name for f in _fm.fontManager.ttflist}
+_cjk_font = next((f for f in _CJK_CANDIDATES if f in _installed_fonts), None)
+if _cjk_font:
+    matplotlib.rcParams["font.sans-serif"] = (
+        [_cjk_font] + matplotlib.rcParams.get("font.sans-serif", [])
+    )
+    matplotlib.rcParams["axes.unicode_minus"] = False
 
 from .vtk_reader import FieldSnapshot, MarkerSnapshot
 
@@ -43,6 +66,7 @@ __all__ = [
     "plot_markers",
     "plot_beam_deformation",
     "plot_convergence",
+    "plot_velocity_profile",
     "save_figure",
 ]
 
@@ -51,7 +75,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 def _grid_axes(snap: FieldSnapshot) -> tuple[np.ndarray, np.ndarray]:
-    """Return (x, y) 1-D coordinate arrays from a FieldSnapshot."""
+    """从 FieldSnapshot 返回 (x, y) 一维坐标数组。"""
     x = np.arange(snap.nx, dtype=float)
     y = np.arange(snap.ny, dtype=float)
     return x, y
@@ -81,26 +105,66 @@ def plot_velocity_magnitude(
     cmap: str = "viridis",
     add_colorbar: bool = True,
     figsize: tuple[float, float] = (8, 6),
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Filled-contour plot of velocity magnitude |u|.
+    |u| 速度幅值的填充等值线图。
 
     Parameters
     ----------
-    snap        : fluid field snapshot
-    n_levels    : number of contour levels
-    cmap        : Matplotlib colormap name
-    add_colorbar: whether to draw a colourbar
-    figsize     : figure size in inches
+    snap        : 流体场快照
+    n_levels    : 等值线层数
+    cmap        : Matplotlib 颜色映射名称
+    add_colorbar: 是否绘制颜色条
+    figsize     : 图形尺寸（英寸）
+    vmin, vmax  : 显式颜色范围边界（格子单位/步）。
+                  当两者均为 *None*（默认）且速度场几乎均匀
+                  （峰峰变化 < 均值的 1%）时，范围自动钳位到
+                  ``[0, 1.5 × 均值]``，以防机器精度噪声（≤ 10⁻¹⁴）
+                  被放大为虚假的视觉伪影（如假速度反转或树状条纹）。
 
     Returns
     -------
     (fig, ax)
+
+    Notes
+    -----
+    自动钳位仅在 ``vmin`` 和 ``vmax`` 均为 ``None`` 时生效。
+    若需观察亚百分比变化，请传入显式数值，如 ``vmin=0.049, vmax=0.051``。
+    仅传入其中一个参数时，另一个保持默认值。
     """
     fig, ax = _make_fig("Velocity magnitude |u|", snap, figsize)
     x, y = _grid_axes(snap)
     mag = snap.velocity_magnitude()
-    cf = ax.contourf(x, y, mag, levels=n_levels, cmap=cmap)
+
+    # ------------------------------------------------------------------
+    # 智能归一化：防止 Matplotlib 在速度场几乎均匀时对机器精度噪声自动缩放。
+    #
+    # 背景说明：在自由出口/充分发展出口通道中，稳态为近似均匀流
+    # （所有 |u| ≈ u_inlet）。经过数千步后，峰峰变化可降至 10⁻¹⁵，
+    # 远低于相对均值的双精度 epsilon。若无显式边界，contourf 会将颜色
+    # 范围自动缩放到这个极小区间，使不可见的噪声表现为剧烈的速度反转
+    # 或条纹图案，视觉上看起来物理上错误，实则并非如此。
+    #
+    # 启发式规则：若相对变化 < 均值的 1%，则钳位到 [0, 1.5·均值]。
+    # ------------------------------------------------------------------
+    if vmin is None and vmax is None:
+        mean_mag = float(np.mean(mag))
+        if mean_mag > 1e-30:
+            rel_var = float(mag.max() - mag.min()) / mean_mag
+            if rel_var < 1e-2:
+                vmin = 0.0
+                vmax = mean_mag * 1.5
+
+    if vmin is not None or vmax is not None:
+        v0 = vmin if vmin is not None else float(mag.min())
+        v1 = vmax if vmax is not None else float(mag.max())
+        levels = np.linspace(v0, v1, n_levels)
+        cf = ax.contourf(x, y, mag, levels=levels, cmap=cmap, extend="both")
+    else:
+        cf = ax.contourf(x, y, mag, levels=n_levels, cmap=cmap)
+
     if add_colorbar:
         fig.colorbar(cf, ax=ax, label="|u| (lattice units/step)")
     return fig, ax
@@ -116,23 +180,22 @@ def plot_velocity_vectors(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Quiver (arrow) plot of the velocity field, optionally over a
-    filled-contour background.
+    速度场的 quiver（箭头）图，可选填充等值线背景。
 
     Parameters
     ----------
-    snap        : fluid field snapshot
-    every       : sub-sample every Nth point (reduces clutter)
-    scale       : quiver scale (None = auto)
-    cmap        : colormap for the background field
-    background  : 'magnitude', 'pressure', 'vorticity', or 'none'
-    figsize     : figure size
+    snap        : 流体场快照
+    every       : 每隔 N 个点采样一次（减少视觉混乱）
+    scale       : quiver 缩放比例（None = 自动）
+    cmap        : 背景字段的颜色映射
+    background  : 'magnitude'、'pressure'、'vorticity' 或 'none'
+    figsize     : 图形尺寸
     """
     fig, ax = _make_fig("Velocity vectors", snap, figsize)
     x, y = _grid_axes(snap)
     X, Y = np.meshgrid(x, y)
 
-    # Background
+    # 背景场
     if background == "magnitude":
         bg = snap.velocity_magnitude()
         label = "|u|"
@@ -151,7 +214,7 @@ def plot_velocity_vectors(
         cf = ax.contourf(x, y, bg, levels=64, cmap=cmap)
         fig.colorbar(cf, ax=ax, label=label)
 
-    # Sub-sample for quiver
+    # 为 quiver 降采样
     sl = slice(None, None, every)
     ax.quiver(X[sl, sl], Y[sl, sl],
               snap.ux[sl, sl], snap.uy[sl, sl],
@@ -168,7 +231,7 @@ def plot_pressure(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Filled-contour plot of the LBM pressure  p = cs² · ρ.
+    LBM 压力 p = cs² · ρ 的填充等值线图。
     """
     fig, ax = _make_fig("Pressure (p = cs² · ρ)", snap, figsize)
     x, y = _grid_axes(snap)
@@ -195,7 +258,7 @@ def plot_vorticity(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Filled-contour plot of the z-vorticity  ωz = ∂uy/∂x − ∂ux/∂y.
+    z 方向涡量 ωz = ∂uy/∂x − ∂ux/∂y 的填充等值线图。
     """
     fig, ax = _make_fig("Vorticity ωz", snap, figsize)
     x, y = _grid_axes(snap)
@@ -203,7 +266,10 @@ def plot_vorticity(
 
     if symmetric:
         v = np.abs(omega).max()
-        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v)
+        # 防止全零（或仅含机器精度）涡量时出现问题，
+        # 如均匀通道流。使用 v ≤ 1e-10 的 TwoSlopeNorm 会将
+        # 10⁻¹⁵ 噪声放大为视觉上明显的虚假涡旋。
+        norm = mcolors.TwoSlopeNorm(vmin=-v, vcenter=0.0, vmax=v) if v > 1e-10 else None
     else:
         norm = None
 
@@ -222,7 +288,7 @@ def plot_streamlines(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Integrated streamline plot coloured by velocity magnitude.
+    以速度幅值着色的积分流线图。
     """
     fig, ax = _make_fig("Streamlines", snap, figsize)
     x, y = _grid_axes(snap)
@@ -246,7 +312,7 @@ def plot_rho(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Filled-contour plot of the density field ρ.
+    密度场 ρ 的填充等值线图。
     """
     fig, ax = _make_fig("Density ρ", snap, figsize)
     x, y = _grid_axes(snap)
@@ -270,7 +336,7 @@ def plot_markers(
     figsize: tuple[float, float] = (8, 6),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Overlay Lagrangian IBM marker positions on a fluid-field background.
+    在流体场背景上叠加拉格朗日 IBM 标记点位置。
     """
     if background == "vorticity":
         fig, ax = plot_vorticity(snaps_fluid, figsize=figsize)
@@ -295,15 +361,15 @@ def plot_beam_deformation(
     figsize: tuple[float, float] = (8, 4),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Plot the deformed shape of a flexible beam.
+    绘制柔性梁的变形形状。
 
     Parameters
     ----------
-    x       : beam node x-coordinates (1-D)
-    y       : beam node y-coordinates (deformed, 1-D)
-    y_ref   : undeformed y-coordinates (1-D, optional — drawn in grey)
-    step    : time-step label for the title
-    figsize : figure size
+    x       : 梁节点 x 坐标（一维）
+    y       : 梁节点 y 坐标（变形后，一维）
+    y_ref   : 未变形 y 坐标（一维，可选——以灰色绘制）
+    step    : 时间步标签（用于标题）
+    figsize : 图形尺寸
     """
     title = "Beam deformation" + (f"  [step {step}]" if step is not None else "")
     fig, ax = plt.subplots(figsize=figsize)
@@ -334,17 +400,17 @@ def plot_convergence(
     figsize: tuple[float, float] = (8, 4),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Plot a scalar quantity (residual, drag, lift, …) versus time step.
+    绘制标量量（残差、阻力、升力……）随时间步的变化曲线。
 
     Parameters
     ----------
-    steps   : 1-D sequence of time-step indices
-    values  : 1-D sequence of scalar values
-    label   : curve label
-    xlabel  : x-axis label
-    ylabel  : y-axis label (defaults to *label*)
-    log_scale: use log-y scale (useful for residuals)
-    figsize : figure size
+    steps   : 时间步索引的一维序列
+    values  : 标量值的一维序列
+    label   : 曲线标签
+    xlabel  : x 轴标签
+    ylabel  : y 轴标签（默认为 *label*）
+    log_scale: 是否使用对数 y 轴（适用于残差）
+    figsize : 图形尺寸
     """
     fig, ax = plt.subplots(figsize=figsize)
     ax.plot(steps, values, linewidth=1.5, label=label)
@@ -367,15 +433,15 @@ def plot_velocity_profile(
     figsize: tuple[float, float] = (8, 5),
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Plot 1-D velocity profiles at specified grid lines.
+    在指定网格线处绘制一维速度剖面。
 
     Parameters
     ----------
-    snap       : fluid field snapshot
-    x_slices   : list of x-indices for vertical profiles (constant x)
-    y_slices   : list of y-indices for horizontal profiles (constant y)
-    component  : 'ux' or 'uy'
-    figsize    : figure size
+    snap       : 流体场快照
+    x_slices   : 竖直剖面的 x 索引列表（常数 x）
+    y_slices   : 水平剖面的 y 索引列表（常数 y）
+    component  : 'ux' 或 'uy'
+    figsize    : 图形尺寸
     """
     field = getattr(snap, component)
     fig, ax = plt.subplots(figsize=figsize)
@@ -408,18 +474,18 @@ def save_figure(fig: plt.Figure, path: str | Path, *,
                 dpi: int = 150,
                 tight: bool = True) -> Path:
     """
-    Save *fig* to *path*.
+    将 *fig* 保存到 *path*。
 
     Parameters
     ----------
-    fig     : Matplotlib figure
-    path    : output path (format inferred from suffix: .png, .pdf, .svg, …)
-    dpi     : dots per inch (relevant for raster formats)
-    tight   : call ``tight_layout()`` before saving
+    fig     : Matplotlib 图形对象
+    path    : 输出路径（格式由后缀推断：.png、.pdf、.svg……）
+    dpi     : 每英寸点数（适用于光栅格式）
+    tight   : 保存前调用 ``tight_layout()``
 
     Returns
     -------
-    Path of the saved file.
+    已保存文件的 Path。
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)

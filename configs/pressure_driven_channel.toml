@@ -1,0 +1,46 @@
+# 压力驱动通道流（Poiseuille 流）
+# 物理模型：矩形通道，西壁（入口）规定较高压力，东壁（出口）规定参考压力，
+# 上下两壁无滑移固壁。稳态时速度剖面收敛至抛物线解：
+#   u(y) = ΔP·y(H−y) / (2νρ)，ΔP = (ρ_in − ρ_out)·cs²（cs² = 1/3）
+# Re = U_max·H / ν，U_max = ΔP·H² / (8νρ)
+# 参考配置说明：configs/template.toml
+
+[simulation]
+n_steps         = 20000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 200
+ny   = 60
+nu   = 0.1
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_pressure"
+face    = "west"
+rho     = 1.005
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_pressure"
+face    = "east"
+rho     = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/pressure_channel"
+format         = "tecplot_asc"
+
+[python]
+interpreter = "python"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

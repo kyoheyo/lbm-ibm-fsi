@@ -1,0 +1,48 @@
+# 速度入口 + 压力出口 + 上下两壁自由出口
+# 物理模型：西壁规定速度入口，东壁规定压力出口（Zou-He 压力），
+# 南北两壁为自由出口（充分发展/零梯度），允许流体侧向流出，
+# 适用于开放域或射流类问题。与 velocity_inlet_free_outlet 的区别在于
+# 东壁有压力参考，避免长时间积分时的密度漂移。
+# Re = ux·ny / nu = 0.05 × 80 / 0.05 = 80
+# 参考配置说明：configs/template.toml
+
+[simulation]
+n_steps         = 25000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 200
+ny   = 80
+nu   = 0.05
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_pressure"
+face    = "east"
+rho     = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "free_outlet"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "free_outlet"
+face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/velocity_inlet_pressure_outlet"
+format         = "tecplot_asc"
+
+[python]
+interpreter = "python"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

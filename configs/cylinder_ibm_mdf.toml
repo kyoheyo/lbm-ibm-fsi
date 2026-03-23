@@ -1,0 +1,108 @@
+# =============================================================================
+# 圆柱绕流 IBM 算例 — 多重直接力法（MDF-IBM，Luo et al. 2007）
+# =============================================================================
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10 格点（直径 D = 20）
+#   入口速度 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01（格子单位）
+#   雷诺数   : Re = U_in · D / ν = 0.05 × 20 / 0.01 = 100
+#
+# IBM 方案：多重直接力法（MDF-IBM）
+#   参考：Luo K. et al. (2007) J. Comput. Phys. 227:454-483.
+#   原理：对 Lagrangian 标记点施加子迭代修正力以逼近无滑移边界条件。
+#   参数：n_iter=3（建议范围 2–4），dx=1.0，dt=1.0（格子单位）。
+#
+# 与 BBQ/IBB 方案（cylinder_in_channel.toml）的对比：
+#   ─ BB/IBB：将流体节点标记为固体，精度高、速度快，但不直接提供 Lagrangian 力。
+#   ─ MDF-IBM：以 Lagrangian 标记点代替固体节点，力连续分布，适用于柔性固体。
+#   ─ MDF 迭代 3 次 ≈ 无滑移误差 O(Δx²)，与 IBB 相当。
+#
+# MPI 跨块说明：
+#   IBM 插值读取包含幽灵层的本地网格速度（halo_exchange 已填充幽灵层）。
+#   力展布范围不超过 2 格支撑宽度，若标记点距 MPI 块边界 ≥ 2 格，则无需
+#   额外处理。对于标记点紧邻块边界的情况，调用方应在 spread_force() 后
+#   执行力场幽灵层归并（MPI_Reduce_scatter），本算例中圆柱标记点均在块内部。
+#
+# 使用方法：
+#   单进程：./lbm-fsi configs/cylinder_ibm_mdf.toml
+#   MPI（4进程）：mpirun -n 4 ./lbm-fsi configs/cylinder_ibm_mdf.toml
+#
+# 输出：流场快照写入 output/cylinder_ibm_mdf/（NPZ 格式）
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+# 西壁（进口）
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+# 东壁（出口）
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+# 南壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# IBM 浸入边界方案（MDF-IBM）
+#
+# geometry  = "circle"  —— 圆柱横截面（2D）
+# x0, y0    —— 圆心格子坐标（须与 fluid.nx/ny 的物理单位一致）
+# size      —— 半径（格子单位）
+# n_markers —— Lagrangian 标记点数量（建议 ≥ 2π·R，即周长的格点倍数）
+#
+# IBM 力算法：multi_direct_forcing（n_iter=3）
+# δ 函数核：four_point（Peskin 4 点核，支撑宽度 4h）
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# [fsi] 流固耦合方案（显式选择）
+# -----------------------------------------------------------------------------
+[fsi]
+coupling = "ibm"   # ② 纯 IBM 浸入边界法
+
+[ibm]
+geometry   = "circle"
+x0         = 150.0     # 圆心 x
+y0         = 50.0      # 圆心 y
+size       = 10.0      # 半径 R=10，直径 D=20
+n_markers  = 64        # 64 个标记点（≈ 2π·R = 63 格），均匀分布在圆柱表面
+delta_kernel = "four_point"
+
+[output]
+write_interval = 500
+directory      = "output/cylinder_ibm_mdf"
+format         = "npz"
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
+
+# MPI 并行（可选）
+# [mpi]
+# mode      = "block"
+# nx_blocks = 1
+# ny_blocks = 0    # 0 = 自动

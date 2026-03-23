@@ -1,0 +1,45 @@
+# 速度入口通道流（均匀入口 + 充分发展出口）
+# 物理模型：矩形通道，西壁规定均匀速度入口，东壁施加充分发展（零法向梯度）出口，
+# 上下两壁无滑移固壁。流场从均匀入口逐渐发展为 Poiseuille 抛物线剖面。
+# Re = U_inlet·H / ν = 0.05 × 60 / 0.1 = 30
+# 参考配置说明：configs/template.toml
+
+[simulation]
+n_steps         = 30000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 300
+ny   = 60
+nu   = 0.1
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[output]
+write_interval = 1000
+directory      = "output/velocity_inlet_channel"
+format         = "tecplot_asc"
+
+[python]
+interpreter = "python"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

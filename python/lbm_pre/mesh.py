@@ -24,7 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
-import gmsh
+try:
+    import gmsh
+    _gmsh_available = True
+except ImportError:
+    gmsh = None           # type: ignore[assignment]
+    _gmsh_available = False
+
 import numpy as np
 
 
@@ -137,6 +143,11 @@ class MeshBuilder:
 
     def build(self) -> "MeshBuilder":
         """Construct the gmsh model (does not write to disk yet)."""
+        if not _gmsh_available:
+            raise ImportError(
+                "The 'gmsh' package is required for mesh generation. "
+                "Install it with: pip install gmsh"
+            )
         gmsh.initialize(sys.argv, False)
         gmsh.option.setNumber("General.Verbosity", 1)
         gmsh.model.add("lbm_domain")
@@ -281,7 +292,7 @@ class MeshBuilder:
 
     def finalize(self) -> None:
         """Release gmsh resources."""
-        if gmsh.is_initialized():
+        if _gmsh_available and gmsh.is_initialized():
             gmsh.finalize()
 
     def __enter__(self) -> "MeshBuilder":
@@ -310,6 +321,11 @@ def export_surface_nodes(msh_path: str | Path,
     -------
     coords : ndarray of shape (N, 2) — sorted counter-clockwise
     """
+    if not _gmsh_available:
+        raise ImportError(
+            "The 'gmsh' package is required for mesh I/O. "
+            "Install it with: pip install gmsh"
+        )
     gmsh.initialize(sys.argv, False)
     gmsh.option.setNumber("General.Verbosity", 0)
     gmsh.open(str(msh_path))

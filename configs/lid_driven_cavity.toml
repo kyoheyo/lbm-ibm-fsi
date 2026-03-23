@@ -1,53 +1,65 @@
-# Lid-driven cavity flow with a flexible filament in the centre
-# Classic benchmark: Re = U*L/ν = 1.0 * 100 / 0.01 = 100
+# 顶盖驱动方腔流基准算例（含柔性丝状体 IBM-FSI）
+# 物理模型：方形封闭腔，北壁（顶盖）以速度 ux=0.1 水平运动，其余三壁静止无滑移。
+# 腔内植入一根根部固定于 (x0=50, y0=30) 的柔性丝状体，模拟流固耦合（FSI）。
+# 雷诺数：Re = U·L / ν = 0.1 × 100 / 0.01 = 100
+# 参考配置说明：configs/template.toml
 
 [simulation]
-n_steps        = 10000
-dt             = 1.0          # lattice time units
-lattice_model  = "D2Q9"
-collision_model = "MRT"       # MRT is more stable at lower viscosity
+n_steps         = 10000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
 
 [fluid]
-nx = 100
-ny = 100
-nz = 1
-nu = 0.01                     # kinematic viscosity (lattice units)
+nx   = 100
+ny   = 100
+nu   = 0.01
 rho0 = 1.0
 
-  [[fluid.boundary_conditions]]
-  bc_type = "zou_he_velocity"
-  face    = "north"
-  ux      = 0.1               # lid velocity
-  uy      = 0.0
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "north"
+ux      = 0.1
+uy      = 0.0
 
-  [[fluid.boundary_conditions]]
-  bc_type = "bounce_back"
-  face    = "south"
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
 
-  [[fluid.boundary_conditions]]
-  bc_type = "bounce_back"
-  face    = "west"
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "west"
 
-  [[fluid.boundary_conditions]]
-  bc_type = "bounce_back"
-  face    = "east"
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "east"
 
 [structure]
-young_modulus  = 1.0e3
-second_moment  = 1.0e-6
-density        = 1.5
-area           = 0.01
-length         = 0.3
-n_elements     = 10
+young_modulus = 1.0e3
+second_moment = 1.0e-6
+density       = 1.5
+area          = 0.01
+length        = 0.3
+n_elements    = 10
+
+[fsi]
+coupling = "ibm"   # ② 纯 IBM 浸入边界法
 
 [ibm]
-geometry   = "filament"
-x0         = 50.0            # centre of domain in lattice units
-y0         = 30.0
-size       = 30.0            # filament length (lattice units)
-n_markers  = 30
+geometry     = "filament"
+x0           = 50.0
+y0           = 30.0
+size         = 30.0
+n_markers    = 30
 delta_kernel = "four_point"
 
 [output]
 write_interval = 500
 directory      = "output/lid_cavity"
+format         = "tecplot_asc"
+plot_interval  = 2000
+
+[python]
+interpreter = "python"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"

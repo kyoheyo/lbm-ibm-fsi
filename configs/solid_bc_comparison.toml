@@ -1,0 +1,208 @@
+# =============================================================================
+# 固体边界条件比较算例（Solid BC Method Comparison）
+# =============================================================================
+#
+# 本算例将 4 种固体边界条件方法并列于同一仿真域中，使所有方法在完全相同的
+# 物理条件下运行，便于直接比较各方法的流场结果与受力预测精度。
+#
+# ── 流体域 ──────────────────────────────────────────────────────────────────
+#   尺寸     : 800 × 700 格点（40D × 35D，D = 圆柱直径 = 20 格点）
+#   均匀来流 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01（格子单位）
+#   雷诺数   : Re = U_in · D / ν = 0.05 × 20 / 0.01 = 100
+#   碰撞模型 : MRT（多弛豫时间，高稳定性）
+#
+# ── 圆柱布置（垂直流向并列，间距 150 格 = 7.5D，足以避免相互干扰） ────────
+#   x 位置 : 200（距入口 10D，距出口 30D）
+#
+#   y 位置  │ 编号     │ 固体边界条件方法
+#   ────────┼──────────┼──────────────────────────────────────────────────
+#     100   │ cyl_ibb  │ ① 插值反弹格式（IBB，Bouzidi 2001，二阶精度）
+#     250   │ cyl_mdf  │ ② IBM – 多重直接力法（MDF-IBM，Luo 2007）
+#     400   │ cyl_mls  │ ③ IBM – 移动最小二乘插值（MLS-IBM，Wang 2009）
+#     550   │ cyl_pen  │ ④ IBM – 罚函数反馈力法（Penalty-IBM，Goldstein 1993）
+#
+#   各圆柱间距 150 格点（= 7.5D）> 5D（无干扰经验阈值）
+#   壁面至最近圆柱中心 ≥ 100 格点（= 5D），避免侧壁边界效应
+#
+# ── 耦合策略 ────────────────────────────────────────────────────────────────
+#   coupling = "hybrid"：
+#     [solid]   → cyl_ibb 使用插值反弹格式（IBB）
+#     [ibm]     → cyl_mdf/mls/pen 使用 IBM，通过体级 method 字段各自覆盖方案
+#
+#   如需对比简单反弹格式（BB），将 [solid] bc_type 改为 "bounce_back"，
+#   或参考配套算例 configs/cylinder_in_channel.toml。
+#
+# ── 输出说明 ────────────────────────────────────────────────────────────────
+#   流场快照 : output/solid_bc_comparison/fluid_NNNNNN.dat（ASCII Tecplot 格式）
+#              可直接用 Tecplot / ParaView 打开；包含密度、x/y 速度分量
+#   受力时序 : output/solid_bc_comparison/
+#               ├── cyl_ibb_force.csv   — IBB 圆柱 Fx/Fy（动量交换法）
+#               ├── cyl_mdf_force.csv   — IBM-MDF 圆柱 Fx/Fy
+#               ├── cyl_mls_force.csv   — IBM-MLS 圆柱 Fx/Fy
+#               └── cyl_pen_force.csv   — IBM-Penalty 圆柱 Fx/Fy
+#
+#   后处理：仿真结束后自动调用 compare_solid_bcs.py 生成对比图像：
+#     velocity_magnitude.png  — 速度幅值云图（含 4 个圆柱）
+#     pressure.png            — 压力云图（p = ρ/3 在格子单位）
+#     vorticity.png           — 涡量云图
+#     force_fx_comparison.png — Fx(t) 四方法对比曲线
+#     force_fy_comparison.png — Fy(t) 四方法对比曲线
+#
+# ── 使用方法 ─────────────────────────────────────────────────────────────────
+#   单进程：./lbm-fsi configs/solid_bc_comparison.toml
+#   MPI（4进程）：mpirun -n 4 ./lbm-fsi configs/solid_bc_comparison.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 50000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 800
+ny   = 700
+nu   = 0.01
+rho0 = 1.0
+
+# 西壁（均匀来流入口）
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+# 东壁（充分发展出口，零梯度）
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+# 南壁（无滑移壁）
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁（无滑移壁）
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# =============================================================================
+# [fsi] 流固耦合方案：混合模式（BB/IBB 固体 + IBM 固体并存）
+# =============================================================================
+[fsi]
+coupling = "hybrid"
+
+# =============================================================================
+# [solid] 圆柱 ①：插值反弹格式（IBB）
+#
+# IBB（Bouzidi 2001）通过对壁面距离分数 q 进行线性/二次插值，将标准反弹
+# 格式从一阶精度提升至二阶精度，是高精度固定边界的首选格式。
+# 动量交换法（MEA）统计圆柱所受合力 Fx/Fy。
+# =============================================================================
+[solid]
+bc_type = "interpolated_bounce_back"
+
+[[solid.bodies]]
+shape  = "cylinder"
+cx     = 200.0      # 圆心 x（距入口 200 格，= 10D）
+cy     = 100.0      # 圆心 y（距南壁 100 格，= 5D）
+radius = 10.0       # 半径 R=10，直径 D=20
+label  = "cyl_ibb"
+
+[solid.force_output]
+enabled  = true
+interval = 200           # 每 200 步输出一次（50000 步 → 250 个数据点）
+filename = "cyl_ibb_force"
+
+# =============================================================================
+# [ibm] 圆柱 ②③④：IBM 浸入边界法（三种方案通过体级 method 字段分别覆盖）
+#
+# 全局参数（delta_kernel/n_iter/alpha/beta）作为默认值；
+# 每个 [[ibm.bodies]] 条目的 method 字段单独指定本体使用的 IBM 方案，
+# 从而在同一仿真中直接对比三种 IBM 力计算算法。
+# =============================================================================
+[ibm]
+delta_kernel = "four_point"   # Peskin 4 点 δ 核（支撑宽度 2 格，二阶精度）
+method       = "mdf"          # 全局默认方法（被各体 method 字段覆盖）
+n_iter       = 3              # MDF 子迭代次数（全局默认）
+alpha        = 8.0            # Penalty 比例增益（全局默认）
+beta         = 0.0            # Penalty 积分增益（全局默认）
+
+# ── 圆柱 ②：IBM – 多重直接力法（MDF-IBM，Luo et al. 2007） ──────────────
+# 对 Lagrangian 标记点施加多次子迭代力修正，逐步消除壁面速度残差，
+# 精度与 IBB 相当（O(Δx²)），是 IBM 中应用最广的稳定方案。
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 200.0      # 与 IBB 圆柱对齐（同一 x 位置）
+y0         = 250.0      # 圆心 y：与相邻圆柱间距 150 = 7.5D
+size       = 10.0       # 半径 R=10，直径 D=20
+n_markers  = 64         # 标记点数（≈ 2πR = 63，均匀分布）
+label      = "cyl_mdf"
+method     = "mdf"      # 体级覆盖：多重直接力法
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 200
+filename = "cyl_mdf_force"
+
+# ── 圆柱 ③：IBM – 移动最小二乘插值（MLS-IBM，Wang et al. 2009） ──────────
+# 以移动最小二乘构造高阶插值基函数替代标准 δ 函数插值，在标记点分布不均匀
+# 或曲线边界法向梯度重构精度要求高时优于标准 MDF。
+# 力展布仍采用标准 δ 函数（保证力守恒）。
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 200.0
+y0         = 400.0      # 间距 150 格 = 7.5D
+size       = 10.0
+n_markers  = 64
+label      = "cyl_mls"
+method     = "mls"      # 体级覆盖：移动最小二乘插值
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 200
+filename = "cyl_mls_force"
+
+# ── 圆柱 ④：IBM – 罚函数反馈力法（Penalty-IBM，Goldstein et al. 1993） ──
+# 将无滑移条件转化为弹簧-阻尼反馈力：F = -α·u_marker - β·∫u dt。
+# 无子迭代，每步计算量最低，适合初步验证；但需调参且对刚度较敏感。
+[[ibm.bodies]]
+geometry   = "circle"
+x0         = 200.0
+y0         = 550.0      # 间距 150 格 = 7.5D
+size       = 10.0
+n_markers  = 64
+label      = "cyl_pen"
+method     = "penalty"  # 体级覆盖：罚函数反馈力法
+alpha      = 8.0        # 体级覆盖：比例增益（与全局一致，可按需调整）
+beta       = 0.0        # 体级覆盖：积分增益
+
+[ibm.bodies.force_output]
+enabled  = true
+interval = 200
+filename = "cyl_pen_force"
+
+# =============================================================================
+# 输出配置
+# =============================================================================
+[output]
+write_interval = 500                          # 每 500 步写出一个流场快照
+directory      = "output/solid_bc_comparison" # 输出目录
+format         = "tecplot_asc"                # ASCII Tecplot 格式（.dat）
+enable_csv_monitor = false                    # 关闭全局动能监控（保留力 CSV）
+
+[python]
+interpreter = "python3"
+post_script = "python/examples/compare_solid_bcs.py"
+pythonpath  = "python"
+
+# =============================================================================
+# MPI 并行（可选；去掉下方注释即可启用）
+# =============================================================================
+# [mpi]
+# mode           = "block"
+# nx_blocks      = 1
+# ny_blocks      = 0         # 0 = 自动分配（推荐）
+# ibm_halo_width = 2         # 当标记点靠近 MPI 块边界时启用双层幽灵交换

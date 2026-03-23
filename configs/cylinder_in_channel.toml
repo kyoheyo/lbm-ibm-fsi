@@ -1,0 +1,113 @@
+# =============================================================================
+# 槽道内圆柱绕流测试算例（Cylinder Flow in a Channel）
+# =============================================================================
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点（长 × 高）
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10 格点（直径 D = 20）
+#   入口速度 : U_in = 0.05（格子单位）
+#   运动粘度 : ν = 0.01（格子单位）
+#   雷诺数   : Re = U_in · D / ν = 0.05 × 20 / 0.01 = 100
+#              （Re=100 时圆柱后方呈现 Kármán 涡街，可用于验证 LBM 数值精度）
+#
+# 固体边界方案：
+#   使用 Bouzidi 插值反弹（IBB，二阶精度），精确处理圆柱曲线边界。
+#   如需测试一阶精度方案，可将 solid.bc_type 改为 "bounce_back"。
+#
+# 参考文献：
+#   Bouzidi M. et al. (2001) Phys. Fluids 13(11):3452.
+#   Ladd A.J.C. (1994) J. Fluid Mech. 271, 285-309.
+#   Schäfer M. & Turek S. (1996) "Benchmark computations of laminar flow around a cylinder"
+#
+# 使用方法：
+#   单进程：./lbm-fsi configs/cylinder_in_channel.toml
+#   MPI（4进程Y向分块）：mpirun -n 4 ./lbm-fsi configs/cylinder_in_channel.toml
+#
+# 输出：流场快照写入 output/cylinder_in_channel/（NPZ 格式）
+#       后处理：python python/examples/plot_solver_output.py output/cylinder_in_channel
+# =============================================================================
+
+[simulation]
+n_steps         = 50000         # 50000 步足以发展为周期性 Kármán 涡街（Re=100）
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"         # MRT 比 BGK 在低粘度下更稳定
+
+# -----------------------------------------------------------------------------
+# 流体域
+# -----------------------------------------------------------------------------
+[fluid]
+nx   = 600    # X 方向格点数（流向）
+ny   = 100    # Y 方向格点数（展向，即通道高度 H=100；D/H=0.2 符合经典基准）
+nu   = 0.01   # 运动粘度：ν=0.01，Re = U·D/ν = 0.05×20/0.01 = 100
+rho0 = 1.0
+
+# 西壁（进口）：均匀速度入口，Zou-He 速度边界
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05      # 入口 x 速度（格子单位）；Ma = U/cs = 0.05/0.577 ≈ 0.087，可压缩误差可接受
+uy      = 0.0
+
+# 东壁（出口）：充分发展出口（拷贝上游一层 f，零法向梯度）
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+# 南壁（下壁）：无滑移固壁，半步长反弹
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+# 北壁（上壁）：无滑移固壁，半步长反弹
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+# -----------------------------------------------------------------------------
+# [solid] 圆柱固体体（IBB 曲线边界反弹）
+#
+# mark_solid_cylinder() 将所有满足 (i-cx)²+(j-cy)² < R² 的节点标记为固体，
+# 并精确计算每个流-固链接的 IBB 壁面距离分数 q（射线-圆弧求交，Yu 2003）。
+# 施加时机：stream() 之后，宏观量更新之前（由 Solver::step() 自动调用）。
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# [fsi] 流固耦合方案（显式选择，可省略；省略时根据 [solid]/[ibm] 段自动推断）
+# -----------------------------------------------------------------------------
+[fsi]
+coupling = "bounce_back"   # ① 纯反弹格式（BB / IBB）
+
+[solid]
+bc_type = "interpolated_bounce_back"    # Bouzidi IBB，二阶精度曲线壁
+
+[[solid.bodies]]
+shape  = "cylinder"
+cx     = 150.0     # 圆心 x：距进口 1.5D 处（约 7.5 倍直径），足够发展入口边界层
+cy     = 50.0      # 圆心 y：通道中心（对称位置）
+radius = 10.0      # 半径 R=10，直径 D=20，D/H=0.2
+
+# -----------------------------------------------------------------------------
+# 输出控制
+# -----------------------------------------------------------------------------
+[output]
+write_interval = 500              # 每 500 步写一次快照（共约 100 个快照）
+directory      = "output/cylinder_in_channel"
+format         = "npz"            # NumPy 压缩格式，可用 lbm_post.NpzReader 读取
+
+# -----------------------------------------------------------------------------
+# Python 后处理（可选）
+# 仿真结束后自动生成流场云图（需要 matplotlib）
+# -----------------------------------------------------------------------------
+[python]
+interpreter = "python3"
+post_script = "python/examples/plot_solver_output.py"
+pythonpath  = "python"
+
+# -----------------------------------------------------------------------------
+# MPI 并行（可选）：取消注释以启用 MPI 域分解
+# 4 进程 Y 向切片示例：mpirun -n 4 ./lbm-fsi configs/cylinder_in_channel.toml
+# -----------------------------------------------------------------------------
+# [mpi]
+# mode      = "block"
+# nx_blocks = 1
+# ny_blocks = 0    # 0 = 自动（等于 mpirun -n N 的 N）

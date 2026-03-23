@@ -2,36 +2,46 @@
 """
 examples/lid_driven_cavity.py
 ==============================
-End-to-end pre/post-processing example for the lid-driven cavity benchmark.
+顶盖驱动方腔（lid-driven cavity）基准算例的端到端前/后处理示例。
 
-Workflow
+工作流程
 --------
-1. Generate the solver TOML configuration (pre-processing).
-2. Build a gmsh background mesh of the domain (pre-processing).
-3. Generate synthetic solver output for demonstration (stands in for the
-   real solver; replace with NpzReader pointing at real output).
-4. Produce visualisation plots (post-processing):
-   - Velocity magnitude contour
-   - Streamlines
-   - Vorticity
-   - Velocity profile at cavity centreline
-5. Compute bulk statistics (post-processing).
+1. 生成求解器 TOML 配置文件（前处理）。
+2. 使用 gmsh 生成域背景网格（前处理）。
+3. 生成合成求解器输出数据（演示用；实际使用时替换为指向真实输出的 NpzReader）。
+4. 生成可视化图像（后处理）：
+   - 速度幅值云图
+   - 流线图
+   - 涡量云图
+   - 方腔中心线速度剖面图
+5. 计算体积统计量（后处理）。
 
-Run::
+运行方式::
 
     cd python/
     python3 examples/lid_driven_cavity.py
 
-Outputs are written to  examples/output/lid_cavity/ .
+输出文件写入  examples/output/lid_cavity/ 。
 """
 
+import sys
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 路径引导：确保 lbm_pre / lbm_post 无论从哪个工作目录调用都可导入。
+# __file__ → .../python/examples/lid_driven_cavity.py
+# .parent  → .../python/examples/
+# .parent  → .../python/          ← 包根目录
+# ---------------------------------------------------------------------------
+_PYTHON_DIR = Path(__file__).resolve().parent.parent
+if str(_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR))
 
 OUTPUT_DIR = Path(__file__).parent / "output" / "lid_cavity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# 1. Generate solver configuration
+# 1. 生成求解器配置
 # ---------------------------------------------------------------------------
 from lbm_pre.config_gen import SolverConfig, reynolds_to_nu
 
@@ -43,20 +53,24 @@ config_path = cfg.write(
 print(f"[1/5] Config written → {config_path}")
 
 # ---------------------------------------------------------------------------
-# 2. Generate gmsh background mesh
+# 2. 生成 gmsh 背景网格
 # ---------------------------------------------------------------------------
 from lbm_pre.mesh import MeshBuilder
 
 mesh_path = OUTPUT_DIR / "domain.msh"
-with MeshBuilder(100, 100).set_mesh_size(5.0) as mb:
-    mb.build().write(mesh_path)
-info = mb.info() if mb._built else None
-print(f"[2/5] Mesh written  → {mesh_path}")
-if info is not None:
-    print(f"      nodes={info.n_nodes}  elements={info.n_elements}")
+try:
+    with MeshBuilder(100, 100).set_mesh_size(5.0) as mb:
+        mb.build().write(mesh_path)
+    info = mb.info() if mb._built else None
+    print(f"[2/5] Mesh written  → {mesh_path}")
+    if info is not None:
+        print(f"      nodes={info.n_nodes}  elements={info.n_elements}")
+except ImportError as gmsh_err:
+    print(f"[2/5] Mesh skipped  — {gmsh_err}")
+    info = None
 
 # ---------------------------------------------------------------------------
-# 3. Generate synthetic "solver output"
+# 3. 生成合成"求解器输出"数据
 # ---------------------------------------------------------------------------
 from lbm_post.vtk_reader import make_synthetic_lid_cavity, save_snapshot_npz
 
@@ -72,7 +86,7 @@ for s in steps:
 print(f"[3/5] {len(snapshots)} synthetic snapshots written → {snaps_dir}")
 
 # ---------------------------------------------------------------------------
-# 4. Produce visualisation plots
+# 4. 生成可视化图像
 # ---------------------------------------------------------------------------
 from lbm_post.plot import (
     plot_velocity_magnitude,
@@ -97,12 +111,12 @@ save_figure(fig, OUTPUT_DIR / "vorticity.png")
 
 fig, _ = plot_velocity_profile(
     final_snap,
-    x_slices=[50],     # vertical profile at cavity centre x=50
+    x_slices=[50],     # 方腔中心 x=50 处的竖向速度剖面
     component="ux",
 )
 save_figure(fig, OUTPUT_DIR / "ux_profile.png")
 
-# Time-series of ux at the cavity monitor point (50, 50)
+# 监测点 (50, 50) 处 ux 的时间序列
 monitor_steps, monitor_values = monitor_point(snapshots, xi=50, yj=50, field="ux")
 fig, _ = plot_convergence(monitor_steps, monitor_values,
                            label="ux at (50,50)",
@@ -112,7 +126,7 @@ save_figure(fig, OUTPUT_DIR / "monitor_ux.png")
 print(f"[4/5] Plots saved → {OUTPUT_DIR}")
 
 # ---------------------------------------------------------------------------
-# 5. Compute bulk statistics
+# 5. 计算体积统计量
 # ---------------------------------------------------------------------------
 from lbm_post.analysis import compute_bulk_quantities
 

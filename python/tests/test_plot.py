@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from lbm_post.vtk_reader import (
+    FieldSnapshot,
     make_synthetic_lid_cavity,
     MarkerSnapshot,
 )
@@ -172,5 +173,87 @@ class TestVelocityVectorsVariants:
     @pytest.mark.parametrize("bg", ["magnitude", "pressure", "vorticity", "none"])
     def test_all_backgrounds(self, snap, bg):
         fig, ax = plot_velocity_vectors(snap, background=bg)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Smart normalisation for nearly-uniform velocity fields
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def uniform_channel_snap():
+    """
+    Synthetic nearly-uniform channel flow snapshot (u ≈ 0.05 everywhere).
+    Simulates the free-outlet steady state from ZouHe inlet +
+    FullyDeveloped on all other faces, where peak-to-peak variation is
+    machine-precision noise (≤ 1e-14), reproducing the visual artifacts
+    (fake velocity reversal / tree-like stripes) caused by matplotlib
+    auto-scaling to the noise floor.
+    """
+    nx, ny = 32, 16
+    rho = np.ones((ny, nx))
+    ux  = np.full((ny, nx), 0.05)
+    uy  = np.zeros((ny, nx))
+    rng = np.random.default_rng(42)
+    ux += rng.uniform(-5e-15, 5e-15, ux.shape)
+    return FieldSnapshot(step=20000, time=20000.0, nx=nx, ny=ny,
+                         rho=rho, ux=ux, uy=uy)
+
+
+class TestUniformFlowNormalisation:
+    """
+    Verify that plot_velocity_magnitude does NOT amplify machine-precision
+    noise into fake visual artifacts when the velocity field is nearly uniform
+    (relative peak-to-peak < 1 %).
+    """
+
+    def test_auto_normalisation_clamped_to_physical_range(
+            self, uniform_channel_snap):
+        """
+        When rel. variation < 1 %, the plot must succeed and return a valid
+        Figure / Axes pair without raising (the key regression: matplotlib
+        used to show machine-precision noise as dramatic stripes).
+        """
+        fig, ax = plot_velocity_magnitude(uniform_channel_snap)
+        assert isinstance(fig, plt.Figure)
+        assert isinstance(ax, plt.Axes)
+        plt.close(fig)
+
+    def test_explicit_vmin_vmax_override_auto_normalisation(
+            self, uniform_channel_snap):
+        """
+        Explicit vmin/vmax bypass the smart normalisation and zoom into the
+        tiny variation — must succeed without raising.
+        """
+        fig, ax = plot_velocity_magnitude(
+            uniform_channel_snap, vmin=0.049, vmax=0.051)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_non_uniform_field_not_clamped(self, snap):
+        """
+        The lid-driven-cavity fixture has > 1 % velocity variation, so the
+        auto-normalisation must NOT activate.
+        """
+        mag = snap.velocity_magnitude()
+        mean_mag = float(np.mean(mag))
+        rel_var = float(mag.max() - mag.min()) / (mean_mag or 1.0)
+        assert rel_var >= 1e-2, (
+            f"Fixture too uniform (rel_var={rel_var:.2e}); "
+            "non-clamped path cannot be tested."
+        )
+        fig, ax = plot_velocity_magnitude(snap)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_vorticity_near_zero_no_amplification(
+            self, uniform_channel_snap):
+        """
+        Vorticity in a uniform flow is machine-precision zero (≤ 1e-14).
+        plot_vorticity must not amplify it via TwoSlopeNorm (which would
+        produce the same fake-stripe artifact as velocity_magnitude).
+        """
+        fig, ax = plot_vorticity(uniform_channel_snap)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
