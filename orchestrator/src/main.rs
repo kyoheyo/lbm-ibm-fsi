@@ -488,6 +488,9 @@ fn run_time_loop(
 fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry]) {
     let dx = 1.0_f64;
     let dt = cfg.simulation.dt;
+    // 每个 IBM 时间步开始前清零体力场，防止上一步的力场残留被 pre_force 机制
+    // 意外累积到当前步（会导致 MLS/MDF 直接力方法逐步发散）。
+    grid.zero_force();
     for entry in ibm_entries.iter_mut() {
         match entry.method.to_lowercase().as_str() {
             "penalty" => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),

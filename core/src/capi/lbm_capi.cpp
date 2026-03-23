@@ -67,6 +67,16 @@ void lbm_grid_free(lbm::LatticeGrid* g)
     delete g;
 }
 
+/// 将体力场（grid.force）清零。
+///
+/// 在每个 IBM 时间步开始前调用此函数，确保多体 IBM 力从零开始累积，
+/// 防止上一步的力场残留被 pre_force 保存/恢复机制意外累积。
+void lbm_grid_zero_force(lbm::LatticeGrid* g)
+{
+    if (!g) return;
+    std::fill(g->force.begin(), g->force.end(), 0.0);
+}
+
 // Rust 封装: LbmGrid::nx() / ny() / nz() — bindings/src/lib.rs
 int lbm_grid_nx(const lbm::LatticeGrid* g) { return g ? g->nx : 0; }
 int lbm_grid_ny(const lbm::LatticeGrid* g) { return g ? g->ny : 0; }

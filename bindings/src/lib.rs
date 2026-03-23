@@ -64,6 +64,7 @@ mod ffi {
         pub fn lbm_grid_new(nx: c_int, ny: c_int, nz: c_int,
                             model: LatticeModelC) -> *mut LatticeGridHandle;
         pub fn lbm_grid_free(g: *mut LatticeGridHandle);
+        pub fn lbm_grid_zero_force(g: *mut LatticeGridHandle);
         pub fn lbm_grid_nx(g: *const LatticeGridHandle) -> c_int;
         pub fn lbm_grid_ny(g: *const LatticeGridHandle) -> c_int;
         pub fn lbm_grid_nz(g: *const LatticeGridHandle) -> c_int;
@@ -468,6 +469,9 @@ impl LbmGrid {
     pub fn rho(&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_rho(self.ptr, idx) } }
     pub fn ux (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_ux (self.ptr, idx) } }
     pub fn uy (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_uy (self.ptr, idx) } }
+
+    /// 将体力场清零（每个 IBM 时间步开始前调用，防止上一步残留力场被累积）。
+    pub fn zero_force(&mut self) { unsafe { ffi::lbm_grid_zero_force(self.ptr) } }
 
     /// 原始可变指针 — 仅供 `LbmSolver::step` 内部使用。
     ///
