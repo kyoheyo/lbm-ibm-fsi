@@ -259,6 +259,12 @@ mod ffi {
         /// 创建直线丝状体标记点集（沿 x 轴均匀分布）。
         pub fn lbm_ibm_marker_set_new_filament(x0: f64, y0: f64, length: f64, n_markers: c_int)
             -> *mut IbmMarkerSetHandle;
+        /// 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+        /// ds 为 nullptr 时自动由相邻点距计算弧长元素。
+        /// 返回 nullptr 若 n_markers ≤ 0 或 x/y 为 nullptr。
+        pub fn lbm_ibm_marker_set_from_coords(x: *const f64, y: *const f64,
+                                               ds: *const f64, n_markers: c_int)
+            -> *mut IbmMarkerSetHandle;
         /// 从 CSV 文件加载标记点（第三方网格接口）。
         /// 文件格式：每行 "x, y [, z [, ds]]"；忽略 '#' 注释行和空行。
         /// 返回 nullptr 若文件无法打开或格式错误。
@@ -1184,6 +1190,33 @@ impl LbmIbmMarkerSet {
         };
         assert!(!ptr.is_null(), "lbm_ibm_marker_set_new_filament returned null");
         let n = n_markers as usize;
+        LbmIbmMarkerSet {
+            ptr,
+            n_markers: n,
+            integral_x: vec![0.0; n],
+            integral_y: vec![0.0; n],
+        }
+    }
+
+    /// 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+    ///
+    /// # 参数
+    /// - `x`, `y`：标记点坐标数组（格子单位，长度 `n_markers`）
+    /// - `ds`：弧长/面积元素数组（长度 `n_markers`）；传空 slice 时由 C++ 端自动计算
+    ///
+    /// # Panics
+    /// 若 `x.len() != y.len()` 或长度为 0。
+    pub fn new_from_coords(x: &[f64], y: &[f64], ds: &[f64]) -> Self {
+        assert_eq!(x.len(), y.len(), "x and y must have the same length");
+        assert!(!x.is_empty(), "marker coordinate arrays must not be empty");
+        let n = x.len();
+        let ds_ptr: *const f64 = if ds.len() == n { ds.as_ptr() } else { std::ptr::null() };
+        let ptr = unsafe {
+            ffi::lbm_ibm_marker_set_from_coords(
+                x.as_ptr(), y.as_ptr(), ds_ptr, n as i32,
+            )
+        };
+        assert!(!ptr.is_null(), "lbm_ibm_marker_set_from_coords returned null");
         LbmIbmMarkerSet {
             ptr,
             n_markers: n,

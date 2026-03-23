@@ -1178,6 +1178,7 @@ int lbm_mpi_enabled()
 #include "ibm/interpolation.hpp"
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 extern "C" {
 
@@ -1511,6 +1512,49 @@ void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* ou
 /// 忽略以 '#' 开头的注释行和空行。
 ///
 /// @param filename  CSV 文件路径（null 终止字符串）
+/// @brief 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+///
+/// @param x         标记点 x 坐标数组（长度 n_markers）
+/// @param y         标记点 y 坐标数组（长度 n_markers）
+/// @param ds        弧长/面积元素数组（长度 n_markers；传 nullptr 则自动由相邻点距计算）
+/// @param n_markers 标记点数量
+/// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
+///         若 n_markers ≤ 0 或 x/y 为 nullptr，返回 nullptr。
+IbmMarkerSetHandle* lbm_ibm_marker_set_from_coords(const double* x, const double* y,
+                                                    const double* ds, int n_markers)
+{
+    if (!x || !y || n_markers <= 0) return nullptr;
+    ibm::MarkerSet ms;
+    ms.markers.resize(static_cast<size_t>(n_markers));
+    for (int k = 0; k < n_markers; ++k) {
+        ms.markers[k] = ibm::Marker{};
+        ms.markers[k].x  = x[k];
+        ms.markers[k].y  = y[k];
+        ms.markers[k].x0 = x[k];
+        ms.markers[k].y0 = y[k];
+    }
+    // Compute ds: use caller-supplied values when available, otherwise derive from
+    // arc-length between successive markers (closed loop assumed for the last gap).
+    if (ds) {
+        for (int k = 0; k < n_markers; ++k)
+            ms.markers[k].ds = ds[k];
+    } else {
+        // Average of forward and backward segment lengths.
+        for (int k = 0; k < n_markers; ++k) {
+            int prev = (k - 1 + n_markers) % n_markers;
+            int next = (k + 1) % n_markers;
+            double dx_f = ms.markers[next].x - ms.markers[k].x;
+            double dy_f = ms.markers[next].y - ms.markers[k].y;
+            double dx_b = ms.markers[k].x   - ms.markers[prev].x;
+            double dy_b = ms.markers[k].y   - ms.markers[prev].y;
+            double seg_f = std::sqrt(dx_f*dx_f + dy_f*dy_f);
+            double seg_b = std::sqrt(dx_b*dx_b + dy_b*dy_b);
+            ms.markers[k].ds = 0.5 * (seg_f + seg_b);
+        }
+    }
+    return reinterpret_cast<IbmMarkerSetHandle*>(new ibm::MarkerSet(std::move(ms)));
+}
+
 /// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
 ///         若文件无法打开或格式错误，返回 nullptr（不抛异常穿越 C ABI）。
 IbmMarkerSetHandle* lbm_ibm_marker_set_from_file(const char* filename)

@@ -821,9 +821,11 @@ fn generate_ibm_markers_ffi(cfg: &Config) {
                     x.len(), x_min, x_max, y_min, y_max,
                     ds.first().copied().unwrap_or(0.0),
                 );
-                // TODO: forward (x, y, ds) to the C++ IBM core once
-                //       lbm_bindings exposes the corresponding interface.
-                let _ = (x, y, ds);
+                // Forward (x, y, ds) to the C++ IBM core via lbm_bindings.
+                let ms = lbm_bindings::LbmIbmMarkerSet::new_from_coords(&x, &y, &ds);
+                println!("  => MarkerSet created ({} markers)", ms.len());
+                // ms is dropped here; in a full simulation loop it would be passed
+                // to step_mdf / step_mls / step_penalty each time step.
             }
             Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),
         }
