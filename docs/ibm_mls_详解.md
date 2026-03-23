@@ -307,10 +307,10 @@ $$M = \sum_{j \in \mathcal{S}(k)} w_j\, p_j \otimes p_j^T \quad (3\times3 \text{
 
 $$\mathbf{b}_u = \sum_{j \in \mathcal{S}(k)} w_j\, u_j^x\, p_j, \quad \mathbf{b}_v = \sum_{j \in \mathcal{S}(k)} w_j\, u_j^y\, p_j$$
 
-**代码对应**（`mls_interpolate_velocity`，行 308–355）：
+**代码对应**（`mls_interpolate_velocity`，行 293–388）：
 
 ```cpp
-// interpolation.cpp:286–290（参数设置，对应 2025 JCP Eq.14）
+// interpolation.cpp:293–301（参数设置，对应 2025 JCP Eq.14）
 const double H_k   = 1.5 * dx;          // 支撑域半宽
 const double eps   = 0.3;               // Gaussian 集中参数 ε
 const double h_eff = H_k * eps;         // = 0.45·dx
@@ -358,7 +358,7 @@ for (int dj = -iR; dj <= iR; ++dj) {      // 遍历 [-2, +2] × [-2, +2]
 **代码实现技巧**：利用 $\det(M) = \det(M^T)$，将"替换列"等价转换为"替换行"（对称矩阵转置等于原矩阵），使三个分量的计算结构统一（均沿第一行展开）：
 
 ```cpp
-// interpolation.cpp:250–280
+// interpolation.cpp:261–280
 // x[0]：替换第0列 → det([[b[0],A[0][1],A[0][2]], [b[1],A[1][1],A[1][2]], [b[2],A[2][1],A[2][2]]])
 x[0] = inv_det * (b[0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])
                 - b[1]*(A[0][1]*A[2][2]-A[0][2]*A[2][1])
@@ -412,7 +412,7 @@ $$f_j = \sum_{k=1}^{N_l} c_k \cdot \phi_j^k \cdot F_k^b, \quad c_k = \Delta S_k 
 ### 7.2 代码对应
 
 ```cpp
-// interpolation.cpp:390–487（mls_spread_force）
+// interpolation.cpp:401–497（mls_spread_force）
 // 第一遍：构建 MLS 矩阵 M，求解 M·c = e_0
 double e0[3] = {1.0, 0.0, 0.0};
 double c[3];
@@ -443,7 +443,7 @@ grid.force[node*2+1] += phi * mk.fy * mk.ds;
 ### 8.2 代码对应
 
 ```cpp
-// interpolation.cpp:1020–1043
+// interpolation.cpp:446–459（compute_ibm_forces_mls_original）
 void compute_ibm_forces_mls_original(fluid, ms, dx, dt, kernel,
                                       u_target_x, u_target_y)
 {
@@ -481,7 +481,7 @@ $$Z = \frac{\sum_k F_k \cdot g_k}{\sum_k |g_k|^2}$$
 ### 9.2 代码对应
 
 ```cpp
-// interpolation.cpp:1063–1110（compute_ibm_forces_mls_explicit）
+// interpolation.cpp:1087–1134（compute_ibm_forces_mls_explicit）
 
 // Step 4：重插值技巧 — 将力场临时替换为"伪速度场"
 std::swap(fluid.u, fluid.force);   // fluid.u = force field
@@ -513,7 +513,7 @@ for (auto& f : fluid.force) f *= Z;
 **作用**：预计算每个 Lagrangian 标记点的 MLS 形状函数支撑集，供后续插值、矩阵构建、力展布共用，消除三处重复计算。
 
 ```cpp
-// interpolation.cpp:492–580
+// interpolation.cpp:502–583
 struct MlsSupportSet {
     std::vector<int>    idx;   // Euler 节点全局索引（排列顺序与循环一致）
     std::vector<double> phi;   // 对应 MLS 形状函数值 φ_j^k
@@ -540,7 +540,7 @@ $A$ 的矩阵元 $A_{ki}$ 反映了标记点 $k$ 和 $i$ 通过共享 Euler 支�
 **高效构建策略**：使用**反向索引** `euler_to_lag[j]` 枚举所有共享同一 Euler 节点 $j$ 的 $(k, i)$ 对：
 
 ```cpp
-// interpolation.cpp:810–838
+// interpolation.cpp:813–841
 static void build_correlation_matrix(phi_data, ms, grid_size, A_mat)
 {
     // 1. 构建反向索引：euler_to_lag[j] = {(k, φ_j^k), …}
@@ -644,7 +644,7 @@ for (int k = 0; k < js; ++k)
 **LU 分解**（原地，行主元选取）：
 
 ```cpp
-// interpolation.cpp:586–635
+// interpolation.cpp:586–638（LU 分解与代换）
 for (int k = 0; k < N; ++k) {
     // 寻找最大主元
     int p = k; double max_val = |A[k][k]|;

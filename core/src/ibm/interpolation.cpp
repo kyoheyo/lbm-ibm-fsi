@@ -1119,7 +1119,7 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
     double num = 0.0, den = 0.0;
     for (int m = 0; m < ms.size(); ++m) {
         const auto& mk = ms.markers[m];
-        // MPI 过滤（与 mls_interpolate_velocity 相同的归属条件）
+        // MPI 归属过滤：仅统计本进程拥有的标记点贡献
         const int i0 = static_cast<int>(std::round(mk.x / dx));
         const int j0 = static_cast<int>(std::round(mk.y / dx));
         if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
@@ -1127,6 +1127,14 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
         num += mk.fx * mk.ux + mk.fy * mk.uy;
         den += mk.ux * mk.ux + mk.uy * mk.uy;
     }
+#ifdef LBM_ENABLE_MPI
+    // MPI：各进程仅持有局部标记点贡献，全局归约得到完整 num/den
+    {
+        double buf[2] = {num, den};
+        MPI_Allreduce(MPI_IN_PLACE, buf, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        num = buf[0]; den = buf[1];
+    }
+#endif
     const double Z = (den > 1e-30) ? num / den : 1.0;
 
     // 6. 将 fluid.force 乘以 Z（原地修正）
