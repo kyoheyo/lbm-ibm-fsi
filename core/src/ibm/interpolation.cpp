@@ -482,12 +482,9 @@ void mls_spread_force(lbm::LatticeGrid& grid,
 // ===========================================================================
 // 隐式 MLS-IBM 力计算
 //
-// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
-//       for high fidelity fluid-structure interaction simulations"
-//
-// 使用 MLS 插值（J）和 MLS 伴随展布（J^T）进行多步迭代，逼近满足无滑移
-// 约束的 IBM 力。与 compute_ibm_forces_mdf() 相比，本函数同时对插值和展布
-// 均采用 MLS 算子，保证离散伴随一致性，从而提高精度并减少界面速度误差。
+// Richardson 迭代：逐步逼近满足无滑移约束的 IBM 力。
+// 本函数使用 MLS 插值（J）和 MLS 伴随展布（J^T），满足离散伴随一致性。
+// mk.fx/fy 存储总 Lagrangian 力（所有迭代增量之和），供 FSI 反作用力计算。
 // ===========================================================================
 void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
@@ -510,8 +507,9 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
     // 累积欧拉力场（最终写入 fluid.force）
     std::vector<double> F_total(n * d, 0.0);
 
-    // 初始化标记点力为零
-    for (auto& mk : ms.markers) { mk.fx = mk.fy = 0.0; }
+    // 累积总 Lagrangian 力（逐迭代累加，最终写入 mk.fx/fy）
+    std::vector<double> lag_fx_total(ms.size(), 0.0);
+    std::vector<double> lag_fy_total(ms.size(), 0.0);
 
     // 临时力场（每次子迭代的增量 MLS 展布结果）
     std::vector<double> dF_euler(n * d, 0.0);
@@ -524,9 +522,15 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
         std::swap(fluid.u, u_work);
 
         // 2. 计算增量力（无滑移条件：目标速度 = u_target_x/y）
-        for (auto& mk : ms.markers) {
-            mk.fx = (u_target_x - mk.ux) / dt;
-            mk.fy = (u_target_y - mk.uy) / dt;
+        //    同时累积总 Lagrangian 力（mk.fx/fy 设为本次增量，供 mls_spread_force 使用）
+        for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
+            auto& mk = ms.markers[m];
+            const double dFx = (u_target_x - mk.ux) / dt;
+            const double dFy = (u_target_y - mk.uy) / dt;
+            mk.fx = dFx;               // 本次增量（供 mls_spread_force 读取）
+            mk.fy = dFy;
+            lag_fx_total[m] += dFx;   // 累积总 Lagrangian 力
+            lag_fy_total[m] += dFy;
         }
 
         // 3. MLS 伴随展布增量力到欧拉网格（mls_spread_force 内部先清零 fluid.force）
@@ -539,21 +543,98 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
             u_work[i * d + 1] += dt * dF_euler[i * d + 1];
         }
 
-        // 5. 累积总欧拉力
+        // 5. 累积总欧拉力（= Σ J^T(δF^k)，由 J^T 线性性等价于 J^T(Σ δF^k)）
         for (int i = 0; i < n * d; ++i) {
             F_total[i] += dF_euler[i];
         }
     }
 
-    // 写入最终总力到 fluid.force
+    // 写入最终总欧拉力到 fluid.force
     fluid.force = F_total;
 
-    // 标记点力：重新计算（总力 F = Σ δF，即最后一次工作速度中的残差对应的力）
-    // 为便于 FSI 反作用力计算，保留最后一次子迭代的 mk.fx/fy（增量值已累加）
+    // 写入总 Lagrangian 力到标记点（供 FSI 反作用力计算：compute_ibm_body_force）
+    for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
+        ms.markers[m].fx = lag_fx_total[m];
+        ms.markers[m].fy = lag_fy_total[m];
+    }
 }
 
 // ===========================================================================
-// 罚函数法 IBM（Penalty-IBM / Feedback Forcing）
+// 原始 MLS-IBM（Original MLS）—— MLS 插值 + Peskin δ 函数展布
+//
+// 参考：2025 JCP §2.1 "Original MLS method"
+//
+// 算法（单步直接力法）：
+//   1. MLS 速度插值：U_m = J · u
+//   2. 直接力：F_m = (u_target − U_m) / dt
+//   3. Peskin δ 展布：f(x) = Σ_m F_m · δ(x − X_m) · ds_m
+//
+// 注意：展布算子 S = δ（非 J^T），不满足离散伴随一致性。
+// 相比显式/隐式 MLS，动量守恒精度偏低，但实现最简单。
+// ===========================================================================
+void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      DeltaKernel kernel,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Original MLS-IBM: only D2Q9 supported currently");
+    }
+
+    // 1. MLS 速度插值：U_m = J · u
+    mls_interpolate_velocity(fluid, ms, dx);
+
+    // 2. 直接力：F_m = (u_target − U_m) / dt
+    for (auto& mk : ms.markers) {
+        mk.fx = (u_target_x - mk.ux) / dt;
+        mk.fy = (u_target_y - mk.uy) / dt;
+    }
+
+    // 3. 标准 Peskin δ 函数展布（S ≠ J^T，非伴随一致）
+    spread_force(fluid, ms, dx, kernel);
+}
+
+// ===========================================================================
+// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 伴随展布，单步
+//
+// 参考：2025 JCP §2.2 "Explicit MLS variant"
+//
+// 算法（单步显式直接力法）：
+//   1. MLS 速度插值：U_m = J · u
+//   2. 直接力：F_m = (u_target − U_m) / dt
+//   3. MLS 伴随展布：f = J^T · F
+//
+// 满足离散伴随一致性（J 与 J^T 互为转置），相比原始 MLS 动量守恒更好。
+// 等价于 compute_ibm_forces_mls_implicit(n_iter=1)，但语义更明确。
+// ===========================================================================
+void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
+                                      MarkerSet& ms,
+                                      double dx,
+                                      double dt,
+                                      double u_target_x,
+                                      double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Explicit MLS-IBM: only D2Q9 supported currently");
+    }
+
+    // 1. MLS 速度插值：U_m = J · u
+    mls_interpolate_velocity(fluid, ms, dx);
+
+    // 2. 直接力：F_m = (u_target − U_m) / dt
+    for (auto& mk : ms.markers) {
+        mk.fx = (u_target_x - mk.ux) / dt;
+        mk.fy = (u_target_y - mk.uy) / dt;
+    }
+
+    // 3. MLS 伴随展布：f = J^T · F（满足离散伴随一致性）
+    mls_spread_force(fluid, ms, dx);
+}
+
+
 //
 // 参考：Goldstein D. et al. (1993) J. Comput. Phys. 105:354-366.
 //
