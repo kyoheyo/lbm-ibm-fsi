@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 build_test/
+install/
 target/
 *.o
 *.a
