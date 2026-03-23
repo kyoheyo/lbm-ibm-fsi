@@ -318,18 +318,53 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
 
     // 打印 IBM 全局方案说明（rank-0 只打印一次）
     if rank == 0 && !effective_bodies.is_empty() {
-        let method_name = match ibm_cfg.method.to_lowercase().as_str() {
-            "penalty" => format!(
-                "Penalty-IBM（Goldstein 1993，α={:.2}, β={:.2}）",
-                ibm_cfg.alpha, ibm_cfg.beta,
-            ),
-            "mls" => "MLS-IBM (moving least squares, Wang 2009)".to_string(),
-            _     => format!("MDF-IBM (multi-direct-forcing, Luo 2007, n_iter={})", ibm_cfg.n_iter),
+        // Collect the effective method for every body (body-level override takes priority).
+        let effective_methods: Vec<String> = effective_bodies.iter()
+            .map(|b| b.method.clone().unwrap_or_else(|| ibm_cfg.method.clone()))
+            .collect();
+
+        // Helper: produce a human-readable description of one method token.
+        let describe_method = |m: &str| -> String {
+            match m.to_lowercase().as_str() {
+                "penalty" => format!(
+                    "Penalty-IBM (Goldstein 1993, α={:.2}, β={:.2})",
+                    ibm_cfg.alpha, ibm_cfg.beta,
+                ),
+                "mls" => "MLS-IBM (moving least squares, Wang 2009)".to_string(),
+                _     => format!("MDF-IBM (multi-direct-forcing, Luo 2007, n_iter={})", ibm_cfg.n_iter),
+            }
         };
-        println!(
-            "  [IBM] scheme: {}  delta kernel: {}  bodies: {}",
-            method_name, ibm_cfg.delta_kernel, effective_bodies.len()
-        );
+
+        let first = &effective_methods[0];
+        let all_same = effective_methods.iter().all(|m| m.to_lowercase() == first.to_lowercase());
+
+        if all_same {
+            // Every body uses the same method – single-line summary as before.
+            println!(
+                "  [IBM] scheme: {}  delta kernel: {}  bodies: {}",
+                describe_method(first), ibm_cfg.delta_kernel, effective_bodies.len()
+            );
+        } else {
+            // Mixed per-body methods – show the global default and list distinct methods.
+            let unique_methods: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                effective_methods.iter()
+                    .filter(|m| seen.insert(m.to_lowercase()))
+                    .map(|m| describe_method(m))
+                    .collect()
+            };
+            println!(
+                "  [IBM] scheme: mixed ({} method(s))  delta kernel: {}  bodies: {}  \
+                 global default: {}",
+                unique_methods.len(),
+                ibm_cfg.delta_kernel,
+                effective_bodies.len(),
+                describe_method(&ibm_cfg.method),
+            );
+            for (i, desc) in unique_methods.iter().enumerate() {
+                println!("  [IBM]   method[{}]: {}", i, desc);
+            }
+        }
     }
 
     let mut entries: Vec<IbmEntry> = Vec::with_capacity(effective_bodies.len());
