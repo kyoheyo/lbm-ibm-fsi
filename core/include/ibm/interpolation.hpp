@@ -266,35 +266,75 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       double u_target_y = 0.0);
 
 // ===========================================================================
-// 隐式 MLS-IBM 力计算（Implicit MLS）—— 迭代 MLS 插值与伴随展布
+// 隐式 MLS-IBM 力计算（Implicit MLS）—— Algorithm 3，Scheme II：GMRES 求解
 //
-// 参考：2025 JCP Wu & Fu §4（Algorithm 3）
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Eq.(24)–(28)
 //
-// 使用 MLS 插值（J）和 MLS 形状函数展布（J^T，含 c_m 守恒因子）通过多步
-// Richardson 迭代逼近满足无滑移约束的 IBM 力，无滑移残差接近机器精度。
+// 完整实现论文 Algorithm 3：
+//   A1: 计算传递算子 Φ（每个 Lagrangian 点的 MLS 形状函数 φ_j^k，Eq.10–14）
+//   A2: 重建 Lagrangian 速度 U* = J·u*（MLS 插值）
+//   C2: 构建 N_l×N_l 相关矩阵 A（Eq.28）和右端向量 B（Eq.24c），
+//       用 GMRES（对角预处理，相对收敛判据 10⁻¹⁴）求解 A·X = B（Scheme II）
+//   A4: 展布 Lagrangian 还原力到 Eulerian 网格（Eq.16）
+//   A5: 速度更新由调用方执行
 //
-// 算法（n_iter 次 Richardson 迭代）：
-//   初始化：F = 0，u_work = grid.u
-//   对 k = 0..n_iter-1：
-//     1. MLS 速度插值：U^k = J · u_work
-//     2. 增量力：δF^k = (u_target − U^k) / dt
-//     3. MLS 展布：δf^k = J^T · δF^k（含守恒因子）
-//     4. 更新工作速度：u_work += dt · δf^k
-//     5. 累积：F += δF^k
-//   结束：mk.fx/fy = F（总力）；fluid.force = J^T · F
+// 与原 Richardson 迭代不同，本实现精确求解 N_l×N_l 线性系统，可将无滑移
+// 边界速度误差降至机器精度（2025 JCP Fig.3d），同时保持力和力矩守恒（Table 1）。
 //
-// 三种 MLS 方案对比（2025 JCP Table 1）：
-//   1. 原始 MLS：MLS 插值 + MLS 形状函数展布，单步，存在无滑移误差
-//   2. 显式 MLS：加 Z 修正因子，破坏守恒性
-//   3. 隐式 MLS（本函数）：迭代逼近，无滑移残差最小，保持守恒性
+// @param fluid          Eulerian 流体网格（fluid.force 将被写入 IBM 体力）
+// @param ms             Lagrangian 标记点集（mk.fx/fy 写入 Lagrangian 还原力）
+// @param dx             格子间距
+// @param dt             时间步长（格子单位通常 = 1）
+// @param gmres_max_iter GMRES 最大迭代次数（原 n_iter 参数；默认 3 保留后向兼容）
+//                       注：对于机器精度结果，建议设 ≥ ms.size()（至少 50）；
+//                       对小 N_l（≤ 50）N 步内即可精确求解
+// @param u_target_x/y   边界目标速度（静止固体取 0；移动固体取壁面速度）
 // ===========================================================================
 void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
-                                      double dt         = 1.0,
-                                      int    n_iter     = 3,
-                                      double u_target_x = 0.0,
-                                      double u_target_y = 0.0);
+                                      double dt             = 1.0,
+                                      int    gmres_max_iter = 3,
+                                      double u_target_x     = 0.0,
+                                      double u_target_y     = 0.0);
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算（Algorithm 3，Scheme I：固定物体直接矩阵求逆）
+//
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Scheme I
+//
+// 对于几何固定（stationary）的物体，传递算子 Φ 和相关矩阵 A 不随时间变化。
+// 本函数将 LU 分解结果缓存于 A_lu_cache / piv_cache（调用方持久化），
+// 后续每步仅执行 O(N_l²) 的 LU 代换，而非重新构建和求解线性系统。
+// 对 N_l 较大时比 Scheme II（GMRES）更快（2025 JCP Table 2）。
+//
+// 用法示例（在时间循环外声明缓存，在循环内每步调用）：
+// @code
+//   std::vector<double> A_lu_cache;
+//   std::vector<int>    piv_cache;
+//   for (int step = 0; step < n_steps; ++step) {
+//       solver.step();
+//       compute_ibm_forces_mls_implicit_stationary(
+//           fluid, ms, dx, dt, A_lu_cache, piv_cache);
+//   }
+// @endcode
+//
+// @param fluid        Eulerian 流体网格
+// @param ms           Lagrangian 标记点集（必须固定不动；位置每步不变）
+// @param dx           格子间距
+// @param dt           时间步长
+// @param A_lu_cache   LU 分解缓存（首次调用时填充，后续复用；传入空 vector 即自动初始化）
+// @param piv_cache    LU 行主元缓存（与 A_lu_cache 配套）
+// @param u_target_x/y 目标速度（静止固体通常为 0.0）
+// ===========================================================================
+void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
+                                                 MarkerSet& ms,
+                                                 double dx,
+                                                 double dt,
+                                                 std::vector<double>& A_lu_cache,
+                                                 std::vector<int>&    piv_cache,
+                                                 double u_target_x = 0.0,
+                                                 double u_target_y = 0.0);
 
 // ===========================================================================
 // IBM 固体受力统计：合力计算

@@ -677,6 +677,118 @@ static int test_mls_implicit_vs_explicit_residual()
     return ok ? 0 : 1;
 }
 
+// ============================================================
+// 测试：隐式 MLS-IBM（Algorithm 3，Scheme II）以充足的 GMRES 迭代数
+//       可将无滑移残差降至近机器精度（论文 §4 核心论断）
+// ============================================================
+static int test_mls_implicit_machine_precision()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    // 构建均匀来流场
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2 + 0] = u0;
+        g.u[i * 2 + 1] = 0.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    const int Nl = ms.size();   // = 32
+
+    // 用充足的 GMRES 迭代数（= N_l，理论上精确求解）
+    ibm::compute_ibm_forces_mls_implicit(g, ms, 1.0, 1.0, /*gmres_max_iter=*/Nl);
+
+    // 应用力更新速度（u_new = u_old + dt * force，dt=1，rho=1）
+    lbm::LatticeGrid g_check = g;
+    for (int i = 0; i < g_check.size(); ++i) {
+        g_check.u[i * 2 + 0] = u0 + g.force[i * 2 + 0];
+        g_check.u[i * 2 + 1] = 0.0 + g.force[i * 2 + 1];
+    }
+
+    // 重新插值边界速度，检查无滑移残差
+    auto ms_check = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::mls_interpolate_velocity(g_check, ms_check, 1.0);
+
+    double max_res = 0.0;
+    for (const auto& mk : ms_check.markers)
+        max_res = std::max(max_res, std::hypot(mk.ux, mk.uy));
+
+    // 论文声明无滑移误差 ≈ 机器精度（10⁻¹⁷）；允许 1e-12 容差以覆盖实际舍入误差
+    const bool ok = std::isfinite(max_res) && (max_res < 1e-12);
+    std::printf("[IBM] Implicit MLS machine-precision no-slip (Nl=%d GMRES iters):"
+                " max_res=%.2e → %s\n", Nl, max_res, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ============================================================
+// 测试：隐式 MLS-IBM（Algorithm 3，Scheme I）固定物体 LU 缓存
+//       第一次调用（构建 A + LU）和后续调用（复用 LU）应给出一致结果
+// ============================================================
+static int test_mls_implicit_stationary_scheme_i()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    // ---- Scheme II 参考解（充足 GMRES）----
+    lbm::LatticeGrid g_ref(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_ref.size(); ++i) {
+        g_ref.u[i * 2 + 0] = u0;
+        g_ref.u[i * 2 + 1] = 0.0;
+    }
+    auto ms_ref = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_mls_implicit(g_ref, ms_ref, 1.0, 1.0, ms_ref.size());
+
+    // ---- Scheme I（第 1 次调用：构建并缓存 LU）----
+    lbm::LatticeGrid g1(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g1.size(); ++i) {
+        g1.u[i * 2 + 0] = u0;
+        g1.u[i * 2 + 1] = 0.0;
+    }
+    auto ms1 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    std::vector<double> A_lu_cache;
+    std::vector<int>    piv_cache;
+    ibm::compute_ibm_forces_mls_implicit_stationary(g1, ms1, 1.0, 1.0,
+                                                     A_lu_cache, piv_cache);
+
+    // ---- Scheme I（第 2 次调用：复用 LU）----
+    lbm::LatticeGrid g2(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g2.size(); ++i) {
+        g2.u[i * 2 + 0] = u0;
+        g2.u[i * 2 + 1] = 0.0;
+    }
+    auto ms2 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_mls_implicit_stationary(g2, ms2, 1.0, 1.0,
+                                                     A_lu_cache, piv_cache);
+
+    // 验证 Scheme I 结果与 Scheme II 一致（差别 < 1e-12）
+    double max_diff = 0.0;
+    for (int i = 0; i < g_ref.size(); ++i) {
+        max_diff = std::max(max_diff, std::abs(g1.force[i*2+0] - g_ref.force[i*2+0]));
+        max_diff = std::max(max_diff, std::abs(g1.force[i*2+1] - g_ref.force[i*2+1]));
+    }
+
+    // 验证 Scheme I 第 1、2 次调用结果完全一致
+    double max_diff_call2 = 0.0;
+    for (int i = 0; i < g1.size(); ++i) {
+        max_diff_call2 = std::max(max_diff_call2,
+                                   std::abs(g1.force[i*2+0] - g2.force[i*2+0]));
+        max_diff_call2 = std::max(max_diff_call2,
+                                   std::abs(g1.force[i*2+1] - g2.force[i*2+1]));
+    }
+
+    // Scheme I 缓存已填充（A_lu_cache 非空）
+    const bool cache_ok  = !A_lu_cache.empty() && !piv_cache.empty();
+    const bool match_ref = max_diff < 1e-12;
+    const bool match_2   = max_diff_call2 < 1e-15;
+    const bool ok = cache_ok && match_ref && match_2;
+    std::printf("[IBM] Implicit MLS Scheme I (LU cache): cache=%s diff_vs_SchemeII=%.2e"
+                " diff_call1_vs_2=%.2e → %s\n",
+                cache_ok ? "filled" : "empty", max_diff, max_diff_call2,
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_ibm_main()
 {
     int failures = 0;
@@ -701,11 +813,14 @@ int test_ibm_main()
     failures += test_marker_make_from_file_no_ds();
     failures += test_ibm_body_force_sum();
     failures += test_mark_solid_from_mesh_file();
-    // 隐式 MLS-IBM 新测试（JCP 2025）
+    // 隐式 MLS-IBM 新测试（JCP 2025 Algorithm 3）
     failures += test_mls_spread_force_finite();
     failures += test_mls_spread_force_integral_conservation();
     failures += test_mls_implicit_force_nonzero();
     failures += test_mls_implicit_vs_explicit_residual();
+    // Algorithm 3 精确求解：机器精度无滑移残差（Scheme II）和 LU 缓存（Scheme I）
+    failures += test_mls_implicit_machine_precision();
+    failures += test_mls_implicit_stationary_scheme_i();
     return failures;
 }
 

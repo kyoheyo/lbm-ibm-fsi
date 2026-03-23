@@ -487,17 +487,382 @@ void mls_spread_force(lbm::LatticeGrid& grid,
 }
 
 // ===========================================================================
-// 隐式 MLS-IBM 力计算
+// 内部辅助：MLS 形状函数支撑集结构
+// ===========================================================================
+struct MlsSupportSet {
+    std::vector<int>    idx;   ///< Euler 节点全局索引
+    std::vector<double> phi;   ///< 对应 MLS 形状函数值 φ_j^k
+};
+
+// 内部辅助：计算每个 Lagrangian 点的 MLS 形状函数支撑集
+// 与 mls_interpolate_velocity / mls_spread_force 使用完全相同的参数（2025 JCP Eq.14）
+static void build_mls_shape_functions(const lbm::LatticeGrid& grid,
+                                       const MarkerSet& ms,
+                                       double dx,
+                                       std::vector<MlsSupportSet>& phi_data)
+{
+    const int Nl = ms.size();
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+
+    // 2025 JCP 参数（与 mls_interpolate_velocity 完全一致）
+    const double H_k  = 1.5 * dx;
+    const double eps  = 0.3;
+    const double h2   = (H_k * eps) * (H_k * eps);
+    const int    iR   = static_cast<int>(std::ceil(H_k / dx));
+
+    phi_data.resize(Nl);
+
+    for (int k = 0; k < Nl; ++k) {
+        const auto& mk = ms.markers[k];
+
+        const double xm = mk.x / dx;
+        const double ym = mk.y / dx;
+        const int    i0 = static_cast<int>(std::round(xm));
+        const int    j0 = static_cast<int>(std::round(ym));
+
+        // MPI 归属过滤
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+
+        // 第一遍：构建 3×3 MLS 矩阵 M
+        double M[3][3] = {};
+        int n_contrib = 0;
+
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                if (std::abs(ddx) > H_k || std::abs(ddy) > H_k) continue;
+                const double w = std::exp(-(ddx*ddx + ddy*ddy) / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        M[r][c] += w * p[r] * p[c];
+                ++n_contrib;
+            }
+        }
+
+        if (n_contrib < 3) continue;
+
+        // 求解 M·c = e_0（e_0=[1,0,0]^T），得到形状函数系数
+        double e0[3] = {1.0, 0.0, 0.0};
+        double c[3];
+        if (!solve3x3(M, e0, c)) continue;
+
+        // 第二遍：计算并存储每个支撑 Euler 节点的形状函数值
+        phi_data[k].idx.clear();
+        phi_data[k].phi.clear();
+
+        for (int dj = -iR; dj <= iR; ++dj) {
+            for (int di = -iR; di <= iR; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+                const double ddx = ii * dx - mk.x;
+                const double ddy = jj * dx - mk.y;
+                if (std::abs(ddx) > H_k || std::abs(ddy) > H_k) continue;
+                const double w   = std::exp(-(ddx*ddx + ddy*ddy) / h2);
+                const double p[3] = {1.0, ddx / dx, ddy / dx};
+                const double phi  = w * (c[0]*p[0] + c[1]*p[1] + c[2]*p[2]);
+                phi_data[k].idx.push_back(node);
+                phi_data[k].phi.push_back(phi);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 内部辅助：稠密 N×N LU 分解（含行主元选取），原地存储 L\U，置换存入 piv
+// 返回 false 若矩阵奇异
+// ===========================================================================
+static bool lu_factor_dense(std::vector<double>& A_lu,
+                             std::vector<int>& piv,
+                             int N)
+{
+    piv.resize(N);
+    for (int k = 0; k < N; ++k) {
+        // 寻找最大主元
+        int p = k;
+        double max_val = std::abs(A_lu[k*N + k]);
+        for (int i = k + 1; i < N; ++i) {
+            double v = std::abs(A_lu[i*N + k]);
+            if (v > max_val) { max_val = v; p = i; }
+        }
+        piv[k] = p;
+        if (p != k)
+            for (int j = 0; j < N; ++j)
+                std::swap(A_lu[k*N + j], A_lu[p*N + j]);
+        if (std::abs(A_lu[k*N + k]) < 1e-30) return false;   // 奇异
+
+        const double inv_akk = 1.0 / A_lu[k*N + k];
+        for (int i = k + 1; i < N; ++i) {
+            A_lu[i*N + k] *= inv_akk;
+            for (int j = k + 1; j < N; ++j)
+                A_lu[i*N + j] -= A_lu[i*N + k] * A_lu[k*N + j];
+        }
+    }
+    return true;
+}
+
+// 前代 + 后代求解（in-place，x 含初始右端向量，返回时为解）
+static void lu_solve_dense(const std::vector<double>& A_lu,
+                            const std::vector<int>& piv,
+                            double* x,
+                            int N)
+{
+    // 行置换
+    for (int k = 0; k < N; ++k)
+        if (piv[k] != k) std::swap(x[k], x[piv[k]]);
+    // 前代 L·y = Pb
+    for (int i = 1; i < N; ++i)
+        for (int j = 0; j < i; ++j)
+            x[i] -= A_lu[i*N + j] * x[j];
+    // 后代 U·x = y
+    for (int i = N - 1; i >= 0; --i) {
+        for (int j = i + 1; j < N; ++j)
+            x[i] -= A_lu[i*N + j] * x[j];
+        if (std::abs(A_lu[i*N + i]) > 1e-30)
+            x[i] /= A_lu[i*N + i];
+    }
+}
+
+// ===========================================================================
+// 内部辅助：稠密 N×N GMRES 求解（无重启，Arnoldi + Givens 旋转）
+// 使用对角 Jacobi 预处理（M = diag(A)）
+// tol：相对残差收敛判据（|r|/|r0| < tol）
+// 返回实际执行的迭代次数
+// ===========================================================================
+static int gmres_dense_jacobi(const std::vector<double>& A,
+                               const std::vector<double>& b,
+                               std::vector<double>& x,
+                               int N,
+                               double tol,
+                               int max_iter)
+{
+    if (N == 0) return 0;
+    max_iter = std::min(max_iter, N);   // 不超过维数
+
+    // 对角 Jacobi 预处理子 D⁻¹
+    std::vector<double> D_inv(N, 1.0);
+    for (int i = 0; i < N; ++i) {
+        double aii = A[i*N + i];
+        if (std::abs(aii) > 1e-30) D_inv[i] = 1.0 / aii;
+    }
+
+    // 初始残差 r = D⁻¹·(b − A·x)
+    std::vector<double> r(N, 0.0);
+    for (int i = 0; i < N; ++i) {
+        double ax = 0.0;
+        for (int j = 0; j < N; ++j) ax += A[i*N + j] * x[j];
+        r[i] = D_inv[i] * (b[i] - ax);
+    }
+    double beta = 0.0;
+    for (int i = 0; i < N; ++i) beta += r[i] * r[i];
+    beta = std::sqrt(beta);
+    if (beta < tol) return 0;   // 初始猜测已收敛
+
+    const int m = max_iter;
+
+    // Krylov 基 V（最多 m+1 个向量，各长 N）
+    std::vector<std::vector<double>> V(m + 1, std::vector<double>(N, 0.0));
+    // 上 Hessenberg 矩阵 H（(m+1)×m）
+    std::vector<std::vector<double>> H(m + 1, std::vector<double>(m, 0.0));
+    // Givens 旋转系数
+    std::vector<double> cs(m, 0.0), sn(m, 0.0);
+    // 右端小向量 g（初始为 [beta, 0, …, 0]^T）
+    std::vector<double> g(m + 1, 0.0);
+    g[0] = beta;
+
+    // v_0 = r / ||r||
+    for (int i = 0; i < N; ++i) V[0][i] = r[i] / beta;
+
+    int j_done = m;
+    for (int j = 0; j < m; ++j) {
+        // w = D⁻¹·A·v_j（预处理矩阵向量乘积）
+        std::vector<double> w(N, 0.0);
+        for (int i = 0; i < N; ++i) {
+            double av = 0.0;
+            for (int k = 0; k < N; ++k) av += A[i*N + k] * V[j][k];
+            w[i] = D_inv[i] * av;
+        }
+
+        // 改进 Gram-Schmidt 正交化
+        for (int i = 0; i <= j; ++i) {
+            double h = 0.0;
+            for (int k = 0; k < N; ++k) h += w[k] * V[i][k];
+            H[i][j] = h;
+            for (int k = 0; k < N; ++k) w[k] -= h * V[i][k];
+        }
+        double norm_w = 0.0;
+        for (int k = 0; k < N; ++k) norm_w += w[k] * w[k];
+        norm_w = std::sqrt(norm_w);
+        H[j + 1][j] = norm_w;
+        if (norm_w > 1e-50 && j + 1 <= m)
+            for (int k = 0; k < N; ++k) V[j + 1][k] = w[k] / norm_w;
+
+        // 应用已有 Givens 旋转到 Hessenberg 新列
+        for (int i = 0; i < j; ++i) {
+            double t       =  cs[i]*H[i][j] + sn[i]*H[i + 1][j];
+            H[i + 1][j]    = -sn[i]*H[i][j] + cs[i]*H[i + 1][j];
+            H[i][j]        =  t;
+        }
+
+        // 计算本步新 Givens 旋转
+        const double denom = std::hypot(H[j][j], H[j + 1][j]);
+        cs[j] = (denom > 1e-50) ? H[j][j]     / denom : 1.0;
+        sn[j] = (denom > 1e-50) ? H[j + 1][j] / denom : 0.0;
+        H[j][j]     = cs[j]*H[j][j] + sn[j]*H[j + 1][j];
+        H[j + 1][j] = 0.0;
+
+        // 旋转 g 向量并检查收敛
+        g[j + 1] = -sn[j] * g[j];
+        g[j]     =  cs[j] * g[j];
+
+        if (std::abs(g[j + 1]) < tol * beta) {   // 相对残差已达收敛
+            j_done = j + 1;
+            break;
+        }
+    }
+
+    // 求解上三角系统 H[0..js-1, 0..js-1]·y = g[0..js-1]（后代）
+    const int js = j_done;
+    std::vector<double> y(js, 0.0);
+    for (int i = js - 1; i >= 0; --i) {
+        y[i] = g[i];
+        for (int k = i + 1; k < js; ++k) y[i] -= H[i][k] * y[k];
+        if (std::abs(H[i][i]) > 1e-50) y[i] /= H[i][i];
+    }
+
+    // 更新解：x += Σ_k y[k] · v_k
+    for (int k = 0; k < js; ++k)
+        for (int i = 0; i < N; ++i)
+            x[i] += V[k][i] * y[k];
+
+    return js;
+}
+
+// ===========================================================================
+// 内部辅助：用预建形状函数集插值速度到 Lagrangian 点
+// ===========================================================================
+static void interpolate_with_phi(const lbm::LatticeGrid& grid,
+                                  MarkerSet& ms,
+                                  const std::vector<MlsSupportSet>& phi_data)
+{
+    const int Nl = ms.size();
+    for (int k = 0; k < Nl; ++k) {
+        const auto& ss = phi_data[k];
+        if (ss.idx.empty()) continue;
+        double ux_sum = 0.0, uy_sum = 0.0;
+        for (int s = 0; s < static_cast<int>(ss.idx.size()); ++s) {
+            const int node = ss.idx[s];
+            ux_sum += ss.phi[s] * grid.u[node * 2 + 0];
+            uy_sum += ss.phi[s] * grid.u[node * 2 + 1];
+        }
+        ms.markers[k].ux = ux_sum;
+        ms.markers[k].uy = uy_sum;
+    }
+}
+
+// ===========================================================================
+// 内部辅助：用预建形状函数集展布力到 Eulerian 网格
+// f_j = Σ_k c_k · φ_j^k · F_k^b，其中 c_k = mk.ds（Eq.16+18）
+// ===========================================================================
+static void spread_with_phi(lbm::LatticeGrid& grid,
+                             const MarkerSet& ms,
+                             const std::vector<MlsSupportSet>& phi_data)
+{
+    std::fill(grid.force.begin(), grid.force.end(), 0.0);
+    const int Nl = ms.size();
+    for (int k = 0; k < Nl; ++k) {
+        const auto& mk = ms.markers[k];
+        const auto& ss = phi_data[k];
+        const double fxk = mk.fx * mk.ds;
+        const double fyk = mk.fy * mk.ds;
+        for (int s = 0; s < static_cast<int>(ss.idx.size()); ++s) {
+            const int node = ss.idx[s];
+            grid.force[node * 2 + 0] += ss.phi[s] * fxk;
+            grid.force[node * 2 + 1] += ss.phi[s] * fyk;
+        }
+    }
+}
+
+// ===========================================================================
+// 内部辅助：构建相关矩阵 A（稠密 Nl×Nl，行主序）
 //
-// Richardson 迭代：逐步逼近满足无滑移约束的 IBM 力。
-// 本函数使用 MLS 插值（J）和 MLS 伴随展布（J^T），满足离散伴随一致性。
-// mk.fx/fy 存储总 Lagrangian 力（所有迭代增量之和），供 FSI 反作用力计算。
+// 论文 Eq.(28)（优化版）：
+//   A_{ki} = Σ_{j ∈ S(k) ∩ S(i)} φ_j^k · c_i · φ_j^i
+//   c_i = ds_i（守恒因子，Eq.18，uniform lattice）
+//
+// 利用反向索引 euler_to_lag[j] = [(Lag_idx, phi_value), …]
+// 高效枚举所有共享 Euler 支撑节点的 (k,i) 对。
+// 总复杂度：O(Σ_k |S(k)| · max_j |euler_to_lag[j]|) ≈ O(N_l · N_e · N_i_avg)，
+// 其中 N_e 为每个 Lagrangian 点的支撑 Euler 节点数（≈ 9，矩形 3dx 支撑域），
+// N_i_avg 为每个 Euler 节点被多少 Lagrangian 点共享（= N_l · N_e / N_euler）。
+// ===========================================================================
+static void build_correlation_matrix(const std::vector<MlsSupportSet>& phi_data,
+                                      const MarkerSet& ms,
+                                      int grid_size,            // nx*ny
+                                      std::vector<double>& A_mat)
+{
+    const int Nl = ms.size();
+    A_mat.assign(static_cast<std::size_t>(Nl) * Nl, 0.0);
+
+    // 构建反向索引：euler_to_lag[j] = {(k, φ_j^k), …}
+    std::vector<std::vector<std::pair<int, double>>> euler_to_lag(grid_size);
+    for (int k = 0; k < Nl; ++k) {
+        const auto& ss = phi_data[k];
+        for (int s = 0; s < static_cast<int>(ss.idx.size()); ++s)
+            euler_to_lag[ss.idx[s]].emplace_back(k, ss.phi[s]);
+    }
+
+    // 累积 A_{ki} += φ_j^k · c_i · φ_j^i
+    for (int k = 0; k < Nl; ++k) {
+        const auto& ss = phi_data[k];
+        for (int s = 0; s < static_cast<int>(ss.idx.size()); ++s) {
+            const int    euler_j = ss.idx[s];
+            const double phi_jk  = ss.phi[s];
+            for (const auto& [i, phi_ji] : euler_to_lag[euler_j]) {
+                // c_i = ms.markers[i].ds（守恒因子）
+                A_mat[k * Nl + i] += phi_jk * ms.markers[i].ds * phi_ji;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算（Algorithm 3，Scheme II：GMRES 求解）
+//
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Scheme II
+//
+// 实现步骤：
+//   A1: 计算传递算子 Φ（所有 Lagrangian 点的 MLS 形状函数）
+//   A2: 重建 Lagrangian 速度 U* = J·u*（MLS 插值）
+//   C2: 构建相关矩阵 A（Eq.28）和右端向量 B（Eq.24c），
+//       用 GMRES 求解 A·X = B（Scheme II，moving 和 stationary 均适用）
+//   A4: 用 Eq.(16) 展布 Lagrangian 力到 Eulerian 网格
+//   A5: 速度更新 u^{n+1} = u* + Δt·f/ρ（由调用方执行）
+//
+// 参数 gmres_max_iter：GMRES 最大迭代次数（等于原 n_iter 参数位置）。
+//   - 设为 N_l 可保证精确解（理论上 Krylov 维数不超过 N_l）。
+//   - 默认值 3 保留后向兼容；对于机器精度结果，建议设 ≥ N_l（或至少 50）。
+//   - 收敛判据：相对残差 < 1e-14（接近论文要求的 1e-17）。
+//
+// 本函数取代了原 Richardson 迭代实现，可消除无滑移误差（≈ 机器精度），
+// 并保持力和力矩守恒（2025 JCP Table 1）。
 // ===========================================================================
 void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
                                       double dt,
-                                      int    n_iter,
+                                      int    gmres_max_iter,
                                       double u_target_x,
                                       double u_target_y)
 {
@@ -505,65 +870,134 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
         throw std::runtime_error("Implicit MLS-IBM: only D2Q9 supported currently");
     }
 
-    const int n = fluid.size();
-    const int d = fluid.dim();   // = 2
+    const int Nl = ms.size();
+    if (Nl == 0) return;
 
-    // 工作速度场（子迭代过程中被逐步修正）
-    std::vector<double> u_work = fluid.u;
+    // A1: 计算每个 Lagrangian 点的 MLS 形状函数（一次构建，后续共用）
+    std::vector<MlsSupportSet> phi_data;
+    build_mls_shape_functions(fluid, ms, dx, phi_data);
 
-    // 累积欧拉力场（最终写入 fluid.force）
-    std::vector<double> F_total(n * d, 0.0);
+    // A2: 用 MLS 形状函数重建 Lagrangian 速度 U* = J·u*
+    interpolate_with_phi(fluid, ms, phi_data);
 
-    // 累积总 Lagrangian 力（逐迭代累加，最终写入 mk.fx/fy）
-    std::vector<double> lag_fx_total(ms.size(), 0.0);
-    std::vector<double> lag_fy_total(ms.size(), 0.0);
+    // 构建右端向量 B（Eq.24c，ρ=1 格子单位）
+    //   Bx[k] = (u_target_x − U*_k,x) / dt
+    //   By[k] = (u_target_y − U*_k,y) / dt
+    std::vector<double> Bx(Nl, 0.0), By(Nl, 0.0);
+    for (int k = 0; k < Nl; ++k) {
+        const auto& mk = ms.markers[k];
+        // MPI 归属过滤（与 build_mls_shape_functions 一致）
+        const int i0 = static_cast<int>(std::round(mk.x / dx));
+        const int j0 = static_cast<int>(std::round(mk.y / dx));
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+        Bx[k] = (u_target_x - mk.ux) / dt;
+        By[k] = (u_target_y - mk.uy) / dt;
+    }
 
-    // 临时力场（每次子迭代的增量 MLS 展布结果）
-    std::vector<double> dF_euler(n * d, 0.0);
+    // C1/C2: 构建相关矩阵 A（Eq.28）并用 GMRES 求解（Scheme II）
+    std::vector<double> A_mat;
+    build_correlation_matrix(phi_data, ms, fluid.nx * fluid.ny, A_mat);
 
-    for (int iter = 0; iter < n_iter; ++iter) {
-        // 1. 用 u_work 进行 MLS 速度插值
-        //    临时将 fluid.u 替换为 u_work 供 mls_interpolate_velocity 读取
-        std::swap(fluid.u, u_work);
-        mls_interpolate_velocity(fluid, ms, dx);
-        std::swap(fluid.u, u_work);
+    // GMRES 求解 A·Fx = Bx 和 A·Fy = By（各速度分量独立，矩阵相同）
+    const double gmres_tol = 1e-14;   // 相对收敛判据（论文 10⁻¹⁷ 绝对）
+    const int    actual_max = std::max(gmres_max_iter, 1);
 
-        // 2. 计算增量力（无滑移条件：目标速度 = u_target_x/y）
-        //    同时累积总 Lagrangian 力（mk.fx/fy 设为本次增量，供 mls_spread_force 使用）
-        for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
-            auto& mk = ms.markers[m];
-            const double dFx = (u_target_x - mk.ux) / dt;
-            const double dFy = (u_target_y - mk.uy) / dt;
-            mk.fx = dFx;               // 本次增量（供 mls_spread_force 读取）
-            mk.fy = dFy;
-            lag_fx_total[m] += dFx;   // 累积总 Lagrangian 力
-            lag_fy_total[m] += dFy;
-        }
+    std::vector<double> Fx(Nl, 0.0), Fy(Nl, 0.0);   // 初始猜测为零
+    gmres_dense_jacobi(A_mat, Bx, Fx, Nl, gmres_tol, actual_max);
+    gmres_dense_jacobi(A_mat, By, Fy, Nl, gmres_tol, actual_max);
 
-        // 3. MLS 伴随展布增量力到欧拉网格（mls_spread_force 内部先清零 fluid.force）
-        mls_spread_force(fluid, ms, dx);
-        std::swap(fluid.force, dF_euler);   // dF_euler = 本次 MLS 展布结果
+    // 写入 Lagrangian 还原力（供 FSI 反作用力计算：compute_ibm_body_force）
+    for (int k = 0; k < Nl; ++k) {
+        ms.markers[k].fx = Fx[k];
+        ms.markers[k].fy = Fy[k];
+    }
 
-        // 4. 更新工作速度：u_work += dt · δf（ρ=1 格子单位）
-        for (int i = 0; i < n; ++i) {
-            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
-            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
-        }
+    // A4: 展布 Lagrangian 力到 Eulerian 网格（Eq.16：f_j = Σ_k c_k φ_j^k F_k^b）
+    spread_with_phi(fluid, ms, phi_data);
+    // A5: 速度更新由调用方执行（solver.step() 中 collide/stream 步骤）
+}
 
-        // 5. 累积总欧拉力（= Σ J^T(δF^k)，由 J^T 线性性等价于 J^T(Σ δF^k)）
-        for (int i = 0; i < n * d; ++i) {
-            F_total[i] += dF_euler[i];
+// ===========================================================================
+// 隐式 MLS-IBM 力计算（Algorithm 3，Scheme I：固定物体直接矩阵求逆）
+//
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Scheme I
+//
+// 对于几何固定（stationary）的物体，传递算子 Φ 和相关矩阵 A 不随时间变化。
+// 本函数在首次调用时（A_lu_cache 为空）构建 A 并完成 LU 分解（相当于 A⁻¹），
+// 后续步骤（A_lu_cache 非空）直接用 LU 代换求解 X = A⁻¹·B，
+// 从而避免每步重复构建矩阵，大幅降低计算量（论文 Table 2，Scheme I）。
+//
+// @param fluid         Eulerian 流体网格
+// @param ms            Lagrangian 标记点集（需固定不动）
+// @param dx            格子间距
+// @param dt            时间步长
+// @param A_lu_cache    LU 因子缓存（首次调用时填充，后续复用；由调用方持久化）
+// @param piv_cache     LU 行主元缓存（与 A_lu_cache 配套）
+// @param u_target_x/y  目标速度（对静止固体通常为 0）
+// ===========================================================================
+void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
+                                                 MarkerSet& ms,
+                                                 double dx,
+                                                 double dt,
+                                                 std::vector<double>& A_lu_cache,
+                                                 std::vector<int>&    piv_cache,
+                                                 double u_target_x,
+                                                 double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("Stationary MLS-IBM: only D2Q9 supported currently");
+    }
+
+    const int Nl = ms.size();
+    if (Nl == 0) return;
+
+    // A1: 计算传递算子 Φ（只在首次调用时真正有效；后续 phi_data 仍需用于插值和展布）
+    std::vector<MlsSupportSet> phi_data;
+    build_mls_shape_functions(fluid, ms, dx, phi_data);
+
+    // C1: 首次调用时构建相关矩阵 A 并完成 LU 分解（缓存 A⁻¹ 于 A_lu_cache）
+    if (A_lu_cache.empty()) {
+        build_correlation_matrix(phi_data, ms, fluid.nx * fluid.ny, A_lu_cache);
+        // in-place LU 分解（A_lu_cache 被改写为 L\U）
+        if (!lu_factor_dense(A_lu_cache, piv_cache, Nl)) {
+            // 矩阵奇异：回退到 GMRES（此时 A_lu_cache 部分覆盖，需清空）
+            A_lu_cache.clear();
+            piv_cache.clear();
+            compute_ibm_forces_mls_implicit(fluid, ms, dx, dt,
+                                             /*gmres_max_iter=*/Nl,
+                                             u_target_x, u_target_y);
+            return;
         }
     }
 
-    // 写入最终总欧拉力到 fluid.force
-    fluid.force = F_total;
+    // A2: 重建 Lagrangian 速度 U* = J·u*
+    interpolate_with_phi(fluid, ms, phi_data);
 
-    // 写入总 Lagrangian 力到标记点（供 FSI 反作用力计算：compute_ibm_body_force）
-    for (int m = 0; m < static_cast<int>(ms.size()); ++m) {
-        ms.markers[m].fx = lag_fx_total[m];
-        ms.markers[m].fy = lag_fy_total[m];
+    // 构建右端向量 B（Eq.24c）
+    std::vector<double> Bx(Nl, 0.0), By(Nl, 0.0);
+    for (int k = 0; k < Nl; ++k) {
+        const auto& mk = ms.markers[k];
+        const int i0 = static_cast<int>(std::round(mk.x / dx));
+        const int j0 = static_cast<int>(std::round(mk.y / dx));
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+        Bx[k] = (u_target_x - mk.ux) / dt;
+        By[k] = (u_target_y - mk.uy) / dt;
     }
+
+    // C2: Scheme I — X = A⁻¹·B（LU 代换，O(N_l²)，比 GMRES 更快）
+    lu_solve_dense(A_lu_cache, piv_cache, Bx.data(), Nl);   // Bx → Fx
+    lu_solve_dense(A_lu_cache, piv_cache, By.data(), Nl);   // By → Fy
+
+    // 写入 Lagrangian 还原力
+    for (int k = 0; k < Nl; ++k) {
+        ms.markers[k].fx = Bx[k];
+        ms.markers[k].fy = By[k];
+    }
+
+    // A4: 展布到 Eulerian 网格（Eq.16）
+    spread_with_phi(fluid, ms, phi_data);
 }
 
 // ===========================================================================
@@ -577,7 +1011,7 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
 //   2. MLS 速度插值：U_m = Φ^T · u*
 //   3. 直接力：F_m = ρ(u_target − U_m) / dt（ρ=1 格子单位）
 //   4. MLS 形状函数展布（含守恒因子 c_i = ds_i/ΔV_j = ds_i，Eq.16 + Eq.18）：
-//        f_j = Σ_m c_m φ_j^m F_m  ≡  mls_spread_force（ds_m 即 c_m·ΔV_j）
+//        f_j = Σ_m c_m φ_j^m F_m  ≡  mls_spread_force（其中 c_m = ds_m / ΔV_j，uniform lattice 下 ΔV_j=dx²→c_m=ds_m）
 //   5. 更新速度：u^{n+1} = u* + dt·f/ρ
 //
 // 注意：展布算子与插值算子非完全伴随（φ_j^m ≠ φ_m^j），因此
@@ -619,7 +1053,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
 //   2. 直接力：F_m = (u_target − U_m) / dt
 //   3. 第一次 MLS 展布：f = J^T · F
 //   4. 重插值：g_k = J · f（用展布后力场重新插值到 Lagrangian 点）
-//   5. 全局修正因子（最小化 ||Z·g − F||² 的最小二乘解，Eq.21）：
+//   5. 全局修正因子（最小化 ||Z·g_k − F_k||² 的最小二乘解，Eq.21）：
 //        Z = Σ_k (F_k · g_k) / Σ_k |g_k|²
 //   6. 修正展布：f → Z · f
 //
