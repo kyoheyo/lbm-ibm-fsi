@@ -1240,6 +1240,231 @@ void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
 }
 
 // ===========================================================================
+// 隐式速度校正 IBM（IVC-IBM）内部辅助：构建基于 Peskin δ 的相关矩阵
+//
+// 参考：Wu & Shu (2009) Eq.(27)–(29)
+//
+// A_{lk} = Δs_k · Σ_{i,j} D_ij^l · D_ij^k · Δx²
+//
+// 其中 D_ij^l = delta_phi(x_ij - X_l, dx) · delta_phi(y_ij - X_l, dx)（2D Peskin δ）
+// 利用反向索引（euler_to_lag[j] = [(Lag_idx, δ值), ...]）高效枚举共享 Euler 节点对。
+// ===========================================================================
+static void build_ivc_matrix(const lbm::LatticeGrid& grid,
+                               const MarkerSet& ms,
+                               double dx,
+                               DeltaKernel kernel,
+                               std::vector<double>& A_mat)
+{
+    const int Nl = ms.size();
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int support = (kernel == DeltaKernel::TwoPoint) ? 1 : 2;
+
+    A_mat.assign(static_cast<std::size_t>(Nl) * Nl, 0.0);
+
+    // 反向索引：euler_to_lag[node] = {(Lagrangian_idx, δ值), …}
+    std::vector<std::vector<std::pair<int, double>>> euler_to_lag(nx * ny);
+
+    for (int l = 0; l < Nl; ++l) {
+        const auto& mk = ms.markers[l];
+        const double xm = mk.x / dx;
+        const double ym = mk.y / dx;
+        const int    i0 = static_cast<int>(std::floor(xm));
+        const int    j0 = static_cast<int>(std::floor(ym));
+
+        // MPI 归属过滤（与 interpolate_velocity / spread_force 保持一致）
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+
+        for (int dj = -support; dj <= support + 1; ++dj) {
+            for (int di = -support; di <= support + 1; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+
+                const double phi_x = delta_phi(mk.x - ii * dx, dx, kernel);
+                const double phi_y = delta_phi(mk.y - jj * dx, dx, kernel);
+                const double D_l   = phi_x * phi_y;   // D(x_ij - X_l)
+                if (D_l != 0.0)
+                    euler_to_lag[node].emplace_back(l, D_l);
+            }
+        }
+    }
+
+    // 累积 A_{lk} = Σ_j D_l(j) · D_k(j) · ds_k · dx²
+    for (int node = 0; node < nx * ny; ++node) {
+        const auto& entries = euler_to_lag[node];
+        if (entries.empty()) continue;
+        for (const auto& [l, D_l] : entries) {
+            for (const auto& [k, D_k] : entries) {
+                A_mat[l * Nl + k] += D_l * D_k * ms.markers[k].ds * dx * dx;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 隐式速度校正 IBM（IVC-IBM）— 通用版（每步重建矩阵 A）
+//
+// 参考：Wu J. & Shu C. (2009) J. Comput. Phys. 228:1963–1979
+//
+// 算法步骤（每时间步调用一次）：
+//   1. 插值：u*(X_B^l) = Σ_{i,j} u*(x_ij) D_ij^l Δx²  （Eq.26 中间速度项）
+//   2. 构建右端向量 B：B^l = U_target^l − u*(X_B^l)   （Eq.29 速度亏量）
+//   3. 构建矩阵 A：A_{lk} = Δs_k Σ_{i,j} D_ij^l D_ij^k Δx²  （Eq.27–28）
+//   4. LU 分解并求解 A · δu_B = B（x/y 分量独立求解）
+//   5. 写入 Lagrangian 力密度：f_B^l = (2/dt) · δu_B^l  （Eq.30，ρ=1）
+//   6. 展布到 Eulerian 网格：f(x_ij) = Σ_l f_B^l D_ij^l Δs_l
+// ===========================================================================
+void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
+                              MarkerSet& ms,
+                              double dx,
+                              double dt,
+                              DeltaKernel kernel,
+                              double u_target_x,
+                              double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("IVC-IBM: only D2Q9 supported currently");
+    }
+
+    const int Nl = ms.size();
+    if (Nl == 0) return;
+
+    // 步骤 1：用 Peskin δ 将中间速度 u* 插值到各边界点
+    //   u*(X_B^l) = Σ_{i,j} u*(x_ij) · D_ij^l · Δx²  （写入 mk.ux/uy）
+    interpolate_velocity(fluid, ms, dx, kernel);
+
+    // 步骤 2：构建右端向量 B（速度亏量，Eq.29）
+    //   B^l = U_target^l − u*(X_B^l)（x/y 分量独立）
+    std::vector<double> Bx(Nl, 0.0), By(Nl, 0.0);
+    for (int l = 0; l < Nl; ++l) {
+        const auto& mk = ms.markers[l];
+        const int i0 = static_cast<int>(std::floor(mk.x / dx));
+        const int j0 = static_cast<int>(std::floor(mk.y / dx));
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+        Bx[l] = u_target_x - mk.ux;
+        By[l] = u_target_y - mk.uy;
+    }
+
+    // 步骤 3：构建相关矩阵 A（Eq.27–28）
+    //   A_{lk} = Δs_k · Σ_{i,j} D_ij^l · D_ij^k · Δx²
+    std::vector<double> A_mat;
+    build_ivc_matrix(fluid, ms, dx, kernel, A_mat);
+
+#ifdef LBM_ENABLE_MPI
+    // MPI：各进程仅持有局部归属标记点的贡献，全局归约后得到完整 A 和 B
+    MPI_Allreduce(MPI_IN_PLACE, A_mat.data(), Nl * Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, Bx.data(),    Nl,      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, By.data(),    Nl,      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+
+    // 步骤 4：LU 分解并求解（x/y 分量独立，矩阵相同，Eq.28）
+    std::vector<int> piv;
+    if (!lu_factor_dense(A_mat, piv, Nl)) {
+        // 奇异系统（极端情况）：退化为显式直接力法
+        for (int l = 0; l < Nl; ++l) {
+            ms.markers[l].fx = Bx[l] * (2.0 / dt);
+            ms.markers[l].fy = By[l] * (2.0 / dt);
+        }
+        spread_force(fluid, ms, dx, kernel);
+        return;
+    }
+    lu_solve_dense(A_mat, piv, Bx.data(), Nl);   // Bx → δu_Bx
+    lu_solve_dense(A_mat, piv, By.data(), Nl);   // By → δu_By
+
+    // 步骤 5：Lagrangian 力密度：f_B^l = (2ρ/dt) · δu_B^l  （Eq.30，ρ=1）
+    for (int l = 0; l < Nl; ++l) {
+        ms.markers[l].fx = Bx[l] * (2.0 / dt);
+        ms.markers[l].fy = By[l] * (2.0 / dt);
+    }
+
+    // 步骤 6：展布力到 Eulerian 网格：f(x_ij) = Σ_l f_B^l · D_ij^l · Δs_l
+    //   等价：f(x_ij) = (2/dt) · δu(x_ij)，其中 δu(x_ij) = Σ_l δu_B^l D_ij^l Δs_l
+    //   spread_force 使用 mk.fx * phi_x * phi_y * mk.ds（与 Eq.24 一致）
+    spread_force(fluid, ms, dx, kernel);
+}
+
+// ===========================================================================
+// 隐式速度校正 IBM（IVC-IBM）— 固定物体优化版（LU 缓存）
+//
+// 参考：Wu & Shu (2009) §3，算法步骤 (1)
+//
+// 矩阵 A 仅取决于边界点位置与 δ 核，对固定物体不随时间变化。
+// 首次调用时构建 A 并完成 LU 分解（缓存于 A_lu_cache/piv_cache），
+// 后续每步只需插值 u* → 构建 B → LU 代换，节省重复矩阵构建开销。
+// ===========================================================================
+void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
+                                        MarkerSet& ms,
+                                        double dx,
+                                        double dt,
+                                        std::vector<double>& A_lu_cache,
+                                        std::vector<int>&    piv_cache,
+                                        DeltaKernel kernel,
+                                        double u_target_x,
+                                        double u_target_y)
+{
+    if (fluid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("IVC-IBM stationary: only D2Q9 supported currently");
+    }
+
+    const int Nl = ms.size();
+    if (Nl == 0) return;
+
+    // 首次调用：构建矩阵 A 并 LU 分解（后续复用缓存）
+    if (A_lu_cache.empty()) {
+        build_ivc_matrix(fluid, ms, dx, kernel, A_lu_cache);
+#ifdef LBM_ENABLE_MPI
+        MPI_Allreduce(MPI_IN_PLACE, A_lu_cache.data(), Nl * Nl,
+                      MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+        if (!lu_factor_dense(A_lu_cache, piv_cache, Nl)) {
+            // 奇异矩阵：清空缓存，退化为逐步重建
+            A_lu_cache.clear();
+            piv_cache.clear();
+            compute_ibm_forces_ivc(fluid, ms, dx, dt, kernel,
+                                    u_target_x, u_target_y);
+            return;
+        }
+    }
+
+    // 每步：插值 u* → X_B
+    interpolate_velocity(fluid, ms, dx, kernel);
+
+    // 每步：构建 B（速度亏量）
+    std::vector<double> Bx(Nl, 0.0), By(Nl, 0.0);
+    for (int l = 0; l < Nl; ++l) {
+        const auto& mk = ms.markers[l];
+        const int i0 = static_cast<int>(std::floor(mk.x / dx));
+        const int j0 = static_cast<int>(std::floor(mk.y / dx));
+        if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
+        if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
+        Bx[l] = u_target_x - mk.ux;
+        By[l] = u_target_y - mk.uy;
+    }
+#ifdef LBM_ENABLE_MPI
+    MPI_Allreduce(MPI_IN_PLACE, Bx.data(), Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, By.data(), Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+
+    // 每步：LU 代换求解（复用缓存）
+    lu_solve_dense(A_lu_cache, piv_cache, Bx.data(), Nl);
+    lu_solve_dense(A_lu_cache, piv_cache, By.data(), Nl);
+
+    // 写入 Lagrangian 力密度：f_B^l = (2/dt) · δu_B^l
+    for (int l = 0; l < Nl; ++l) {
+        ms.markers[l].fx = Bx[l] * (2.0 / dt);
+        ms.markers[l].fy = By[l] * (2.0 / dt);
+    }
+
+    // 展布力到 Eulerian 网格
+    spread_force(fluid, ms, dx, kernel);
+}
+
+// ===========================================================================
 // IBM 固体受力统计：合力计算
 //
 // F_x = Σ_m  mk.fx * mk.ds

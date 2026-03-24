@@ -9,7 +9,7 @@
 // C ABI 声明
 // ---------------------------------------------------------------------------
 mod ffi {
-    use std::ffi::{c_int, c_char};
+    use std::ffi::{c_int, c_char, c_void};
 
     #[repr(C)]
     pub enum LatticeModelC {
@@ -308,6 +308,20 @@ mod ffi {
                                              ms: *mut IbmMarkerSetHandle,
                                              dx: f64, dt: f64,
                                              u_target_x: f64, u_target_y: f64);
+        /// IVC-IBM 一步（隐式速度校正，Wu & Shu 2009）。每步重建矩阵 A，适用于移动物体。
+        pub fn lbm_ibm_compute_ivc(g: *mut LatticeGridHandle,
+                                    ms: *mut IbmMarkerSetHandle,
+                                    dx: f64, dt: f64,
+                                    u_target_x: f64, u_target_y: f64);
+        /// IVC-IBM 一步（固定物体，LU 分解缓存）。首次调用构建并缓存 A 的 LU 分解，
+        /// 后续步骤直接 LU 代换，更高效。*cache_handle 首次调用前须为 null。
+        pub fn lbm_ibm_compute_ivc_stationary(g: *mut LatticeGridHandle,
+                                               ms: *mut IbmMarkerSetHandle,
+                                               dx: f64, dt: f64,
+                                               cache_handle: *mut *mut c_void,
+                                               u_target_x: f64, u_target_y: f64);
+        /// 释放由 lbm_ibm_compute_ivc_stationary() 分配的缓存。
+        pub fn lbm_ibm_ivc_stationary_cache_free(cache_handle: *mut *mut c_void);
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
@@ -1155,6 +1169,8 @@ pub struct LbmIbmMarkerSet {
     /// 用于 Penalty-IBM 的 x/y 方向速度误差积分（调用方无需直接访问）
     integral_x: Vec<f64>,
     integral_y: Vec<f64>,
+    /// 用于 IVC-IBM 固定物体优化版（step_ivc_stationary）的 LU 分解缓存
+    ivc_cache:  *mut c_void,
 }
 
 impl LbmIbmMarkerSet {
@@ -1175,6 +1191,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 
@@ -1195,6 +1212,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 
@@ -1222,6 +1240,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 
@@ -1254,6 +1273,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         })
     }
 
@@ -1374,6 +1394,55 @@ impl LbmIbmMarkerSet {
         }
     }
 
+    /// 隐式速度校正 IBM 一步（IVC-IBM，Wu & Shu 2009）。
+    ///
+    /// 以边界点速度修正 δu_B^l 为未知量，求解 m×m 线性方程组
+    /// A·X = B 强制满足非滑移边界条件（参考论文 Eq.28–30）：
+    ///   - A_{lk} = Δs_k · Σ_{i,j} D_ij^l · D_ij^k · Δx²
+    ///   - B^l = U_target^l − u*(X_B^l)（速度亏量）
+    ///   - 力密度：f_B^l = (2ρ/dt) · δu_B^l
+    ///
+    /// 每步重建矩阵 A，适用于移动物体。对静止物体请使用 `step_ivc_stationary`。
+    ///
+    /// 参考：J. Wu & C. Shu (2009) J. Comput. Phys. 228:1963–1979
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距（通常 = 1.0）
+    /// @param dt         时间步长（通常 = 1.0）
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_ivc(&mut self, grid: &mut LbmGrid,
+                     dx: f64, dt: f64,
+                     u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_ivc(
+                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+        }
+    }
+
+    /// 隐式速度校正 IBM 一步（IVC-IBM，固定物体，LU 分解缓存）。
+    ///
+    /// 对几何固定的浸入边界，首次调用时构建矩阵 A 并完成 LU 分解（缓存于内部），
+    /// 后续每步仅执行 LU 代换，节省矩阵构建开销。
+    ///
+    /// 内部缓存由 `LbmIbmMarkerSet` 自动管理（通过 `ivc_cache` 字段）；
+    /// 销毁 `LbmIbmMarkerSet` 时自动释放缓存。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距（通常 = 1.0）
+    /// @param dt         时间步长（通常 = 1.0）
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_ivc_stationary(&mut self, grid: &mut LbmGrid,
+                                dx: f64, dt: f64,
+                                u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_ivc_stationary(
+                grid.ptr, self.ptr, dx, dt,
+                &mut self.ivc_cache, u_target_x, u_target_y)
+        }
+    }
+
     /// 读取所有标记点的 Lagrangian 力 `(fx, fy)`。
     /// 在 `step_*()` 调用后调用此函数以获取当前步的力值。
     pub fn get_forces(&self) -> (Vec<f64>, Vec<f64>) {
@@ -1472,6 +1541,9 @@ pub fn ibm_halo_reduce_force_2d(grid: &mut LbmGrid, decomp: &mut LbmMpiDecomp2D)
 
 impl Drop for LbmIbmMarkerSet {
     fn drop(&mut self) {
+        if !self.ivc_cache.is_null() {
+            unsafe { ffi::lbm_ibm_ivc_stationary_cache_free(&mut self.ivc_cache) };
+        }
         if !self.ptr.is_null() {
             unsafe { ffi::lbm_ibm_marker_set_free(self.ptr) };
             self.ptr = std::ptr::null_mut();

@@ -851,6 +851,156 @@ static int test_mls_implicit_stationary_scheme_i()
     return ok ? 0 : 1;
 }
 
+// ============================================================
+// 测试：IVC-IBM 基本力输出有限且非零
+//
+// 均匀来流 ux=0.05，静止边界（U_target=0）应产生非零抑制力。
+// ============================================================
+static int test_ivc_ibm_force_nonzero()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2 + 0] = u0;
+        g.u[i * 2 + 1] = 0.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_ivc(g, ms, 1.0, 1.0);
+
+    // Eulerian 力场应至少有一个非零分量
+    double max_force = 0.0;
+    for (int i = 0; i < g.size(); ++i)
+        max_force = std::max(max_force,
+                             std::hypot(g.force[i * 2 + 0], g.force[i * 2 + 1]));
+
+    // Lagrangian 力密度也应非零
+    double max_lag_force = 0.0;
+    for (const auto& mk : ms.markers)
+        max_lag_force = std::max(max_lag_force, std::hypot(mk.fx, mk.fy));
+
+    const bool ok = std::isfinite(max_force)     && (max_force     > 1e-10) &&
+                    std::isfinite(max_lag_force)  && (max_lag_force > 1e-10);
+    std::printf("[IBM] IVC-IBM force nonzero: max_euler=%.3e max_lag=%.3e → %s\n",
+                max_force, max_lag_force, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ============================================================
+// 测试：IVC-IBM 精确满足无滑移边界条件（机器精度）
+//
+// IVC-IBM 通过直接 LU 求解 Ax=B，精度应优于迭代法（MDF）。
+// 构造均匀来流 u*=0.05，目标速度 U_target=0（静止固体），
+// 将 IVC 产生的力更新流速后，重新插值边界速度，验证无滑移
+// 残差 |u(X_B)| < 1e-12（近机器精度）。
+// ============================================================
+static int test_ivc_ibm_machine_precision()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g.size(); ++i) {
+        g.u[i * 2 + 0] = u0;
+        g.u[i * 2 + 1] = 0.0;
+    }
+
+    auto ms = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_ivc(g, ms, 1.0, 1.0);
+
+    // 更新速度：u_new = u* + δu，δu = (dt/2ρ) * force = 0.5 * force（dt=ρ=1）
+    // 来自 Wu & Shu (2009) Eq.17/20：ρu = Σe_α f_α + (1/2)F dt。
+    lbm::LatticeGrid g_upd = g;
+    for (int i = 0; i < g_upd.size(); ++i) {
+        g_upd.u[i * 2 + 0] = u0 + 0.5 * g.force[i * 2 + 0];
+        g_upd.u[i * 2 + 1] = 0.0 + 0.5 * g.force[i * 2 + 1];
+    }
+
+    // 重新插值到边界，检查无滑移残差（目标 U=0）
+    auto ms_check = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::interpolate_velocity(g_upd, ms_check, 1.0);
+
+    double max_res = 0.0;
+    for (const auto& mk : ms_check.markers)
+        max_res = std::max(max_res, std::hypot(mk.ux, mk.uy));
+
+    const bool ok = std::isfinite(max_res) && (max_res < 1e-12);
+    std::printf("[IBM] IVC-IBM machine-precision no-slip: max_res=%.2e → %s\n",
+                max_res, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ============================================================
+// 测试：IVC-IBM 固定物体 LU 缓存版（stationary）
+//   1. 缓存在首次调用后填充（A_lu_cache/piv_cache 均非空）
+//   2. 第 1 次（无缓存）与通用版 compute_ibm_forces_ivc 结果一致（差 < 1e-12）
+//   3. 第 2 次调用（复用缓存）与第 1 次结果完全一致（差 < 1e-15）
+// ============================================================
+static int test_ivc_ibm_stationary_cache()
+{
+    const int nx = 32, ny = 32;
+    const double u0 = 0.05;
+
+    // ---- 通用版参考解 ----
+    lbm::LatticeGrid g_ref(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g_ref.size(); ++i) {
+        g_ref.u[i * 2 + 0] = u0;
+        g_ref.u[i * 2 + 1] = 0.0;
+    }
+    auto ms_ref = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_ivc(g_ref, ms_ref, 1.0, 1.0);
+
+    // ---- 固定版第 1 次调用（构建并缓存 LU）----
+    lbm::LatticeGrid g1(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g1.size(); ++i) {
+        g1.u[i * 2 + 0] = u0;
+        g1.u[i * 2 + 1] = 0.0;
+    }
+    auto ms1 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    std::vector<double> A_lu_cache;
+    std::vector<int>    piv_cache;
+    ibm::compute_ibm_forces_ivc_stationary(g1, ms1, 1.0, 1.0, A_lu_cache, piv_cache);
+
+    // ---- 固定版第 2 次调用（复用 LU 缓存）----
+    lbm::LatticeGrid g2(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g2.size(); ++i) {
+        g2.u[i * 2 + 0] = u0;
+        g2.u[i * 2 + 1] = 0.0;
+    }
+    auto ms2 = ibm::MarkerSet::make_circle(16.0, 16.0, 4.0, 32);
+    ibm::compute_ibm_forces_ivc_stationary(g2, ms2, 1.0, 1.0, A_lu_cache, piv_cache);
+
+    // 验证缓存已填充
+    const bool cache_ok = !A_lu_cache.empty() && !piv_cache.empty();
+
+    // 验证第 1 次与通用版一致（< 1e-12）
+    double max_diff_ref = 0.0;
+    for (int i = 0; i < g_ref.size(); ++i) {
+        max_diff_ref = std::max(max_diff_ref,
+            std::abs(g1.force[i*2+0] - g_ref.force[i*2+0]));
+        max_diff_ref = std::max(max_diff_ref,
+            std::abs(g1.force[i*2+1] - g_ref.force[i*2+1]));
+    }
+
+    // 验证第 1、2 次完全一致（< 1e-15）
+    double max_diff_call2 = 0.0;
+    for (int i = 0; i < g1.size(); ++i) {
+        max_diff_call2 = std::max(max_diff_call2,
+            std::abs(g1.force[i*2+0] - g2.force[i*2+0]));
+        max_diff_call2 = std::max(max_diff_call2,
+            std::abs(g1.force[i*2+1] - g2.force[i*2+1]));
+    }
+
+    const bool ok = cache_ok && (max_diff_ref < 1e-12) && (max_diff_call2 < 1e-15);
+    std::printf("[IBM] IVC-IBM stationary (LU cache): cache=%s diff_vs_general=%.2e"
+                " diff_call1_vs_2=%.2e → %s\n",
+                cache_ok ? "filled" : "empty", max_diff_ref, max_diff_call2,
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_ibm_main()
 {
     int failures = 0;
@@ -884,6 +1034,10 @@ int test_ibm_main()
     // Algorithm 3 精确求解：机器精度无滑移残差（Scheme II）和 LU 缓存（Scheme I）
     failures += test_mls_implicit_machine_precision();
     failures += test_mls_implicit_stationary_scheme_i();
+    // IVC-IBM（隐式速度校正，Wu & Shu 2009）
+    failures += test_ivc_ibm_force_nonzero();
+    failures += test_ivc_ibm_machine_precision();
+    failures += test_ivc_ibm_stationary_cache();
     return failures;
 }
 
