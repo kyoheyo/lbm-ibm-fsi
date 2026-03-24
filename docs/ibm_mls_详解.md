@@ -1300,6 +1300,8 @@ $$\mathbf{u} = \mathbf{u}^* + \delta\mathbf{u} \quad \text{（Eq.20，实际流�
 
 以各拉格朗日边界点的速度修正量 $\delta\mathbf{u}_B^l$ 为**未知量**，通过 Peskin δ 函数的展布-插值算子建立线性方程组，强制实现无滑移边界条件 $\mathbf{u}(\mathbf{X}_B^l) = \mathbf{U}_B^l$。
 
+> **代码中的 `u*` 说明**：`LatticeGrid::compute_macroscopic()`（`lattice.cpp:33`）仅计算 $\rho\mathbf{u}^* = \sum_\alpha \mathbf{e}_\alpha f_\alpha$，**不加** 体力半步项 $\tfrac{1}{2}\mathbf{f}\Delta t$。因此 `grid.u` 在 LBM `stream()` 步骤之后即为论文 Eq.18 的中间速度 $\mathbf{u}^*$，`interpolate_velocity` 正确地对 $\mathbf{u}^*$ 进行插值。实际的校正速度 $\mathbf{u} = \mathbf{u}^* + \delta\mathbf{u}$（Eq.20/25）在**下一步** LBM 碰撞中通过 Guo 体力项隐式获得（$\rho\mathbf{u} = \sum_\alpha \mathbf{e}_\alpha f_\alpha + \tfrac{1}{2}\mathbf{f}\Delta t$），故本实现为**显式单次耦合**（explicit single-pass coupling），不在同一时间步内迭代至收敛（与原文 §3 "Repeat step 2 to step 5" 的完全收敛版等价，但省去内循环，引入 $O(\Delta t)$ 耦合误差）。
+
 ### 14.2 方程组推导（Eq.27–29）
 
 设第 $l$ 个边界点处的速度亏量为 $B^l = U_{\text{target}}^l - u^*(\mathbf{X}_B^l)$（插值 $u^*$ 到边界的残差），则 IVC 矩阵方程为：
@@ -1327,7 +1329,9 @@ $$\mathbf{f}(\mathbf{x}_{ij}) = \sum_l f_B^l \cdot D_{ij}^l \cdot \Delta s_l \qu
 | 3 | 构建矩阵 $A$（通用版每步重建；固定版首步构建+缓存）| `build_ivc_matrix()` |
 | 4 | LU 分解求解 $A \cdot \delta u_B = B$（$x$/$y$ 独立）| `lu_factor_dense()` + `lu_solve_dense()` |
 | 5 | 写入 Lagrangian 力密度 $f_B^l = (2/\Delta t)\,\delta u_B^l$ | 内部循环写 mk.fx/fy |
-| 6 | 展布力到 Eulerian 网格 | `spread_force()` |
+| 6 | 展布力到 Eulerian 网格，写入 `fluid.force` | `spread_force()` |
+
+> **与原文算法步骤（3）–（4）的对应**：论文第 3 步先用 Eq.24 将 $\delta u_B^l$ 展布到 Euler 节点 $\delta\mathbf{u}(x_{ij})$，第 4 步再用 Eq.25 校正速度 $\mathbf{u} = \mathbf{u}^* + \delta\mathbf{u}$，同步计算力密度 $\mathbf{f} = 2\rho\delta\mathbf{u}/\Delta t$（Eq.30）。本实现将这两步合并为：仅存储体力 $\mathbf{f}$（步骤 5–6），速度校正 $\mathbf{u}^* \to \mathbf{u}^* + \delta\mathbf{u}$ 则在**下一 LBM 时间步**的碰撞中通过 Guo 格式（Eq.17）隐式完成。单次无滑移残差由测试 `test_ivc_ibm_machine_precision` 验证达机器精度（$<10^{-12}$）。
 
 ### 14.5 代码对应（`core/src/ibm/interpolation.cpp`）
 
