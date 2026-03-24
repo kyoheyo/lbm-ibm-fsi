@@ -1235,10 +1235,12 @@ int lbm_ibm_marker_set_size(const IbmMarkerSetHandle* h)
 // MDF-IBM
 // ---------------------------------------------------------------------------
 
-/// 多重直接力法（MDF-IBM，Luo 2007）。
+/// 多重直接力法（MDF-IBM，Wang et al. 2008 / Suzuki & Inamuro 2011）。
 ///
 /// 调用时机：collide() + stream() 之后，宏观量更新之前。
 /// 本函数向 grid.force 写入 IBM 体力，供 Guo 体力格式使用。
+/// 同时将各迭代增量之和（拉格朗日总体力 g_L(Xₖ)）写入 ms 各标记点的 fx/fy，
+/// 可通过 lbm_ibm_compute_body_force() 获取 FSI 合力。
 ///
 /// @param g        LatticeGrid 指针
 /// @param ms       IbmMarkerSet 句柄
