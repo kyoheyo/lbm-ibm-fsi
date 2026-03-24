@@ -9,7 +9,7 @@
 // C ABI 声明
 // ---------------------------------------------------------------------------
 mod ffi {
-    use std::ffi::{c_int, c_char};
+    use std::ffi::{c_int, c_char, c_void};
 
     #[repr(C)]
     pub enum LatticeModelC {
@@ -1212,6 +1212,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 
@@ -1239,6 +1240,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 
@@ -1271,6 +1273,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         })
     }
 
@@ -1538,6 +1541,9 @@ pub fn ibm_halo_reduce_force_2d(grid: &mut LbmGrid, decomp: &mut LbmMpiDecomp2D)
 
 impl Drop for LbmIbmMarkerSet {
     fn drop(&mut self) {
+        if !self.ivc_cache.is_null() {
+            unsafe { ffi::lbm_ibm_ivc_stationary_cache_free(&mut self.ivc_cache) };
+        }
         if !self.ptr.is_null() {
             unsafe { ffi::lbm_ibm_marker_set_free(self.ptr) };
             self.ptr = std::ptr::null_mut();
