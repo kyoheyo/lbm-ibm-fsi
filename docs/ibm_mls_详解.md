@@ -53,6 +53,8 @@
     - 14.5 代码对应
     - 14.6 与其他方法的对比
     - 14.7 MPI 适配
+    - 14.8 C API 与 Rust 绑定封装
+    - 14.9 TOML 配置
 15. [IBM 合力统计](#15-ibm-合力统计)
 16. [MPI 分区适配](#16-mpi-分区适配)
 17. [MPI 幽灵层交换](#17-mpi-幽灵层交换)
@@ -1330,21 +1332,21 @@ $$\mathbf{f}(\mathbf{x}_{ij}) = \sum_l f_B^l \cdot D_{ij}^l \cdot \Delta s_l \qu
 ### 14.5 代码对应（`core/src/ibm/interpolation.cpp`）
 
 ```cpp
-// interpolation.cpp:1252–1309（build_ivc_matrix）
+// interpolation.cpp:1252–1320（build_ivc_matrix）
 // 构建 A_{lk} = Σ_j D_l(j)·D_k(j)·ds_k·dx²（反向 Euler→Lag 索引）
 static void build_ivc_matrix(const lbm::LatticeGrid& grid,
                                const MarkerSet& ms, double dx,
                                DeltaKernel kernel,
                                std::vector<double>& A_mat);
 
-// interpolation.cpp:1321–1390（compute_ibm_forces_ivc — 通用版）
+// interpolation.cpp:1321–1398（compute_ibm_forces_ivc — 通用版）
 // 每步重建矩阵 A，适用于移动/变形物体。
 void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
                               MarkerSet& ms, double dx, double dt,
                               DeltaKernel kernel,
                               double u_target_x, double u_target_y);
 
-// interpolation.cpp:1400–1458（compute_ibm_forces_ivc_stationary — 固定物体优化版）
+// interpolation.cpp:1400–1466（compute_ibm_forces_ivc_stationary — 固定物体优化版）
 // 首次调用构建+缓存 A 的 LU 分解，后续步骤仅 LU 代换。
 void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
                                         MarkerSet& ms, double dx, double dt,
@@ -1382,6 +1384,83 @@ for (int step = 0; step < n_steps; ++step) {
 ### 14.7 MPI 适配
 
 与 MDF-IBM 一致，IVC-IBM 在 MPI 模式下对矩阵 $A$ 和向量 $B$ 各进行一次 `MPI_Allreduce`，确保所有进程持有完整的方程组解。展布步骤后需调用 `ibm_halo_reduce_force_2d()`（见 §17.2）归并幽灵层力贡献。
+
+### 14.8 C API 与 Rust 绑定封装
+
+**C API**（`lbm_capi.cpp`，`bindings/src/lib.rs:312–324`）：
+
+```c
+/// 通用版：每步重建矩阵 A，适用于移动物体。
+void lbm_ibm_compute_ivc(LatticeGridHandle* g, IbmMarkerSetHandle* ms,
+                          double dx, double dt,
+                          double u_target_x, double u_target_y);
+
+/// 固定物体优化版：首次调用 LU 分解并缓存，后续复用。
+/// *cache_handle 首次调用前须为 null。
+void lbm_ibm_compute_ivc_stationary(LatticeGridHandle* g, IbmMarkerSetHandle* ms,
+                                     double dx, double dt,
+                                     void** cache_handle,
+                                     double u_target_x, double u_target_y);
+
+/// 释放 ivc_stationary 缓存（通常由 LbmIbmMarkerSet Drop 自动调用）。
+void lbm_ibm_ivc_stationary_cache_free(void** cache_handle);
+```
+
+**Rust 封装**（`bindings/src/lib.rs:1405–1450`）：
+
+```rust
+// 通用版（移动物体）
+pub fn step_ivc(&mut self, grid: &mut LbmGrid,
+                 dx: f64, dt: f64,
+                 u_target_x: f64, u_target_y: f64) {
+    unsafe {
+        ffi::lbm_ibm_compute_ivc(grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+    }
+}
+
+// 固定物体版（LU 缓存存于 self.ivc_cache，Drop 时自动释放）
+pub fn step_ivc_stationary(&mut self, grid: &mut LbmGrid,
+                            dx: f64, dt: f64,
+                            u_target_x: f64, u_target_y: f64) {
+    unsafe {
+        ffi::lbm_ibm_compute_ivc_stationary(
+            grid.ptr, self.ptr, dx, dt,
+            &mut self.ivc_cache, u_target_x, u_target_y)
+    }
+}
+```
+
+**典型调用**（`orchestrator/src/main.rs: step_ibm`）：
+
+```rust
+"ivc"            => entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0),
+"ivc_stationary" => entry.ms.step_ivc_stationary(grid, dx, dt, 0.0, 0.0),
+```
+
+### 14.9 TOML 配置
+
+在 TOML 仿真配置文件中，通过 `[ibm]` 段的 `method` 字段选择 IVC-IBM：
+
+```toml
+[ibm]
+method       = "ivc"          # 或 "ivc_stationary"（固定物体，LU 缓存，更高效）
+delta_kernel = "FourPoint"    # Peskin 4 点核（推荐）；也可用 "TwoPoint"
+
+[[ibm.body]]
+shape  = "circle"
+cx     = 50.0
+cy     = 50.0
+radius = 10.0
+# 也可对单个体覆盖：
+# method = "ivc_stationary"
+```
+
+| 键 | 可选值 | 说明 |
+|----|--------|------|
+| `method` | `"ivc"` | 每步重建矩阵，适用于**移动/变形物体** |
+| `method` | `"ivc_stationary"` | 首步 LU 分解后缓存，适用于**固定静止物体**（更快）|
+| `delta_kernel` | `"FourPoint"` | 推荐：4 点 Peskin，$C^1$，满足矩条件 |
+| `delta_kernel` | `"TwoPoint"` | 2 点双线性插值，精度略低 |
 
 ---
 
