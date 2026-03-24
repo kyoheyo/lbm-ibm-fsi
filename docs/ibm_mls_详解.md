@@ -45,18 +45,26 @@
 11. [隐式 MLS-IBM Scheme II：GMRES（Algorithm 3 C2 路径）](#11-隐式-mls-ibm-scheme-iigmres)
 12. [隐式 MLS-IBM Scheme I：固定物体直接矩阵求逆](#12-隐式-mls-ibm-scheme-i固定物体)
 13. [罚函数 IBM（Penalty-IBM）](#13-罚函数-ibmpenalty-ibm)
-14. [IBM 合力统计](#14-ibm-合力统计)
-15. [MPI 分区适配](#15-mpi-分区适配)
-16. [MPI 幽灵层交换](#16-mpi-幽灵层交换)
-17. [方案对比与选用建议](#17-方案对比与选用建议)
-18. [代码审查发现的问题与注意事项](#18-代码审查发现的问题与注意事项)
-    - 18.1 solve3x3 对称矩阵约束
-    - 18.2 Scheme I phi_data 缓存
-    - 18.3 隐式 MLS 在 MPI 多进程模式下已完整
-    - 18.4 Peskin 与 MLS 最近格点策略差异
-    - 18.5 MLS 插值回退策略的不一致性
-    - 18.6 GMRES 收敛判据
-    - 18.7 ✅ MDF Lagrangian 力累加修正（已修复）
+14. [隐式速度校正 IBM（IVC-IBM，Wu & Shu 2009）](#14-隐式速度校正-ibmivc-ibmwu--shu-2009)
+    - 14.1 方法背景与核心思想
+    - 14.2 方程组推导（Eq.27–29）
+    - 14.3 力密度计算（Eq.30）
+    - 14.4 算法步骤（每时间步）
+    - 14.5 代码对应
+    - 14.6 与其他方法的对比
+    - 14.7 MPI 适配
+15. [IBM 合力统计](#15-ibm-合力统计)
+16. [MPI 分区适配](#16-mpi-分区适配)
+17. [MPI 幽灵层交换](#17-mpi-幽灵层交换)
+18. [方案对比与选用建议](#18-方案对比与选用建议)
+19. [代码审查发现的问题与注意事项](#19-代码审查发现的问题与注意事项)
+    - 19.1 solve3x3 对称矩阵约束
+    - 19.2 Scheme I phi_data 缓存
+    - 19.3 隐式 MLS 在 MPI 多进程模式下已完整
+    - 19.4 Peskin 与 MLS 最近格点策略差异
+    - 19.5 MLS 插值回退策略的不一致性
+    - 19.6 GMRES 收敛判据
+    - 19.7 ✅ MDF Lagrangian 力累加修正（已修复）
 
 ---
 
@@ -1275,7 +1283,109 @@ spread_force(fluid, ms, dx, kernel);
 
 ---
 
-## 14. IBM 合力统计
+## 14. 隐式速度校正 IBM（IVC-IBM，Wu & Shu 2009）
+
+**参考**：Wu J. & Shu C. (2009) *J. Comput. Phys.* **228**:1963–1979。
+"Implicit velocity correction-based immersed boundary–lattice Boltzmann method and its applications"
+
+### 14.1 方法背景与核心思想
+
+IVC-IBM 基于 Guo 体力格式（§5.4）将流体速度分解为**中间速度** $\mathbf{u}^*$ 与**速度修正量** $\delta\mathbf{u}$（论文 Eq.17–20）：
+
+$$\rho\mathbf{u}^* = \sum_\alpha \mathbf{e}_\alpha f_\alpha \quad \text{（Eq.18，LBM 碰撞-流式后的中间速度）}$$
+$$\rho\,\delta\mathbf{u} = \tfrac{1}{2}\mathbf{f}\,\Delta t \quad \text{（Eq.19，力对速度的半步修正）}$$
+$$\mathbf{u} = \mathbf{u}^* + \delta\mathbf{u} \quad \text{（Eq.20，实际流体速度）}$$
+
+以各拉格朗日边界点的速度修正量 $\delta\mathbf{u}_B^l$ 为**未知量**，通过 Peskin δ 函数的展布-插值算子建立线性方程组，强制实现无滑移边界条件 $\mathbf{u}(\mathbf{X}_B^l) = \mathbf{U}_B^l$。
+
+### 14.2 方程组推导（Eq.27–29）
+
+设第 $l$ 个边界点处的速度亏量为 $B^l = U_{\text{target}}^l - u^*(\mathbf{X}_B^l)$（插值 $u^*$ 到边界的残差），则 IVC 矩阵方程为：
+
+$$\sum_k A_{lk}\,\delta u_B^k = B^l \quad \text{（Eq.28，分量独立，$x$/$y$ 各一个系统）}$$
+
+其中矩阵元素（Eq.27）：
+$$A_{lk} = \Delta s_k \sum_{i,j} D_{ij}^l \cdot D_{ij}^k \cdot \Delta x^2, \quad D_{ij}^l = \delta(x_{ij} - X_l^x)\,\delta(y_{ij} - X_l^y)$$
+
+矩阵 $A$ 为**对称半正定**矩阵，仅取决于边界点位置和 δ 核，与流场无关，适合对静止物体做 LU 缓存。
+
+### 14.3 力密度计算（Eq.30）
+
+求解方程组后，Lagrangian 力密度与 Eulerian 体力分别为：
+
+$$f_B^l = \frac{2\rho}{\Delta t}\,\delta u_B^l \quad \text{（Lagrangian 力密度，写入 mk.fx/fy）}$$
+$$\mathbf{f}(\mathbf{x}_{ij}) = \sum_l f_B^l \cdot D_{ij}^l \cdot \Delta s_l \quad \text{（Eulerian 体力，写入 fluid.force）}$$
+
+### 14.4 算法步骤（每时间步）
+
+| 步骤 | 操作 | 代码调用 |
+|------|------|---------|
+| 1 | 插值中间速度 $u^*$ 到边界点 $u^*(\mathbf{X}_B^l)$ | `interpolate_velocity()` |
+| 2 | 构建右端向量 $B^l = U_{\text{target}}^l - u^*(\mathbf{X}_B^l)$ | 内部循环 |
+| 3 | 构建矩阵 $A$（通用版每步重建；固定版首步构建+缓存）| `build_ivc_matrix()` |
+| 4 | LU 分解求解 $A \cdot \delta u_B = B$（$x$/$y$ 独立）| `lu_factor_dense()` + `lu_solve_dense()` |
+| 5 | 写入 Lagrangian 力密度 $f_B^l = (2/\Delta t)\,\delta u_B^l$ | 内部循环写 mk.fx/fy |
+| 6 | 展布力到 Eulerian 网格 | `spread_force()` |
+
+### 14.5 代码对应（`core/src/ibm/interpolation.cpp`）
+
+```cpp
+// interpolation.cpp:1252–1309（build_ivc_matrix）
+// 构建 A_{lk} = Σ_j D_l(j)·D_k(j)·ds_k·dx²（反向 Euler→Lag 索引）
+static void build_ivc_matrix(const lbm::LatticeGrid& grid,
+                               const MarkerSet& ms, double dx,
+                               DeltaKernel kernel,
+                               std::vector<double>& A_mat);
+
+// interpolation.cpp:1321–1390（compute_ibm_forces_ivc — 通用版）
+// 每步重建矩阵 A，适用于移动/变形物体。
+void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
+                              MarkerSet& ms, double dx, double dt,
+                              DeltaKernel kernel,
+                              double u_target_x, double u_target_y);
+
+// interpolation.cpp:1400–1458（compute_ibm_forces_ivc_stationary — 固定物体优化版）
+// 首次调用构建+缓存 A 的 LU 分解，后续步骤仅 LU 代换。
+void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
+                                        MarkerSet& ms, double dx, double dt,
+                                        std::vector<double>& A_lu_cache,
+                                        std::vector<int>& piv_cache,
+                                        DeltaKernel kernel,
+                                        double u_target_x, double u_target_y);
+```
+
+**固定物体用法示例**：
+
+```cpp
+std::vector<double> A_lu_cache;
+std::vector<int>    piv_cache;
+for (int step = 0; step < n_steps; ++step) {
+    solver.step();      // LBM 碰撞 + 流式
+    ibm::compute_ibm_forces_ivc_stationary(
+        fluid, ms, dx, dt, A_lu_cache, piv_cache);  // 首步建 LU，后续复用
+}
+```
+
+### 14.6 与其他方法的对比
+
+| 方法 | 无滑移精度 | 每步开销 | 适用场景 |
+|------|-----------|---------|---------|
+| MDF-IBM | $O(N_F)$ 迭代近似 | $O(N_F \cdot N_l \cdot N_e)$ | 简单实现，$N_F \approx 5$ 足够 |
+| Penalty-IBM | 取决于增益大小 | $O(N_l \cdot N_e)$ | 移动物体，简单实现 |
+| **IVC-IBM（通用）** | **精确（机器精度）** | $O(N_l^2 \cdot N_e + N_l^3)$ | 移动/变形物体精确无滑移 |
+| **IVC-IBM（固定）** | **精确（机器精度）** | $O(N_l^2)$（仅 LU 代换）| 静止固体，高效精确 |
+| MLS-IBM Scheme II | 精确（GMRES）| $O(N_l^2 \cdot N_e + k \cdot N_l^2)$ | 高精度 MLS 插值 |
+| MLS-IBM Scheme I | 精确（LU 缓存）| $O(N_l^2)$（仅 LU 代换）| 静止固体最高精度 |
+
+> **注意**：$N_l$ 为边界点数，$N_e \approx 16$ 为每个标记点的 Peskin δ 支撑 Euler 节点数，$k$ 为 GMRES 迭代数。
+
+### 14.7 MPI 适配
+
+与 MDF-IBM 一致，IVC-IBM 在 MPI 模式下对矩阵 $A$ 和向量 $B$ 各进行一次 `MPI_Allreduce`，确保所有进程持有完整的方程组解。展布步骤后需调用 `ibm_halo_reduce_force_2d()`（见 §17.2）归并幽灵层力贡献。
+
+---
+
+## 15. IBM 合力统计
 
 **物理意义**：IBM 体力合力等于固体所受流体作用力（牛顿第三定律）。
 
@@ -1300,7 +1410,7 @@ void compute_ibm_body_force(const MarkerSet& ms, double& out_fx, double& out_fy)
 
 ---
 
-## 15. MPI 分区适配
+## 16. MPI 分区适配
 
 `ibm_marker_set_adapt_to_partition()` 将标记点坐标从全局格子坐标系转换到本地坐标系：
 
@@ -1312,9 +1422,9 @@ $$mk.x \mathrel{+}= \text{offset}_x, \quad mk.y \mathrel{+}= \text{offset}_y$$
 
 ---
 
-## 16. MPI 幽灵层交换
+## 17. MPI 幽灵层交换
 
-### 16.1 ibm_halo_exchange_u_2d（IBM 插值前）
+### 17.1 ibm_halo_exchange_u_2d（IBM 插值前）
 
 LBM PUSH 流式迁移后，幽灵行的 $u$ 是从本地物理行**外推**的（非邻居真实速度）。在 IBM 插值前必须调用此函数更新幽灵行 $u$：
 
@@ -1324,7 +1434,7 @@ void ibm_halo_exchange_u_2d(grid, decomp) {
 }
 ```
 
-### 16.2 ibm_halo_reduce_force_2d（IBM 展布后）
+### 17.2 ibm_halo_reduce_force_2d（IBM 展布后）
 
 IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一部分），需通过 `MPI_Sendrecv` 归并回邻居物理行：
 
@@ -1335,7 +1445,7 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 ---
 
-## 17. 方案对比与选用建议
+## 18. 方案对比与选用建议
 
 | 方案 | 函数 | 无滑移误差 | 力守恒 | 力矩守恒 | 每步开销 | 适用场景 |
 |------|------|-----------|-------|---------|---------|---------|
@@ -1343,15 +1453,17 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 | MDF-IBM | `compute_ibm_forces_mdf` | O(1e-3)×iter | ✓ | ✓ | O(iter·N_l·N_e) | 稳健，适中精度 |
 | 原始 MLS（Alg.1） | `compute_ibm_forces_mls_original` | O(1e-3) | ✗ | ✗ | O(N_l·N_e²) | 高阶插值，低精度展布 |
 | 显式 MLS（Alg.2） | `compute_ibm_forces_mls_explicit` | O(1e-2) | ✗ | ✗ | O(N_l·N_e²) | 不推荐（Z 因子破坏守恒） |
+| **IVC-IBM（通用）** | **`compute_ibm_forces_ivc`** | **机器精度** | **✓** | ✓ | O(N_l²·N_e + N_l³) | **移动物体精确无滑移** |
+| **IVC-IBM（固定）** | **`compute_ibm_forces_ivc_stationary`** | **机器精度** | **✓** | ✓ | O(N_l²)（复用LU）| **静止固体高效精确** |
 | **隐式 MLS Scheme II** | **`compute_ibm_forces_mls_implicit`** | **机器精度** | **✓** | **✓** | O(N_l²·iter + N_l·N_e²) | **移动物体，推荐** |
 | **隐式 MLS Scheme I** | **`compute_ibm_forces_mls_implicit_stationary`** | **机器精度** | **✓** | **✓** | O(N_l²) 复用LU | **固定物体，最快** |
 | 罚函数 | `compute_ibm_forces_penalty` | O(1/α) | ✗ | ✗ | O(N_l·N_e) | 大刚度系数近似无滑移 |
 
 ---
 
-## 18. 代码审查发现的问题与注意事项
+## 19. 代码审查发现的问题与注意事项
 
-### 18.1 ✅ solve3x3 仅对对称矩阵正确（设计选择，非 bug）
+### 19.1 ✅ solve3x3 仅对对称矩阵正确（设计选择，非 bug）
 
 **现象**：`solve3x3` 的 `x[1]` 和 `x[2]` 公式利用了对称矩阵的性质 $A[i][j] = A[j][i]$（等价于 $\det(M) = \det(M^T)$），因此**仅对对称矩阵正确**。
 
@@ -1359,7 +1471,7 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 **修复**：代码已添加注释说明此约束（`interpolation.cpp:247–261`），防止误用于非对称矩阵。
 
-### 18.2 ✅ Scheme I phi_data 缓存已实现
+### 19.2 ✅ Scheme I phi_data 缓存已实现
 
 **现象**：`compute_ibm_forces_mls_implicit_stationary` 新增 `phi_cache` 参数（`std::vector<MlsSupportSet>&`），在首次调用时构建并缓存，后续步骤直接复用，避免重复 `build_mls_shape_functions`。
 
@@ -1367,7 +1479,7 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 **状态**：✅ 已完成（见 `interpolation.cpp:949–1025`，`interpolation.hpp:310–330`）。
 
-### 18.3 ✅ 隐式 MLS 在 MPI 多进程模式下已完整
+### 19.3 ✅ 隐式 MLS 在 MPI 多进程模式下已完整
 
 **已修复项目**：
 
@@ -1379,25 +1491,25 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 **当前状态**：✅ 三处均已修复，单进程和 MPI 多进程模式下均正确。
 
-### 18.4 ✅ Peskin 与 MLS 使用不同的最近格点策略（设计合理）
+### 19.4 ✅ Peskin 与 MLS 使用不同的最近格点策略（设计合理）
 
 | 方法 | 最近格点 | 原因 |
 |------|---------|------|
 | Peskin（`interpolate_velocity`） | `std::floor(x/dx)` | Peskin 核基于 $\lfloor x/\Delta x \rfloor$ 定义，支撑 $[i_0 - s, i_0 + s + 1]$（非对称） |
 | MLS（`mls_interpolate_velocity` 等） | `std::round(x/dx)` | MLS 支撑域 $[-H_k, H_k]$ 以标记点为中心，对称分布 |
 
-### 18.5 ✅ MLS 插值回退策略的不一致性（已知，可接受）
+### 19.5 ✅ MLS 插值回退策略的不一致性（已知，可接受）
 
 - `mls_interpolate_velocity`（奇异）：回退到加权平均 `bu[0]/M[0][0]`
 - `mls_spread_force`（奇异）：直接跳过此标记点（`continue`）
 
 两种回退策略不同但都是降级处理，实际情况下（正确参数 + 足够支撑节点）不会触发。
 
-### 18.6 ✅ GMRES 收敛判据（设计合理）
+### 19.6 ✅ GMRES 收敛判据（设计合理）
 
 初始绝对判据 `if (beta < tol)` 防止零右端向量情况。后续迭代内使用相对判据 `|g[j+1]| < tol * beta`。对 `tol = 1e-14`，实测结果见 `test_mls_implicit_machine_precision`：32 次迭代后 `max_res = 1.08e-16` ≈ double ε。
 
-### 18.7 ✅ MDF：Lagrangian 标记点力累加修正（已修复）
+### 19.7 ✅ MDF：Lagrangian 标记点力累加修正（已修复）
 
 **问题**（已修复）：原实现中，每次子迭代直接用 `mk.fx = dFx` 覆盖标记点力，导致 `mk.fx/fy` 在 $N_F > 1$ 时仅保存末次迭代增量 $\Delta\mathbf{g}^{(N_F-1)}_k \to 0$（收敛后趋近于零）。`compute_ibm_body_force()` 随即返回近零 FSI 合力，严重低估阻力/升力。
 
