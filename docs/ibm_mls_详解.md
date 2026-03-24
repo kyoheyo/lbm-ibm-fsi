@@ -20,6 +20,16 @@
 3. [标准 Peskin 速度插值（J 算子）](#3-标准-peskin-速度插值j-算子)
 4. [标准 Peskin 力展布（J^T 算子）](#4-标准-peskin-力展布jt-算子)
 5. [多重直接力法 MDF-IBM（Algorithm 0）](#5-多重直接力法-mdf-ibmalgorithm-0)
+   - 5.1 问题背景：单次直接力法的不足
+   - 5.2 完整算法推导（对应 2011 Suzuki & Inamuro §3.2）
+   - 5.3 代码逐行对应
+   - 5.4 完整时间步流程（MDF-IBM + LBM 全耦合）
+   - 5.5 δ 函数实现细节
+   - 5.6 `interpolate_velocity`：Lagrangian 点插值
+   - 5.7 `spread_force`：力展布
+   - 5.8 FSI 合力计算
+   - 5.9 C API 与 Rust 绑定封装
+   - 5.10 数值参数建议与收敛性
 6. [MLS 速度插值（MLS-J 算子）](#6-mls-速度插值mls-j-算子)
    - 6.1 MLS 矩阵构建
    - 6.2 solve3x3 对称矩阵 Cramér 法则
@@ -40,6 +50,13 @@
 16. [MPI 幽灵层交换](#16-mpi-幽灵层交换)
 17. [方案对比与选用建议](#17-方案对比与选用建议)
 18. [代码审查发现的问题与注意事项](#18-代码审查发现的问题与注意事项)
+    - 18.1 solve3x3 对称矩阵约束
+    - 18.2 Scheme I phi_data 缓存
+    - 18.3 隐式 MLS 在 MPI 多进程模式下已完整
+    - 18.4 Peskin 与 MLS 最近格点策略差异
+    - 18.5 MLS 插值回退策略的不一致性
+    - 18.6 GMRES 收敛判据
+    - 18.7 ✅ MDF Lagrangian 力累加修正（已修复）
 
 ---
 
@@ -209,65 +226,426 @@ void spread_force(lbm::LatticeGrid& grid, const MarkerSet& ms,
 
 ## 5. 多重直接力法 MDF-IBM（Algorithm 0）
 
-**参考**：Luo K. et al. (2007) *J. Comput. Phys.* 227:454–483.
+**参考论文**：
+- Wang Z., Fan J., Luo K. (2008) *"Combined multi-direct forcing and immersed boundary method for simulating flows with moving particles"*，Int. J. Multiphase Flow **34**:283–302。（**原始 MDF 方法**）
+- Suzuki K., Inamuro T. (2011) *"Effect of internal mass in the simulation of a moving body by the immersed boundary method"*，Comput. Fluids **49**:173–187。（**MDF 应用于 LBM 的版本**，本项目的直接参考）
 
-### 5.1 算法
+**本节符号约定**（与代码变量对照）
 
-MDF 通过多次子迭代逐步消除无滑移误差：
+| 论文符号 | 含义 | 代码变量 |
+|---------|------|---------|
+| $\mathbf{u}^* = \mathbf{u}^n$ | 时间步 $n$ 结束后的欧拉速度场（stream后） | `fluid.u`（传入时的值）|
+| $\mathbf{u}^{(\ell)}$ | 第 $\ell$ 次子迭代的工作速度场 | `u_work` |
+| $\mathbf{U}_k$ | 第 $k$ 个 Lagrangian 点的目标（固体壁面）速度 | 静止时 = **0** |
+| $\Delta \mathbf{g}^{(\ell)}_k$ | 第 $\ell$ 次迭代在 Lagrangian 点上的力增量 | `mk.fx`, `mk.fy`（每次迭代临时）|
+| $\mathbf{g}^{(L)}_k$ | 最终 Lagrangian 总体力 $= \sum_\ell \Delta\mathbf{g}^{(\ell)}_k$ | `mk.fx`, `mk.fy`（函数返回后）|
+| $\delta\mathbf{f}^{(\ell)}(\mathbf{x})$ | 第 $\ell$ 次迭代展布到欧拉网格的增量体力场 | `dF_euler` |
+| $\mathbf{g}^{(L)}(\mathbf{x})$ | 最终欧拉总体力场 $= \sum_\ell \delta\mathbf{f}^{(\ell)}$ | `fluid.force`（返回后）|
+| $W(\mathbf{x} - \mathbf{X}_k)$ | 离散 δ 函数（Peskin 4 点余弦核） | `delta_phi()` |
+| $\Delta V_k = \Delta S_k$ | Lagrangian 点体积元/弧长元素 | `mk.ds` |
+| $N_F$ | 子迭代次数 | `n_iter` |
+| $\Delta x$ | 格子间距 | `dx` |
+| $\Delta t$ | 时间步长 | `dt` |
 
-$$
-\begin{aligned}
-&\text{初始化：} \mathbf{F}_{\text{total}} = 0,\quad \mathbf{u}^{(0)} = \mathbf{u}^* \\
-&\text{对 } \ell = 0, 1, \ldots, N_{\text{iter}}-1: \\
-&\quad (1)\; \mathbf{U}_k^{(\ell)} = \sum_j \mathbf{u}_j^{(\ell)} \phi_j^k \Delta x^2 \\
-&\quad (2)\; \delta\mathbf{F}_k^{(\ell)} = \frac{\mathbf{0} - \mathbf{U}_k^{(\ell)}}{\Delta t} \\
-&\quad (3)\; \delta \mathbf{f}_j^{(\ell)} = \sum_k \delta\mathbf{F}_k^{(\ell)} \phi_j^k \Delta S_k \\
-&\quad (4)\; \mathbf{u}_j^{(\ell+1)} = \mathbf{u}_j^{(\ell)} + \Delta t \cdot \delta\mathbf{f}_j^{(\ell)} \\
-&\quad (5)\; \mathbf{F}_{\text{total}} \mathrel{+}= \delta\mathbf{f}^{(\ell)}
-\end{aligned}
-$$
+---
 
-### 5.2 代码对应
+### 5.1 问题背景：单次直接力法的不足
+
+**直接力法**（Fadlun et al. 2000，Eq. (10) in 2008 paper）要求在每个时间步 $n \to n+1$ 中，对第 $k$ 个 Lagrangian 点施加力：
+
+$$F_k(\mathbf{x}_k) = \frac{\mathbf{U}_k - \hat{\mathbf{u}}_k}{\Delta t}  \tag{Wang2008 Eq.10}$$
+
+其中 $\hat{\mathbf{u}}_k$ 是该 Lagrangian 点处由欧拉场插值得到的"预测速度"（即 $\hat{u}_k = \sum_j \hat{u}_j W_{jk} \Delta x^2$），$\mathbf{U}_k$ 是固体壁面目标速度。
+
+> **问题**：展布力后，相邻 Lagrangian 点会相互干扰，导致实际插值速度 $\hat{\mathbf{u}}^1_k \neq \mathbf{U}_k$，无滑移条件 $O(\Delta x)$ 量级上不满足（2008 paper §2.2）。
+
+**多重直接力法（MDF）** 通过 $N_F$ 次子迭代（每次相当于额外施加一次直接力修正）逐步消除残余误差，使 Lagrangian 点速度收敛到目标速度：
+
+$$\text{误差} \sim O(\Delta x^2) \text{ 对 NF=1}，\text{~以} -2 \text{ 斜率下降（log-log图中，2008 Fig.1)}$$
+
+---
+
+### 5.2 完整算法推导（对应 2011 Suzuki & Inamuro §3.2）
+
+**背景**（2011 paper Eq. 16–17）：LBM 每时间步分两步更新分布函数：
+
+$$f_i^*(\mathbf{x}, t+\Delta t) = f_i(\mathbf{x}, t) - \frac{1}{s}\left[f_i - f_i^{\rm eq}\right]  \quad \text{（无体力碰撞）} \tag{2011 Eq.16}$$
+
+$$f_i(\mathbf{x}, t+\Delta t) = f_i^*(\mathbf{x}+\mathbf{c}_i\Delta x, t+\Delta t) + 3\Delta x\, E_i\, \mathbf{c}_i \cdot \mathbf{g}(\mathbf{x}, t+\Delta t)  \tag{2011 Eq.17}$$
+
+其中 $\mathbf{g}(\mathbf{x}, t+\Delta t)$ 是欧拉体力，$E_i$ 是权重。这意味着欧拉速度场通过体力被修正为：
+
+$$\mathbf{u}^*(\mathbf{x}) = \mathbf{u}^n(\mathbf{x}) + \Delta t \cdot \mathbf{g}(\mathbf{x}) \tag{等价于}$$
+
+**MDFM 迭代过程**（2011 paper §3.2，Step 0–4）：
+
+**Step 0**（初始化，2011 Eq.21）：计算第一次 Lagrangian 力增量，
+
+$$\Delta\mathbf{g}^{(0)}_k = \frac{\mathbf{U}_k - \mathbf{u}^*(\mathbf{X}_k)}{\Delta t}  \tag{2011 Eq.21}$$
+
+其中 $\mathbf{u}^*(\mathbf{X}_k) = \sum_j \mathbf{u}^*(\mathbf{x}_j) W(\mathbf{x}_j - \mathbf{X}_k) \Delta x^2$ 是从 $\mathbf{u}^*$ 插值得到的。
+
+**迭代 $\ell = 0, 1, \ldots, N_F - 1$**：
+
+**Step 1**（展布，2011 Eq.22）：将 Lagrangian 增量力展布到欧拉网格，
+
+$$\delta\mathbf{f}^{(\ell)}(\mathbf{x}) = \sum_{k=1}^{N} \Delta\mathbf{g}^{(\ell)}_k \cdot W(\mathbf{x} - \mathbf{X}_k) \cdot \Delta V_k  \tag{2011 Eq.22}$$
+
+其中 $\Delta V_k = S/N \cdot \Delta x \approx \Delta S_k$（弧长元素），即代码中的 `mk.ds`。
+
+**Step 2**（修正欧拉速度，2011 Eq.23）：
+
+$$\mathbf{u}^{(\ell+1)}(\mathbf{x}) = \mathbf{u}^{(\ell)}(\mathbf{x}) + \frac{\Delta t}{\text{Sh}} \cdot \delta\mathbf{f}^{(\ell)}(\mathbf{x})  \tag{2011 Eq.23}$$
+
+在格子单位中 $\text{Sh}/\Delta t = 1/\Delta x = 1$（$\text{Sh} = \Delta t$），故化简为：
+
+$$\mathbf{u}^{(\ell+1)}(\mathbf{x}) = \mathbf{u}^{(\ell)}(\mathbf{x}) + \Delta t \cdot \delta\mathbf{f}^{(\ell)}(\mathbf{x})  \tag{格子单位}$$
+
+**Step 3**（插值，2011 Eq.24）：将修正后的欧拉速度插值回 Lagrangian 点，
+
+$$\mathbf{u}^{(\ell)}(\mathbf{X}_k) = \sum_{\mathbf{x}} \mathbf{u}^{(\ell+1)}(\mathbf{x}) \cdot W(\mathbf{x} - \mathbf{X}_k) \cdot \Delta x^2  \tag{2011 Eq.24}$$
+
+**Step 4**（更新 Lagrangian 力，2011 Eq.25）：
+
+$$\Delta\mathbf{g}^{(\ell+1)}_k = \Delta\mathbf{g}^{(\ell)}_k + \frac{\mathbf{U}_k - \mathbf{u}^{(\ell)}(\mathbf{X}_k)}{\Delta t}  \tag{2011 Eq.25（等价形式）}$$
+
+> **注意**：2011 paper 中 Step 4 表述为新的体力 = 旧体力 + 残余修正。等价地，也可写成每次增量直接计算：$\Delta\mathbf{g}^{(\ell)}_k = (\mathbf{U}_k - \mathbf{u}^{(\ell-1)}(\mathbf{X}_k)) / \Delta t$，即每次迭代用当前工作速度重新计算增量。两者对最终总力 $\mathbf{g}^{(L)}_k = \sum_\ell \Delta\mathbf{g}^{(\ell)}_k$ 完全等价（累加相同）。
+
+**最终结果**：
+
+- **欧拉体力**：$\mathbf{g}^{(L)}(\mathbf{x}) = \sum_{\ell=0}^{N_F-1} \delta\mathbf{f}^{(\ell)}(\mathbf{x})$，写入 `fluid.force`，供 Guo 体力格式（§5.4）使用。
+- **Lagrangian 总体力**：$\mathbf{g}^{(L)}_k = \sum_{\ell=0}^{N_F-1} \Delta\mathbf{g}^{(\ell)}_k$，写入 `mk.fx`/`mk.fy`，供 FSI 合力计算（§14）使用。
+
+收敛性（2008 paper §3.1 & Fig.1）：$\ell_2$ 范数误差以 $-2$ 斜率在 log-log 图上随 $N_F$ 减小，**$N_F = 5$ 通常足够精确**（2011 paper Appendix D）。
+
+---
+
+### 5.3 代码逐行对应（`core/src/ibm/interpolation.cpp`）
 
 ```cpp
-// interpolation.cpp:164–230
-void compute_ibm_forces_mdf(fluid, ms, dx, dt, n_iter, kernel)
+// ====================================================================
+// core/src/ibm/interpolation.cpp: compute_ibm_forces_mdf()
+// 实现参考：Wang 2008（原始 MDF）；Suzuki & Inamuro 2011（LBM 版本）
+// ====================================================================
+void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
+                             MarkerSet& ms,
+                             double dx,   // 格子间距（通常 = 1.0）
+                             double dt,   // 时间步长（通常 = 1.0）
+                             int    n_iter,
+                             DeltaKernel kernel)
 {
-    std::vector<double> u_work = fluid.u;          // u^(0) = u*
-    std::vector<double> F_total(n*d, 0.0);
-    std::vector<double> dF_euler(n*d, 0.0);
+    const int n  = fluid.size();   // 欧拉节点总数
+    const int d  = fluid.dim();    // = 2（D2Q9）
+    const int nm = ms.size();      // Lagrangian 标记点总数 N
 
+    // ── 工作速度场 u_work ──────────────────────────────────────────
+    // u_work 初始化为 u*（Step 0 前的欧拉速度，即 LBM stream 后）
+    // 对应：u^(0) = u*  （2011 §3.2 初始化）
+    std::vector<double> u_work = fluid.u;
+
+    // ── 欧拉总体力累加器 F_total ───────────────────────────────────
+    // g^(L)(x) = Σ_ℓ δf^(ℓ)(x)，最终写入 fluid.force
+    std::vector<double> F_total(n * d, 0.0);
+
+    // ── Lagrangian 总体力累加器 ────────────────────────────────────
+    // g^(L)_k = Σ_ℓ Δg^(ℓ)_k，最终写入 mk.fx/fy
+    // 必须单独累加，不能只保留末次迭代值（末次迭代增量→0）
+    std::vector<double> total_lag_fx(nm, 0.0);
+    std::vector<double> total_lag_fy(nm, 0.0);
+
+    // ── 当前迭代增量力场 dF_euler ──────────────────────────────────
+    // δf^(ℓ)(x) = spread(Δg^(ℓ))
+    std::vector<double> dF_euler(n * d, 0.0);
+
+    // ================================================================
+    // 主迭代循环：ℓ = 0, 1, …, n_iter-1
+    // ================================================================
     for (int iter = 0; iter < n_iter; ++iter) {
-        // Step (1): 插值 u^(ℓ) 到 Lagrangian 点
+
+        // ── Step 0/3（插值）：u^(ℓ)(x) → U^(ℓ)(X_k) ─────────────
+        // 对应：2011 Eq.21（ℓ=0）或 Eq.24（ℓ>0）
+        //   U^(ℓ)(X_k) = Σ_x u^(ℓ)(x) · W(x - X_k) · Δx²
+        //
+        // 技巧：将 u_work 临时换入 fluid.u，再调用通用插值函数，
+        //       以复用 interpolate_velocity 中的 MPI 归属过滤逻辑。
         std::swap(fluid.u, u_work);
-        interpolate_velocity(fluid, ms, dx, kernel);   // 写入 mk.ux/uy
+        interpolate_velocity(fluid, ms, dx, kernel);   // 写入 mk.ux, mk.uy
         std::swap(fluid.u, u_work);
 
-        // Step (2): δF_k = (0 - U_k^(ℓ)) / dt
-        for (auto& mk : ms.markers) {
-            mk.fx = (0.0 - mk.ux) / dt;
-            mk.fy = (0.0 - mk.uy) / dt;
+        // ── Step 0/4（计算增量力）：Δg^(ℓ)_k ───────────────────────
+        // 对应：2011 Eq.21（ℓ=0），Eq.25 等价形式（ℓ>0）
+        //   Δg^(ℓ)_k = (U_k - U^(ℓ)(X_k)) / Δt
+        //   静止固体：U_k = 0，故 Δg^(ℓ)_k = -U^(ℓ)(X_k) / Δt
+        for (int m = 0; m < nm; ++m) {
+            auto& mk = ms.markers[m];
+            const double dFx = (0.0 - mk.ux) / dt;   // ρ=1 格子单位
+            const double dFy = (0.0 - mk.uy) / dt;
+            mk.fx = dFx;          // 暂存增量，供 spread_force() 使用
+            mk.fy = dFy;
+            total_lag_fx[m] += dFx;   // 累加到 Lagrangian 总力
+            total_lag_fy[m] += dFy;
         }
 
-        // Step (3): 展布 δF 到 Euler 网格
-        spread_force(fluid, ms, dx, kernel);    // 写入 fluid.force
-        std::swap(fluid.force, dF_euler);       // dF_euler = δf^(ℓ)
+        // ── Step 1（展布）：spread(Δg^(ℓ)) → δf^(ℓ)(x) ─────────────
+        // 对应：2011 Eq.22
+        //   δf^(ℓ)(x) = Σ_k Δg^(ℓ)_k · W(x - X_k) · ΔS_k
+        //
+        // spread_force() 读取 mk.fx/fy（增量力）和 mk.ds（弧长元素 ΔS_k），
+        // 将结果写入 fluid.force，然后 swap 到 dF_euler 保存。
+        std::fill(dF_euler.begin(), dF_euler.end(), 0.0);
+        spread_force(fluid, ms, dx, kernel);   // 写入 fluid.force
+        std::swap(fluid.force, dF_euler);      // dF_euler ← δf^(ℓ)(x)
 
-        // Step (4): u^(ℓ+1) = u^(ℓ) + dt · δf^(ℓ)
+        // ── Step 2（修正欧拉速度）：u^(ℓ+1) = u^(ℓ) + Δt·δf^(ℓ) ────
+        // 对应：2011 Eq.23（格子单位 Sh/Δt=1）
         for (int i = 0; i < n; ++i) {
-            u_work[i*d+0] += dt * dF_euler[i*d+0];
-            u_work[i*d+1] += dt * dF_euler[i*d+1];
+            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
+            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
         }
 
-        // Step (5): 累积
-        for (int i = 0; i < n*d; ++i) F_total[i] += dF_euler[i];
-    }
+        // ── 累积欧拉总力：g^(L)(x) = Σ_ℓ δf^(ℓ)(x) ─────────────────
+        for (int i = 0; i < n * d; ++i) {
+            F_total[i] += dF_euler[i];
+        }
+    }   // end of iter loop
 
-    fluid.force = F_total;   // 最终总力写入 fluid.force（供 Guo 体力格式）
+    // ================================================================
+    // 写出最终结果
+    // ================================================================
+
+    // 欧拉总体力 → fluid.force（供下一步 collide 中 Guo 格式使用）
+    fluid.force = F_total;
+
+    // Lagrangian 总体力 → mk.fx/fy（供 FSI 合力统计 §14 使用）
+    // 重要：这里写的是各迭代增量之和，而非末次迭代增量。
+    // 末次迭代增量趋近于零（已收敛），仅用其会严重低估合力。
+    for (int m = 0; m < nm; ++m) {
+        ms.markers[m].fx = total_lag_fx[m];
+        ms.markers[m].fy = total_lag_fy[m];
+    }
 }
 ```
 
-**关键实现技巧**：使用 `std::swap(fluid.u, u_work)` 临时替换速度场，避免额外的数据拷贝。
+---
+
+### 5.4 完整时间步流程（MDF-IBM + LBM 全耦合）
+
+以下是一个完整时间步的执行顺序，结合代码调用关系说明各部分如何衔接。
+
+```
+时间步 n → n+1（main.rs: run_loop）
+─────────────────────────────────────────────────────────────────────
+① solver.step(grid)
+   ├── collide()                     ← 使用 fluid.force（来自上步 IBM）
+   │     BGK: f_a* = f_a - ω(f_a - f_eq)
+   │     Guo: f_a* += w_a(1-ω/2) [(c_a-u)/cs² + (c_a·u)c_a/cs⁴]·F  [见§5.4.1]
+   ├── stream()                      ← 传播 f*，计算 u^{n+1} = Σ f_a c_a / ρ
+   └── apply_BC() + compute_macroscopic()
+
+   → fluid.u 更新为 u^* = u^{n+1}（stream 后、IBM 力修正前）
+
+② grid.zero_force()                  ← 清零 fluid.force
+
+③ ms.step_mdf(grid, dx, dt, n_iter)  ← 本节实现
+   = lbm_ibm_compute_mdf(g, ms, dx, dt, n_iter)
+   → 读取 fluid.u（= u^*），执行 N_F 次子迭代
+   → 写入 fluid.force = g^(L)(x)（总欧拉体力）
+   → 写入 mk.fx/fy = g^(L)_k（总 Lagrangian 力）
+
+④ （MPI）ibm_halo_reduce_force_2d()  ← 归并幽灵行力贡献
+
+   → 此时 fluid.force 包含下一步 collide 所需的 IBM 体力
+
+⑤ 时间步循环返回 ①
+```
+
+**关键耦合点**：IBM 力 `fluid.force` 在 `step()` 的 `collide()` 中**同步消费**（Guo 格式），而不是在 stream 后修正 `fluid.u`。这与 2011 paper 的 Eq.17 完全吻合：LBM 的体力直接修正分布函数 $f_i$，宏观速度通过 $\mathbf{u} = \sum f_i \mathbf{c}_i / \rho + \Delta t \mathbf{g} / (2\rho)$ 隐含修正。
+
+#### 5.4.1 Guo 体力格式（`solver.cpp: apply_guo_forcing`）
+
+2011 paper Eq.17 的 LBM 体力修正项 $3\Delta x E_i \mathbf{c}_i \cdot \mathbf{g}$ 对应标准 Guo et al. (2002) 格式（格子单位 $\Delta x = \Delta t = 1$，$c_s^2 = 1/3$）：
+
+$$F_\alpha = w_\alpha \left(1 - \frac{\omega}{2}\right) \left[\frac{\mathbf{c}_\alpha - \mathbf{u}}{c_s^2} + \frac{(\mathbf{c}_\alpha \cdot \mathbf{u})\mathbf{c}_\alpha}{c_s^4}\right] \cdot \mathbf{F}  \tag{Guo 2002}$$
+
+代码（`solver.cpp:385–403`）：
+
+```cpp
+// apply_guo_forcing(node, w_a, c_a, F, &f_a)
+constexpr double cs2 = 1.0/3.0, cs4 = 1.0/9.0;
+double cu = Σ c_a[α] * u[α];                                // c_a · u
+double term = Σ ((c_a[α]-u[α])/cs2 + cu*c_a[α]/cs4) * F[α]; // 矢量内积
+*f_a += w_a * (1.0 - 0.5*ω) * term;                         // Guo 修正
+```
+
+---
+
+### 5.5 δ 函数实现细节（`delta_phi`，对应论文中的 $W$）
+
+**2008 paper Eq.(14)–(15)** 采用 Griffith & Peskin (2005) 的四点核：
+
+$$\phi_h(r) = \begin{cases}
+\dfrac{1}{8}\!\left(3 - 2|r| + \sqrt{1 + 4|r| - 4r^2}\right) & 0 \leq |r| < 1 \\[6pt]
+\dfrac{1}{8}\!\left(5 - 2|r| - \sqrt{-7 + 12|r| - 4r^2}\right) & 1 \leq |r| < 2 \\[4pt]
+0 & |r| \geq 2
+\end{cases}$$
+
+本项目使用的是数学上等价但形式不同的 **Peskin 余弦核**（`DeltaKernel::FourPoint`），也是四点支撑宽度的最常用写法：
+
+$$\phi_h(r) = \frac{1}{4h}\left(1 + \cos\!\frac{\pi r}{2h}\right), \quad |r| \leq 2h  \tag{代码 interpolation.cpp:31–36}$$
+
+两者均为 $C^1$ 连续，**满足矩条件**（归一化、保守性）：$\sum_j \phi_h(x_j - X_k) \Delta x = 1$。
+
+**二维 δ 函数（乘积形式）**（2008 paper Eq.14，2011 paper Eq.19）：
+
+$$W(\mathbf{x} - \mathbf{X}_k) = \phi_h(x - X_k^x) \cdot \phi_h(y - X_k^y)  \tag{张量积}$$
+
+代码（`interpolation.cpp:88–91` 插值，`141–146` 展布）：
+
+```cpp
+// 插值中的权重（×Δx²，对应论文中 ΔV = Δx² 的积分元素）
+const double phi_x = delta_phi(mk.x - ii*dx, dx, kernel);
+const double phi_y = delta_phi(mk.y - jj*dx, dx, kernel);
+const double phi   = phi_x * phi_y * dx * dx;   // W·Δx²
+
+// 展布中的权重（×ΔS_k，对应论文中 ΔV_k = mk.ds）
+const double phi = phi_x * phi_y * mk.ds;        // W·ΔS_k
+```
+
+> **注意插值与展布的权重不同**：
+> - 插值（J 算子）：权重 = $W \cdot \Delta x^2$（欧拉积分元素）
+> - 展布（J^T 算子）：权重 = $W \cdot \Delta S_k$（Lagrangian 弧长元素）
+>
+> 这是 IBM 中 J 与 J^T 的**伴随关系**（adjoint property），保证了动量守恒：
+> $\sum_j f_j^{\rm IBM} \Delta x^2 = \sum_k F_k \Delta S_k$（2008 paper §2.1）。
+
+**支撑范围循环**（`interpolation.cpp:77–96`）：
+
+```cpp
+const int support = (kernel == DeltaKernel::FourPoint) ? 2 : 1;
+// i0, j0 = floor(mk.x/dx), floor(mk.y/dx)（左下角格点）
+for (int dj = -support; dj <= support + 1; ++dj)    // 4 点：dj ∈ {-2,-1,0,1,2,3}?
+    for (int di = -support; di <= support + 1; ++di)  //    注：实为 [-2,+2) 共4格
+```
+
+> **循环范围说明**：`dj ∈ {-support, …, support+1}` 即 `{-2,-1,0,1}`（FourPoint 时），覆盖以 `floor(xm)` 为左边界的 4 格支撑区间 $[i_0-1, i_0+2]$，对应 Peskin 核的 $[-2h, +2h]$ 支撑。
+
+---
+
+### 5.6 `interpolate_velocity`：Lagrangian 点插值（J 算子）
+
+对应 2011 paper Eq.(24)，2008 paper Eq.(17)（`interpolation.cpp:43–102`）：
+
+$$\mathbf{U}^{(\ell)}_k = \mathbf{u}^{(\ell)}(\mathbf{X}_k) = \sum_{\mathbf{x}_j \in \mathcal{S}(k)} \mathbf{u}^{(\ell)}(\mathbf{x}_j) \cdot W(\mathbf{x}_j - \mathbf{X}_k) \cdot \Delta x^2  \tag{J 算子}$$
+
+```cpp
+// 伪代码摘要：
+for (int m = 0; m < ms.size(); ++m) {
+    MPI归属过滤（owner_i/j_lo/hi）;           // 仅本进程负责的标记点
+    for di, dj in support_range:              // 4×4 = 16 个邻近格点
+        phi = delta_phi(Δx)*delta_phi(Δy)*dx²;
+        ux_sum += fluid.u[node*2+0] * phi;   // Σ u_j · W_jk · Δx²
+        uy_sum += fluid.u[node*2+1] * phi;
+    mk.ux = ux_sum;  mk.uy = uy_sum;        // 写入 U^(ℓ)_k
+}
+```
+
+**注意**：固体节点（`grid.solid[node] == true`）被跳过，避免固体内部的无效速度参与插值。
+
+---
+
+### 5.7 `spread_force`：力展布（J^T 算子）
+
+对应 2011 paper Eq.(22)，2008 paper Eq.(19)（`interpolation.cpp:107–159`）：
+
+$$\delta\mathbf{f}^{(\ell)}(\mathbf{x}_j) = \sum_{k=1}^{N} \Delta\mathbf{g}^{(\ell)}_k \cdot W(\mathbf{x}_j - \mathbf{X}_k) \cdot \Delta S_k  \tag{J^T 算子}$$
+
+```cpp
+// 伪代码摘要（散射操作）：
+std::fill(grid.force, 0.0);                 // 清零
+for (int m = 0; m < ms.size(); ++m) {
+    MPI归属过滤;
+    for di, dj in support_range:
+        phi = delta_phi(Δx)*delta_phi(Δy)*mk.ds;  // W_jk · ΔS_k
+        grid.force[node*2+0] += mk.fx * phi;      // Σ_k Δg_k · W · ΔS
+        grid.force[node*2+1] += mk.fy * phi;
+}
+```
+
+**OpenMP 原子操作**：展布是散射操作（多个标记点写同一欧拉节点），并行时需加 `#pragma omp atomic`。
+
+---
+
+### 5.8 FSI 合力计算（`compute_ibm_body_force`，§14）
+
+根据 2011 paper Eq.(5)（符号相反）：
+
+$$\mathbf{F}_{\rm solid} = -\int_{\Omega} \mathbf{g}(\mathbf{x}) \, d\mathbf{x} \approx -\sum_{k} \mathbf{g}^{(L)}_k \cdot \Delta S_k$$
+
+代码（`interpolation.cpp:1227–1244`）：
+
+```cpp
+// compute_ibm_body_force(ms, out_fx, out_fy)
+for (int m = 0; m < ms.size(); ++m)
+    fx += mk.fx * mk.ds;    // Σ g^(L)_k · ΔS_k（施加到流体上的合力）
+    fy += mk.fy * mk.ds;
+// 固体所受合力 = (-fx, -fy)（牛顿第三定律，调用方取反）
+```
+
+> **为何必须累加各迭代 Lagrangian 力**（而非仅取末次迭代值）：  
+> 末次迭代增量 $\Delta\mathbf{g}^{(N_F-1)}_k \to 0$（已收敛），若只用末次值则合力≈0。  
+> 应使用累积总力 $\mathbf{g}^{(L)}_k = \sum_\ell \Delta\mathbf{g}^{(\ell)}_k$，这在 `compute_ibm_forces_mdf` 中已通过 `total_lag_fx/fy` 正确实现。
+
+---
+
+### 5.9 C API 与 Rust 绑定封装
+
+**C API**（`lbm_capi.cpp:1248–1268`）：
+
+```cpp
+void lbm_ibm_compute_mdf(LatticeGrid* g, IbmMarkerSetHandle* ms,
+                          double dx, double dt, int n_iter)
+{
+    // 多体支持：先保存前序 IBM 体的力，计算后累加
+    std::vector<double> pre_force = g->force;
+    ibm::compute_ibm_forces_mdf(*g, *marker_set, dx, dt, n_iter);
+    for (size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];    // 多体合并
+}
+```
+
+**Rust 封装**（`bindings/src/lib.rs:1277–1280`）：
+
+```rust
+pub fn step_mdf(&mut self, grid: &mut LbmGrid, dx: f64, dt: f64, n_iter: i32) {
+    unsafe { ffi::lbm_ibm_compute_mdf(grid.ptr, self.ptr, dx, dt, n_iter) }
+}
+```
+
+**典型调用**（`main.rs: step_ibm`）：
+
+```rust
+fn step_ibm(cfg, grid, ibm_entries) {
+    grid.zero_force();                                     // 清零上步残留
+    for entry in ibm_entries {
+        entry.ms.step_mdf(grid, 1.0, cfg.dt, entry.n_iter); // N_F 次子迭代
+    }
+}
+// 调用时机：solver.step(grid) 之后，下次 solver.step 的 collide() 之前
+```
+
+---
+
+### 5.10 数值参数建议与收敛性
+
+| 参数 | 推荐值 | 说明 |
+|------|-------|------|
+| `n_iter`（$N_F$）| 3–5 | 2008 Fig.1 显示 $N_F=5$ 时 $\ell_2$ 误差降至 $\sim10^{-6}$；$N_F=20$ 达 $\sim10^{-6}$ |
+| `kernel` | `FourPoint` | 4 点 Peskin 核，$C^1$ 连续，满足矩条件 |
+| `dt` | $\leq$ Ma·$c_s$ 稳定范围 | 格子单位下通常 = 1.0 |
+| `dx` | 1.0 | 格子单位 |
+| Lagrangian 点间距 | $\approx \Delta x$（圆周上） | $\Delta S_k = 2\pi R / N \approx \Delta x$，防止"漏洞" |
+
+**时间步内力的生效顺序**：IBM 力在时间步 $n$ 末尾写入 `fluid.force`，在时间步 $n+1$ 的 `collide()` 中通过 Guo 格式生效——即 **IBM 力超前一步**施加，这是显式耦合方案（explicit coupling）的固有特性。
 
 ---
 
@@ -1018,6 +1396,20 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 ### 18.6 ✅ GMRES 收敛判据（设计合理）
 
 初始绝对判据 `if (beta < tol)` 防止零右端向量情况。后续迭代内使用相对判据 `|g[j+1]| < tol * beta`。对 `tol = 1e-14`，实测结果见 `test_mls_implicit_machine_precision`：32 次迭代后 `max_res = 1.08e-16` ≈ double ε。
+
+### 18.7 ✅ MDF：Lagrangian 标记点力累加修正（已修复）
+
+**问题**（已修复）：原实现中，每次子迭代直接用 `mk.fx = dFx` 覆盖标记点力，导致 `mk.fx/fy` 在 $N_F > 1$ 时仅保存末次迭代增量 $\Delta\mathbf{g}^{(N_F-1)}_k \to 0$（收敛后趋近于零）。`compute_ibm_body_force()` 随即返回近零 FSI 合力，严重低估阻力/升力。
+
+**根因**：$\mathbf{g}^{(L)}_k = \sum_\ell \Delta\mathbf{g}^{(\ell)}_k$（各迭代增量之和）才是正确的 Lagrangian 总体力（2008 paper Eq.27 及 2011 paper §3.2），而非末次增量。
+
+**修复方案**（`interpolation.cpp: compute_ibm_forces_mdf`）：
+- 新增 `total_lag_fx[m]`/`total_lag_fy[m]` 累加器，每次迭代同步累加。
+- `mk.fx/fy` 在迭代内临时保存增量（供 `spread_force()` 使用），迭代结束后将累加总力写回 `mk.fx/fy`。
+
+**欧拉力场 `fluid.force` 不受影响**（始终正确，为各增量展布之和）。
+
+**验证**：新增测试 `test_mdf_marker_force_accumulates`：3 次迭代后 `rms(mk.fx)` 与 1 次迭代量级相当（均非零），而修复前 3 次迭代后值趋近于 0。
 
 ---
 

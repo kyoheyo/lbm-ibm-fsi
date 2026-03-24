@@ -305,6 +305,67 @@ static int test_mdf_ibm_force_finite()
     return ok ? 0 : 1;
 }
 
+// 测试 9b：MDF-IBM 标记点力正确累加（论文要求 mk.fx = Σ 各迭代增量之和）
+//
+//   验证：多次子迭代后，mk.fx 存储的是各次迭代增量的累积总和，
+//   而非仅最后一次迭代的增量值（否则 FSI 合力将严重低估）。
+//
+//   方法：
+//     1. 流场均匀 ux=0.05，调用 1 次迭代 MDF → 得到参考力 f1。
+//     2. 同样流场，调用 3 次迭代 MDF → 得到多迭代力 fm。
+//     3. 第一次迭代增量 ≈ f1（因初始 u_work 相同）。
+//     4. 多迭代累积力 fm ≥ f1（后续迭代修正残余误差时仍有正贡献）。
+//        若 mk.fx 未累加（仅存末次增量），则 fm ≈ 0（收敛后末次增量趋近于 0），
+//        这是严重错误，本测试可检出。
+static int test_mdf_marker_force_accumulates()
+{
+    const int nx = 32, ny = 32;
+    const double ux0 = 0.05;
+
+    // 1 次迭代
+    lbm::LatticeGrid g1(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g1.size(); ++i) {
+        g1.u[i * 2 + 0] = ux0;
+        g1.u[i * 2 + 1] = 0.0;
+        g1.rho[i] = 1.0;
+    }
+    auto ms1 = ibm::MarkerSet::make_circle(16.0, 16.0, 3.0, 16);
+    ibm::compute_ibm_forces_mdf(g1, ms1, 1.0, 1.0, 1, ibm::DeltaKernel::FourPoint);
+
+    // 3 次迭代
+    lbm::LatticeGrid g3(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    for (int i = 0; i < g3.size(); ++i) {
+        g3.u[i * 2 + 0] = ux0;
+        g3.u[i * 2 + 1] = 0.0;
+        g3.rho[i] = 1.0;
+    }
+    auto ms3 = ibm::MarkerSet::make_circle(16.0, 16.0, 3.0, 16);
+    ibm::compute_ibm_forces_mdf(g3, ms3, 1.0, 1.0, 3, ibm::DeltaKernel::FourPoint);
+
+    // 计算两种情况下标记点力的均方根值
+    double rms1 = 0.0, rms3 = 0.0;
+    for (int m = 0; m < ms1.size(); ++m) {
+        rms1 += ms1.markers[m].fx * ms1.markers[m].fx
+              + ms1.markers[m].fy * ms1.markers[m].fy;
+        rms3 += ms3.markers[m].fx * ms3.markers[m].fx
+              + ms3.markers[m].fy * ms3.markers[m].fy;
+    }
+    rms1 = std::sqrt(rms1 / ms1.size());
+    rms3 = std::sqrt(rms3 / ms3.size());
+
+    // 验证：3 次迭代的标记点力应与 1 次迭代的量级相当（均不趋近于零）。
+    // 若 mk.fx 仅保存末次迭代增量，3 次迭代后末次增量趋近于 0，rms3 << rms1。
+    const bool nonzero1 = (rms1 > 1e-6);
+    const bool nonzero3 = (rms3 > 1e-6);
+    // 多迭代后合力应不小于单次迭代的 50%（累积修正）
+    const bool accumulated = (rms3 >= 0.5 * rms1);
+
+    std::printf("[IBM] MDF marker force: 1-iter rms=%.4e, 3-iter rms=%.4e → %s\n",
+                rms1, rms3,
+                (nonzero1 && nonzero3 && accumulated) ? "PASS" : "FAIL");
+    return (nonzero1 && nonzero3 && accumulated) ? 0 : 1;
+}
+
 // 测试 10：MLS 插值速度在支撑域内存在流体节点时可正常返回有限值
 static int test_mls_interpolate_finite()
 {
@@ -802,6 +863,7 @@ int test_ibm_main()
     failures += test_cylinder_bb_noslip();
     failures += test_cylinder_ibb_vs_bb();
     failures += test_mdf_ibm_force_finite();
+    failures += test_mdf_marker_force_accumulates();
     failures += test_mls_interpolate_finite();
     failures += test_mls_uniform_field_exact();
     // 新增测试：固体受力统计（MEA）和罚函数 IBM

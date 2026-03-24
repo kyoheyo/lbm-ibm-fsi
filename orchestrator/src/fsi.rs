@@ -327,7 +327,7 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             "mls"          => "MLS-IBM (implicit MLS, JCP 2025, n_iter=3)".to_string(),
             "mls_original" => "MLS-IBM original (Algorithm 1, JCP 2025)".to_string(),
             "mls_explicit" => "MLS-IBM explicit+Z (Algorithm 2, JCP 2025)".to_string(),
-            _              => format!("MDF-IBM (multi-direct-forcing, Luo 2007, n_iter={})", ibm_cfg.n_iter),
+            _              => format!("MDF-IBM (multi-direct-forcing, Wang 2008, n_iter={})", ibm_cfg.n_iter),
         };
         println!(
             "  [IBM] scheme: {}  delta kernel: {}  bodies: {}",

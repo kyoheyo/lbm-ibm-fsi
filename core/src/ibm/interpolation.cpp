@@ -160,6 +160,23 @@ void spread_force(lbm::LatticeGrid& grid,
 
 // ===========================================================================
 // 多重直接力法（MDF-IBM）
+//
+// 实现参考：
+//   Wang et al. (2008) Int. J. Multiphase Flow 34:283–302   — 原始 MDF 方法
+//   Suzuki & Inamuro (2011) Comput. Fluids 49:173–187       — MDF 的 LBM 版本
+//
+// 算法（LBM 格子单位，Dx = Dt = 1）：
+//   Step 0：g₀(Xₖ) = Uₖ − u*(Xₖ)
+//   迭代 l = 0 … n_iter−1：
+//     Step 1：将 gₗ(Xₖ) 展布到欧拉网格：gₗ(x) = Σₖ gₗ(Xₖ)·W(x−Xₖ)·ΔV
+//     Step 2：修正工作速度：u_{l+1}(x) = u*(x) + Σᵢ≤ₗ gᵢ(x)
+//     Step 3：插值：uₗ(Xₖ) = Σₓ uₗ(x)·W(x−Xₖ)·Δx²
+//     Step 4：更新拉格朗日力：g_{l+1}(Xₖ) = gₗ(Xₖ) + (Uₖ − uₗ(Xₖ))
+//   最终欧拉体力 = Σₗ spread(gₗ − g_{l-1}) = spread(g_{n_iter})
+//   最终拉格朗日力 = g_{n_iter}(Xₖ) = Σₗ 各迭代增量之和 → 存入 mk.fx/fy
+//
+// 注意：mk.fx/fy 在本函数返回后保存的是各迭代增量的累加总和（即拉格朗日总体力
+// g_L(Xₖ)），供 compute_ibm_body_force() 等 FSI 接口使用。
 // ===========================================================================
 void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
                              MarkerSet& ms,
@@ -174,59 +191,73 @@ void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
 
     const int n = fluid.size();
     const int d = fluid.dim();   // = 2
+    const int nm = ms.size();
 
-    // 工作速度场（子迭代过程中被逐步修正）
+    // 工作速度场 u_work：从 u* 出发，每次子迭代后叠加展布力修正。
+    // 对应论文 Step 2 的虚拟流速场，用于插值评估收敛程度。
     std::vector<double> u_work = fluid.u;
 
-    // 累积欧拉力场（最终写入 fluid.force）
+    // 累积欧拉力场 F_total：各迭代增量展布结果之和，最终写入 fluid.force。
+    // 等价于论文中最终拉格朗日力 g_L 展布到欧拉网格的结果。
     std::vector<double> F_total(n * d, 0.0);
 
-    // 初始化标记点力为零
-    for (auto& mk : ms.markers) { mk.fx = mk.fy = 0.0; }
+    // 拉格朗日力累加器：各迭代增量之和 = g_L(Xₖ)，供 FSI 反作用力计算。
+    // 这是论文中 mk.fx/fy 应存储的正确值（总合力，而非末次迭代增量）。
+    std::vector<double> total_lag_fx(nm, 0.0);
+    std::vector<double> total_lag_fy(nm, 0.0);
 
-    // 临时力场（每次子迭代的增量展布结果）
+    // 临时力场：每次子迭代的增量展布结果 spread(Δgₗ)
     std::vector<double> dF_euler(n * d, 0.0);
 
     for (int iter = 0; iter < n_iter; ++iter) {
-        // 1. 用 u_work 插值标记点速度（临时将 fluid.u 设为 u_work）
-        //    无需拷贝：直接 swap，插值后再 swap 回来
+        // Step 1 & 3：用 u_work 插值标记点速度
+        //   对应论文：u*(x) → 插值 → u*(Xₖ)（第 0 次）或 uₗ(x) → 插值 → uₗ(Xₖ)
+        //   无需拷贝：直接 swap，插值后再 swap 回来
         std::swap(fluid.u, u_work);
         interpolate_velocity(fluid, ms, dx, kernel);
         std::swap(fluid.u, u_work);
 
-        // 2. 计算增量力（刚体目标速度 = 0；如需移动边界，在此修改 target）
-        for (auto& mk : ms.markers) {
+        // Step 0 / Step 4：计算本次迭代增量力 Δgₗ(Xₖ) = Uₖ − uₗ(Xₖ)
+        //   刚体静止目标速度 Uₖ = 0；如需移动边界，可将 0.0 替换为 mk.ux_target 等。
+        for (int m = 0; m < nm; ++m) {
+            auto& mk = ms.markers[m];
             const double dFx = (0.0 - mk.ux) / dt;   // ρ=1 格子单位假设
             const double dFy = (0.0 - mk.uy) / dt;
-            mk.fx = dFx;   // 临时存放增量（不累加到 markers，最后由 F_total 覆盖）
+            // 暂存增量到 mk.fx/fy 供 spread_force() 使用（展布增量力，而非累积总力）
+            mk.fx = dFx;
             mk.fy = dFy;
+            // 同时累加到拉格朗日总力：g_L(Xₖ) = Σ Δgₗ(Xₖ)
+            total_lag_fx[m] += dFx;
+            total_lag_fy[m] += dFy;
         }
 
-        // 3. 将增量力展布到 dF_euler
+        // Step 1（展布）：将增量力 Δgₗ 展布到欧拉网格得到 dF_euler
         std::fill(dF_euler.begin(), dF_euler.end(), 0.0);
-        // 临时使用 fluid.force 作为展布目标，然后移走
-        spread_force(fluid, ms, dx, kernel);  // writes to fluid.force
-        std::swap(fluid.force, dF_euler);     // dF_euler = 本次增量展布结果
+        spread_force(fluid, ms, dx, kernel);  // 写入 fluid.force（使用 mk.fx/fy 增量）
+        std::swap(fluid.force, dF_euler);     // dF_euler = spread(Δgₗ)
 
-        // 4. 更新工作速度：u_work += dt · dF_euler / ρ（ρ=1）
+        // Step 2：更新工作速度：u_work += Δgₗ(x)·dt（等价于 u_{l+1} = u* + Σᵢ≤ₗ gᵢ(x)）
         for (int i = 0; i < n; ++i) {
             u_work[i * d + 0] += dt * dF_euler[i * d + 0];
             u_work[i * d + 1] += dt * dF_euler[i * d + 1];
         }
 
-        // 5. 累积总欧拉力
+        // 累积总欧拉力：F_total = Σₗ spread(Δgₗ) = spread(g_L)
         for (int i = 0; i < n * d; ++i) {
             F_total[i] += dF_euler[i];
         }
     }
 
-    // 写入最终总力到 fluid.force（供 Guo 体力格式在 collide 步使用）
+    // 写入最终总欧拉力到 fluid.force（供 Guo 体力格式在 collide 步使用）
     fluid.force = F_total;
 
-    // 同步标记点力（近似：取最后一次子迭代的值重新展布前的 mk.fx/fy）
-    // 为了提供更好的力信息，重新从 F_total 反推。此处保持 mk.fx/fy
-    // 为最后一次子迭代的增量值（已足够用于 FSI 反作用力计算）。
-    // 如需精确 marker force，调用方可在此之后额外调用 interpolate+compute。
+    // 将累积拉格朗日总力 g_L(Xₖ) 写入 mk.fx/fy。
+    // 这是各迭代增量之和，等价于论文中的 g_L(Xₖ)，正确用于：
+    //   compute_ibm_body_force() → Σ mk.fx·mk.ds（FSI 合力）
+    for (int m = 0; m < nm; ++m) {
+        ms.markers[m].fx = total_lag_fx[m];
+        ms.markers[m].fy = total_lag_fy[m];
+    }
 }
 
 // ===========================================================================
