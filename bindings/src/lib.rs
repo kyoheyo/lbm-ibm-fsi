@@ -1132,7 +1132,7 @@ pub fn mpi_allreduce_sum_f64(local_val: f64) -> f64 {
 /// `ibm::MarkerSet` 的安全封装（Lagrangian 标记点集）。
 ///
 /// 封装了 IBM 三大方案的步进函数：
-/// - [`LbmIbmMarkerSet::step_mdf`]：多重直接力法（MDF-IBM，Luo 2007）
+/// - [`LbmIbmMarkerSet::step_mdf`]：多重直接力法（MDF-IBM，Wang 2008 / Suzuki & Inamuro 2011）
 /// - [`LbmIbmMarkerSet::step_penalty`]：罚函数反馈力法（Goldstein 1993）
 /// - [`LbmIbmMarkerSet::step_mls`]：移动最小二乘 + 直接力（Wang 2009）
 ///
