@@ -349,6 +349,55 @@ mod ffi {
         pub fn lbm_ibm_halo_reduce_force_2d(g: *mut LatticeGridHandle,
                                              h: *mut MpiDecomp2DHandle);
 
+        // --- 刚体求解器 C-API（RigidBodySolver2D）---
+        pub enum RigidBody2DHandle {}
+
+        /// 创建 2D 刚体求解器。scheme: 0=None,1=Uhlmann,2=Feng,3=Lagrangian
+        pub fn lbm_rigid2d_create(
+            mass: f64, inertia: f64,
+            rho_b: f64, rho_f: f64,
+            cx0: f64, cy0: f64,
+            scheme: c_int, is_closed: c_int,
+            ref_x: *const f64, ref_y: *const f64, n_bnd: c_int,
+            int_ref_x: *const f64, int_ref_y: *const f64, n_int: c_int,
+        ) -> *mut RigidBody2DHandle;
+        pub fn lbm_rigid2d_free(h: *mut RigidBody2DHandle);
+        pub fn lbm_rigid2d_get_state(h: *const RigidBody2DHandle,
+            cx: *mut f64, cy: *mut f64,
+            ux: *mut f64, uy: *mut f64,
+            theta: *mut f64, omega: *mut f64);
+        pub fn lbm_rigid2d_set_velocity(h: *mut RigidBody2DHandle,
+            ux: f64, uy: f64, omega: f64);
+        pub fn lbm_rigid2d_n_boundary(h: *const RigidBody2DHandle) -> c_int;
+        pub fn lbm_rigid2d_get_boundary_positions(h: *const RigidBody2DHandle,
+            out_x: *mut f64, out_y: *mut f64);
+        pub fn lbm_rigid2d_get_boundary_velocities(h: *const RigidBody2DHandle,
+            out_ux: *mut f64, out_uy: *mut f64);
+        pub fn lbm_rigid2d_n_internal(h: *const RigidBody2DHandle) -> c_int;
+        pub fn lbm_rigid2d_get_internal_positions(h: *const RigidBody2DHandle,
+            out_x: *mut f64, out_y: *mut f64);
+        pub fn lbm_rigid2d_set_internal_velocities(h: *mut RigidBody2DHandle,
+            ux: *const f64, uy: *const f64);
+        pub fn lbm_rigid2d_compute_internal_momentum(h: *mut RigidBody2DHandle);
+        pub fn lbm_rigid2d_advance(h: *mut RigidBody2DHandle,
+            total_fx: f64, total_fy: f64, total_torque: f64, dt: f64);
+
+        // --- IBM 移动体辅助函数 ---
+        pub fn lbm_ibm_compute_mdf_moving(g: *mut LatticeGridHandle,
+            ms: *mut IbmMarkerSetHandle,
+            dx: f64, dt: f64, n_iter: c_int,
+            target_ux: *const f64, target_uy: *const f64);
+        pub fn lbm_ibm_compute_body_force_torque(
+            ms: *const IbmMarkerSetHandle,
+            cx: f64, cy: f64,
+            out_fx: *mut f64, out_fy: *mut f64, out_torque: *mut f64);
+        pub fn lbm_ibm_interpolate_only(g: *const LatticeGridHandle,
+            ms: *mut IbmMarkerSetHandle, dx: f64);
+        pub fn lbm_ibm_get_marker_velocities(ms: *const IbmMarkerSetHandle,
+            out_ux: *mut f64, out_uy: *mut f64);
+        pub fn lbm_ibm_update_marker_positions(ms: *mut IbmMarkerSetHandle,
+            x: *const f64, y: *const f64, n: c_int);
+
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
         // Rust 安全封装: register_plugins()（见本文件底部）
