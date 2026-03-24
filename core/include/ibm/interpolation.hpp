@@ -361,6 +361,95 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
                                                  double u_target_y = 0.0);
 
 // ===========================================================================
+// 隐式速度校正 IBM（IVC-IBM，Implicit Velocity Correction）
+//
+// 参考：Wu J. & Shu C. (2009) J. Comput. Phys. 228:1963–1979
+//   "Implicit velocity correction-based immersed boundary-lattice Boltzmann
+//    method and its applications"
+//
+// 核心思想（Wu & Shu 2009 §3）：
+//   在 Guo 体力 LBM 框架下，流体速度可分解为中间速度 u* 与速度修正 δu：
+//     ρu  = Σ_α e_α f_α + (1/2) f dt   （Eq.17）
+//     ρu* = Σ_α e_α f_α                （Eq.18，中间速度）
+//     ρδu = (1/2) f dt                  （Eq.19，速度修正量）
+//     u   = u* + δu                     （Eq.20）
+//   以边界点速度修正 δu_B^l 为未知量，通过 Peskin δ 展布与插值封闭方程组，
+//   强制满足非滑移边界条件 u(X_B^l) = U_B^l。
+//
+// 方程组（AX=B，Eq.28–29）：
+//   A_{lk} = Σ_{i,j} D_ij^l · D_ij^k · Δs_k · Δx²
+//   B^l    = U_B^l − Σ_{i,j} u*(x_ij) · D_ij^l · Δx²
+//   X      = {δu_B^1, δu_B^2, …, δu_B^m}   （m 为边界点数）
+//   其中 D_ij^l = d(x_ij − X_B^l) · d(y_ij − X_B^l)（2D Peskin δ 核）
+//
+// 力密度（Eq.30）：
+//   f(x_ij) = (2ρ/dt) · δu(x_ij)  = (2ρ/dt) · Σ_l δu_B^l · D_ij^l · Δs_l
+//   f_B^l   = (2ρ/dt) · δu_B^l    （Lagrangian 力密度，供 FSI 合力计算）
+//
+// 求解步骤（algorithm §3 overview）：
+//   (1) 初始化：计算矩阵 A 并 LU 分解（固定物体只需做一次）。
+//   (2) LBM 步：collide+stream → 中间速度 u*。
+//   (3) 插值：u*(X_B^l) = Σ_{i,j} u*(x_ij) D_ij^l Δx²。
+//   (4) 构建 B：B^l = U_target^l − u*(X_B^l)。
+//   (5) 求解：A · δu_B = B（LU 代换，x/y 分量独立求解）。
+//   (6) 展布：f(x_ij) += (2/dt) · Σ_l δu_B^l · D_ij^l · Δs_l。
+//   (7) 写入 Lagrangian 力：f_B^l = (2/dt) · δu_B^l（供 compute_ibm_body_force）。
+//
+// 与其他方法的关系：
+//   ─ MDF-IBM：迭代修正，只近似满足非滑移，每步 O(n_iter · N_l)
+//   ─ IVC-IBM：精确满足非滑移，每步 O(N_l²)（LU 代换），固定物体更快
+//   ─ MLS-IBM（Scheme I/II）：使用 MLS 形状函数而非 Peskin δ，2025 JCP 精度更高
+//
+// @param fluid        Eulerian 流体网格（fluid.force 写入 IBM 体力）
+// @param ms           Lagrangian 标记点集（mk.fx/fy 写入 Lagrangian 力密度）
+// @param dx           格子间距（通常 = 1.0）
+// @param dt           时间步长（通常 = 1.0）
+// @param kernel       δ 核类型（默认 FourPoint，对应论文 Eq.22）
+// @param u_target_x/y 边界目标速度（静止固体取 0；移动固体取壁面速度）
+// ===========================================================================
+void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
+                              MarkerSet& ms,
+                              double dx,
+                              double dt             = 1.0,
+                              DeltaKernel kernel    = DeltaKernel::FourPoint,
+                              double u_target_x     = 0.0,
+                              double u_target_y     = 0.0);
+
+// ===========================================================================
+// 隐式速度校正 IBM（IVC-IBM）— 固定物体优化版（LU 缓存）
+//
+// 参考：Wu & Shu (2009) §3，算法步骤 (1)
+//
+// 对于几何固定（stationary）的浸入边界，矩阵 A 只取决于边界点位置和 δ 核，
+// 与流场无关，因此只需在首次调用时构建 A 并完成 LU 分解，后续每步仅执行：
+//   插值 u*(X_B^l) → 构建 B → LU 代换 → 展布力
+// 从而节省 O(N_l² · N_e) 的矩阵构建开销（N_e ≈ 16 为每个标记的支撑 Euler 节点数）。
+//
+// 用法示例（在时间循环外声明缓存，在循环内每步调用）：
+// @code
+//   std::vector<double> A_lu_cache;
+//   std::vector<int>    piv_cache;
+//   for (int step = 0; step < n_steps; ++step) {
+//       solver.step();
+//       compute_ibm_forces_ivc_stationary(fluid, ms, 1.0, 1.0,
+//                                          A_lu_cache, piv_cache);
+//   }
+// @endcode
+//
+// @param A_lu_cache  LU 分解缓存（首次调用时填充；传入空 vector 自动初始化）
+// @param piv_cache   行主元缓存（与 A_lu_cache 配套）
+// ===========================================================================
+void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
+                                        MarkerSet& ms,
+                                        double dx,
+                                        double dt,
+                                        std::vector<double>& A_lu_cache,
+                                        std::vector<int>&    piv_cache,
+                                        DeltaKernel kernel    = DeltaKernel::FourPoint,
+                                        double u_target_x     = 0.0,
+                                        double u_target_y     = 0.0);
+
+// ===========================================================================
 // IBM 固体受力统计：合力计算
 //
 // 通过对 Lagrangian 标记点的力密度加权求和，计算浸入固体所受的总合力：

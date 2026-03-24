@@ -1491,6 +1491,97 @@ void lbm_ibm_mls_stationary_cache_free(void** cache_handle)
     *cache_handle = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// IVC-IBM（隐式速度校正 IBM，Wu & Shu 2009）
+// ---------------------------------------------------------------------------
+
+/// 隐式速度校正 IBM 一步（IVC-IBM，Wu & Shu 2009）。
+///
+/// 以边界点速度修正 δu_B^l 为未知量，通过求解 m×m 线性方程组强制满足非滑移条件。
+/// 每步重建相关矩阵 A，适用于移动物体或需要每步更新 A 的场景。
+///
+/// 算法参考：J. Wu & C. Shu (2009) J. Comput. Phys. 228:1963–1979 §3
+///
+/// @param g          LatticeGrid 指针
+/// @param ms         IbmMarkerSet 句柄
+/// @param dx         格子间距（通常 = 1.0）
+/// @param dt         时间步长（通常 = 1.0）
+/// @param u_target_x 目标 x 速度（静止固体取 0.0；移动边界取壁面速度）
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_ivc(lbm::LatticeGrid* g,
+                           IbmMarkerSetHandle* ms,
+                           double dx, double dt,
+                           double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    // 多体支持：spread_force 内部先清零 g->force；先保存已有体力，计算后累加。
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_ivc(*g, *marker_set, dx, dt,
+                                  ibm::DeltaKernel::FourPoint,
+                                  u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 隐式速度校正 IBM 一步（IVC-IBM，固定物体，LU 分解缓存）。
+///
+/// 对几何固定的浸入边界，在首次调用时构建相关矩阵 A 并完成 LU 分解（缓存），
+/// 后续步骤直接用 LU 代换求解，避免每步重复构建矩阵（更高效）。
+///
+/// cache_handle 是指向持久化缓存对象的不透明指针：
+///   - 首次调用前传入 nullptr 的地址（*cache_handle == nullptr），函数自动分配并填充。
+///   - 后续调用传入相同指针（缓存已初始化，直接复用）。
+///   - 调用 lbm_ibm_ivc_stationary_cache_free() 释放缓存。
+///
+/// @param g              LatticeGrid 指针
+/// @param ms             IbmMarkerSet 句柄（标记点位置在整个仿真中必须固定）
+/// @param dx             格子间距
+/// @param dt             时间步长
+/// @param cache_handle   指向缓存句柄的指针（in/out；首次调用前 *cache_handle = nullptr）
+/// @param u_target_x/y   目标速度（静止固体取 0.0）
+struct IvcStationaryCache {
+    std::vector<double> A_lu;
+    std::vector<int>    piv;
+};
+
+void lbm_ibm_compute_ivc_stationary(lbm::LatticeGrid* g,
+                                      IbmMarkerSetHandle* ms,
+                                      double dx, double dt,
+                                      void** cache_handle,
+                                      double u_target_x, double u_target_y)
+{
+    if (!g || !ms || !cache_handle) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    // 懒惰分配缓存
+    if (*cache_handle == nullptr)
+        *cache_handle = new IvcStationaryCache();
+    auto* cache = reinterpret_cast<IvcStationaryCache*>(*cache_handle);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_ivc_stationary(
+        *g, *marker_set, dx, dt,
+        cache->A_lu, cache->piv,
+        ibm::DeltaKernel::FourPoint,
+        u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 释放由 lbm_ibm_compute_ivc_stationary() 分配的缓存。
+void lbm_ibm_ivc_stationary_cache_free(void** cache_handle)
+{
+    if (!cache_handle || !*cache_handle) return;
+    delete reinterpret_cast<IvcStationaryCache*>(*cache_handle);
+    *cache_handle = nullptr;
+}
+
 /// 从 MarkerSet 读取所有标记点的 Lagrangian 力（fx, fy）。
 /// out_fx/out_fy 长度须 ≥ lbm_ibm_marker_set_size()。
 void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* out_fy)
