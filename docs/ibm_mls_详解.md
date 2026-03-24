@@ -695,18 +695,18 @@ for (int i = N-1; i >= 0; --i) {
 
 | 算法步骤 | 公式 | 代码位置 |
 |---------|------|---------|
-| A1：构建传递算子 Φ | $\phi_j^k = w_j \mathbf{c}^T p_j$（Eq.10–14） | `build_mls_shape_functions()`（行 878） |
-| A2：重建 Lagrangian 速度 | $\mathbf{U}^* = J \mathbf{u}^*$（Eq.15） | `interpolate_with_phi()`（行 881） |
-| 构建 B | $B_k = (u_{\text{target}} - U_k^*) / \Delta t$（Eq.24c） | 行 883–896 |
-| C2：构建 A | $A_{ki} = \sum_j \phi_j^k c_i \phi_j^i$（Eq.28） | `build_correlation_matrix()`（行 900） |
-| C2：GMRES 求解 | $A \mathbf{F}^x = \mathbf{B}^x,\; A \mathbf{F}^y = \mathbf{B}^y$ | `gmres_dense_jacobi()`（行 907–908） |
-| A4：力展布 | $f_j = \sum_k c_k \phi_j^k F_k^b$（Eq.16） | `spread_with_phi()`（行 917） |
+| A1：构建传递算子 Φ | $\phi_j^k = w_j \mathbf{c}^T p_j$（Eq.10–14） | `build_mls_shape_functions()`（行 881） |
+| A2：重建 Lagrangian 速度 | $\mathbf{U}^* = J \mathbf{u}^*$（Eq.15） | `interpolate_with_phi()`（行 884） |
+| 构建 B | $B_k = (u_{\text{target}} - U_k^*) / \Delta t$（Eq.24c） | 行 886–899 |
+| C2：构建 A | $A_{ki} = \sum_j \phi_j^k c_i \phi_j^i$（Eq.28） | `build_correlation_matrix()`（行 903） |
+| C2：GMRES 求解 | $A \mathbf{F}^x = \mathbf{B}^x,\; A \mathbf{F}^y = \mathbf{B}^y$ | `gmres_dense_jacobi()`（行 917–918） |
+| A4：力展布 | $f_j = \sum_k c_k \phi_j^k F_k^b$（Eq.16） | `spread_with_phi()`（行 927） |
 | A5：速度更新 | $\mathbf{u}^{n+1} = \mathbf{u}^* + \Delta t \mathbf{f}$（由调用方执行） | solver.step() |
 
 ### 11.2 完整代码
 
 ```cpp
-// interpolation.cpp:861–919
+// interpolation.cpp:864–929
 void compute_ibm_forces_mls_implicit(fluid, ms, dx, dt,
                                       gmres_max_iter,  // 原 n_iter 参数
                                       u_target_x, u_target_y)
@@ -774,31 +774,33 @@ $$A \mathbf{F}^b = \frac{\mathbf{u}_{\text{target}} - \mathbf{U}^*}{\Delta t} = 
 ### 12.1 完整代码与逻辑
 
 ```cpp
-// interpolation.cpp:939–1001
+// interpolation.cpp:949–1025
 void compute_ibm_forces_mls_implicit_stationary(
     fluid, ms, dx, dt,
     A_lu_cache,   // LU 因子缓存（调用方持久化；空=尚未初始化）
     piv_cache,    // 主元缓存
+    phi_cache,    // MLS 形状函数缓存（调用方持久化；空=尚未初始化）
     u_target_x, u_target_y)
 {
-    // A1（每步均需执行，因为 phi_data 用于 A2 插值和 A4 展布）
-    std::vector<MlsSupportSet> phi_data;
-    build_mls_shape_functions(fluid, ms, dx, phi_data);
+    // A1：只在首次调用时构建 phi_cache（静止物体几何不变）
+    if (phi_cache.empty()) {
+        build_mls_shape_functions(fluid, ms, dx, phi_cache);
+    }
 
     // C1：仅在首次调用时构建 A 并完成 LU 分解（Scheme I 的核心优化）
     if (A_lu_cache.empty()) {
-        build_correlation_matrix(phi_data, ms, fluid.nx*fluid.ny, A_lu_cache);
+        build_correlation_matrix(phi_cache, ms, fluid.nx*fluid.ny, A_lu_cache);
         if (!lu_factor_dense(A_lu_cache, piv_cache, Nl)) {
             // 奇异矩阵（极少情况）：回退到 GMRES
-            A_lu_cache.clear(); piv_cache.clear();
+            A_lu_cache.clear(); piv_cache.clear(); phi_cache.clear();
             compute_ibm_forces_mls_implicit(fluid, ms, dx, dt, Nl, ...);
             return;
         }
         // A_lu_cache 现在存储 LU 分解结果（L\U 原地覆盖 A）
     }
 
-    // A2：U* = J·u*（每步必须，因为流体速度每步变化）
-    interpolate_with_phi(fluid, ms, phi_data);
+    // A2：U* = J·u*（每步必须，因为流体速度每步变化；使用缓存的 phi_cache）
+    interpolate_with_phi(fluid, ms, phi_cache);
 
     // 构建 B（每步必须）
     std::vector<double> Bx(Nl), By(Nl);
@@ -817,23 +819,24 @@ void compute_ibm_forces_mls_implicit_stationary(
         ms.markers[k].fy = By[k];
     }
 
-    // A4：展布力到 Eulerian 网格
-    spread_with_phi(fluid, ms, phi_data);
+    // A4：展布力到 Eulerian 网格（使用缓存的 phi_cache）
+    spread_with_phi(fluid, ms, phi_cache);
 }
 ```
 
 ### 12.2 使用示例
 
 ```cpp
-std::vector<double> A_lu_cache;   // 持久化 LU 缓存（时间循环外）
-std::vector<int>    piv_cache;
+std::vector<double>        A_lu_cache;   // 持久化 LU 缓存（时间循环外）
+std::vector<int>           piv_cache;
+std::vector<MlsSupportSet> phi_cache;    // 持久化 MLS 形状函数缓存
 
 for (int step = 0; step < n_steps; ++step) {
     solver.step();
     // 第 1 步：build_mls_shape_functions + build_correlation_matrix + LU
-    // 第 2..N 步：build_mls_shape_functions + LU 代换（复用缓存）
+    // 第 2..N 步：全部复用缓存（仅执行 interpolate + LU代换 + spread）
     compute_ibm_forces_mls_implicit_stationary(
-        fluid, ms, dx, dt, A_lu_cache, piv_cache);
+        fluid, ms, dx, dt, A_lu_cache, piv_cache, phi_cache);
 }
 ```
 
@@ -841,12 +844,12 @@ for (int step = 0; step < n_steps; ++step) {
 
 | 步骤 | Scheme II（GMRES，每步） | Scheme I（LU 缓存，第 2..N 步） |
 |------|------------------------|-------------------------------|
-| build_mls_shape_functions | $O(N_l \cdot N_e^2)$ | $O(N_l \cdot N_e^2)$ |
+| build_mls_shape_functions | $O(N_l \cdot N_e^2)$ | **仅第 1 步**（phi_cache 已缓存） |
 | build_correlation_matrix | $O(N_l \cdot N_e \cdot \bar{N}_i)$ | 仅第 1 步 |
 | LU 分解 / GMRES | $O(N_l^2 \cdot \text{iter})$ | 仅第 1 步 |
 | LU 代换 | — | $O(N_l^2)$ |
 
-> ⚠️ **已知性能局限（Scheme I）**：当前实现每步仍调用 `build_mls_shape_functions`，因为 `phi_data` 需用于 A2 插值和 A4 展布。对静止物体，`phi_data` 不随时间变化，可进一步缓存以消除此重复开销——这是一个已知的优化机会，需将 `MlsSupportSet` 暴露到公共头文件中。
+> **Scheme I 性能说明**：当前实现同时缓存 `phi_cache`（MLS 形状函数）和 `A_lu_cache`（LU 分解），因此对静止物体从第 2 步起每步开销仅为 $O(N_l^2)$ 的 LU 代换，无需重建 phi_data 或 A 矩阵。
 
 ---
 
@@ -925,7 +928,7 @@ void compute_ibm_body_force(const MarkerSet& ms, double& out_fx, double& out_fy)
 
 $$\text{offset}_x = \text{phys\_x0} - \text{x\_start}, \quad \text{offset}_y = \text{phys\_y0} - \text{y\_start}$$
 
-$$mk.x \mathrel{+}= \text{offset}_x, \quad mk.y \mathrel{+}= \text{offset}_x$$
+$$mk.x \mathrel{+}= \text{offset}_x, \quad mk.y \mathrel{+}= \text{offset}_y$$
 
 并设置 `owner_i_lo/hi = [phys_x0, phys_x0 + local_nx)`，用于 MPI 多进程下的标记点归属过滤。
 
@@ -978,23 +981,25 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 **修复**：代码已添加注释说明此约束（`interpolation.cpp:247–261`），防止误用于非对称矩阵。
 
-### 18.2 ⚠️ Scheme I 每步仍重建 phi_data（已知性能局限）
+### 18.2 ✅ Scheme I phi_data 缓存已实现
 
-**现象**：`compute_ibm_forces_mls_implicit_stationary` 在每步调用 `build_mls_shape_functions`，即便对静止物体 `phi_data` 不随时间变化。
+**现象**：`compute_ibm_forces_mls_implicit_stationary` 新增 `phi_cache` 参数（`std::vector<MlsSupportSet>&`），在首次调用时构建并缓存，后续步骤直接复用，避免重复 `build_mls_shape_functions`。
 
-**原因**：`phi_data` 需用于每步的 A2（速度插值）和 A4（力展布），当前 API 未缓存它；缓存需将 `MlsSupportSet` 暴露到公共头文件（API 变更）。
+**实现**：`phi_cache`、`A_lu_cache`、`piv_cache` 三个缓存均由调用方在时间循环外持久化，传入函数。首次调用时依次填充，后续步骤利用缓存零开销跳过构建阶段（仅执行 A2 插值 + LU 代换 + A4 展布）。
 
-**影响**：Scheme I 的 `build_mls_shape_functions` 开销 $O(N_l \cdot N_e^2)$ 与 `build_correlation_matrix` $O(N_l \cdot N_e^2)$ 同量级，实际加速比约 2× 而非理论上的无限加速比（第一步之后）。
+**状态**：✅ 已完成（见 `interpolation.cpp:949–1025`，`interpolation.hpp:310–330`）。
 
-**建议（未来优化）**：创建 `IbmStationaryCache` 结构体，同时缓存 `phi_data` + LU 分解。
+### 18.3 ✅ 隐式 MLS 在 MPI 多进程模式下已完整
 
-### 18.3 ⚠️ 隐式 MLS 在 MPI 多进程模式下不完整
+**已修复项目**：
 
-**现象**：`build_correlation_matrix` 仅使用本进程 `phi_data`（仅包含本进程拥有的标记点贡献）。不同进程上的标记点可能共享 Euler 支撑节点，但跨进程的 $A_{ki}$ 贡献未通过 `MPI_Allreduce` 汇聚。
+1. **Scheme I（固定物体）**：`build_correlation_matrix` 后对 `A_mat` 执行 `MPI_Allreduce(SUM)`，汇聚所有进程的局部贡献得到全局相关矩阵；构建 B 向量后同样 `MPI_Allreduce`（见 `interpolation.cpp:974–1011`）。
 
-**影响**：在 MPI 多进程模式下，每进程的 $A$ 矩阵是全局矩阵的子块，GMRES 求解结果仅对本进程拥有的标记点正确。
+2. **Scheme II（GMRES）**：同样对 `A_mat` 和 `B` 向量执行 `MPI_Allreduce`，确保每进程求解相同的全局系统（见 `interpolation.cpp:903–918`）。
 
-**当前状态**：单进程（非 MPI）模式下完全正确，已通过所有测试（测试均在 `ENABLE_MPI=OFF` 下运行）。MPI 多进程下的隐式 MLS 需额外实现 `MPI_Allreduce` 归约 $A$ 矩阵。
+3. **显式 MLS Z 因子**：`compute_ibm_forces_mls_explicit` 中 Z 因子分子/分母 `num`/`den` 执行 `MPI_Allreduce`，保证 Z 值在所有进程上一致（见 `interpolation.cpp:1122–1132`）。
+
+**当前状态**：✅ 三处均已修复，单进程和 MPI 多进程模式下均正确。
 
 ### 18.4 ✅ Peskin 与 MLS 使用不同的最近格点策略（设计合理）
 
@@ -1059,4 +1064,4 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 ---
 
-*文档生成日期：2026-03-23；对应代码版本：commit `70453e3`（interpolation.cpp 行 1–1397）*
+*文档生成日期：2026-03-24；对应代码版本：commit `3a23166`（interpolation.cpp 行 1–1440）*
