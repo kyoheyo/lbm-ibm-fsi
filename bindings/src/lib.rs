@@ -1191,6 +1191,7 @@ impl LbmIbmMarkerSet {
             n_markers: n,
             integral_x: vec![0.0; n],
             integral_y: vec![0.0; n],
+            ivc_cache:  std::ptr::null_mut(),
         }
     }
 

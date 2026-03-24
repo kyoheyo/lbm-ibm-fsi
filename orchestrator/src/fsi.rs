@@ -71,7 +71,7 @@ pub struct IbmEntry {
     pub label: String,
     /// 受力输出配置
     pub force_cfg: SolidForceOutputConfig,
-    /// IBM 力计算方法（`"mdf"` / `"mls"` / `"penalty"`）；来自体级覆盖或全局默认
+    /// IBM 力计算方法（`"mdf"` / `"mls"` / `"penalty"` / `"ivc"` / `"ivc_stationary"`）；来自体级覆盖或全局默认
     pub method: String,
     /// MDF 子迭代次数（`method="mdf"` 时有效）
     pub n_iter: i32,
@@ -320,14 +320,16 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
     // 首行显示全局默认方案；各体的具体方案在下方 [IBM] body[N] 行中逐一说明。
     if rank == 0 && !effective_bodies.is_empty() {
         let global_method_desc = match ibm_cfg.method.to_lowercase().as_str() {
-            "penalty"      => format!(
+            "penalty"          => format!(
                 "Penalty-IBM (Goldstein 1993, α={:.2}, β={:.2})",
                 ibm_cfg.alpha, ibm_cfg.beta,
             ),
-            "mls"          => "MLS-IBM (implicit MLS, JCP 2025, n_iter=3)".to_string(),
-            "mls_original" => "MLS-IBM original (Algorithm 1, JCP 2025)".to_string(),
-            "mls_explicit" => "MLS-IBM explicit+Z (Algorithm 2, JCP 2025)".to_string(),
-            _              => format!("MDF-IBM (multi-direct-forcing, Wang 2008, n_iter={})", ibm_cfg.n_iter),
+            "mls"              => "MLS-IBM (implicit MLS, JCP 2025, n_iter=3)".to_string(),
+            "mls_original"     => "MLS-IBM original (Algorithm 1, JCP 2025)".to_string(),
+            "mls_explicit"     => "MLS-IBM explicit+Z (Algorithm 2, JCP 2025)".to_string(),
+            "ivc"              => "IVC-IBM (implicit velocity correction, Wu & Shu 2009)".to_string(),
+            "ivc_stationary"   => "IVC-IBM stationary (LU cache, Wu & Shu 2009)".to_string(),
+            _                  => format!("MDF-IBM (multi-direct-forcing, Wang 2008, n_iter={})", ibm_cfg.n_iter),
         };
         println!(
             "  [IBM] scheme: {}  delta kernel: {}  bodies: {}",

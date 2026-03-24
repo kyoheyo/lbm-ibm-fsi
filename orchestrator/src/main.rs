@@ -493,11 +493,13 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
     grid.zero_force();
     for entry in ibm_entries.iter_mut() {
         match entry.method.to_lowercase().as_str() {
-            "penalty"      => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
-            "mls"          => entry.ms.step_mls(grid, dx, dt),
-            "mls_original" => entry.ms.step_mls_original(grid, dx, dt, 0.0, 0.0),
-            "mls_explicit" => entry.ms.step_mls_explicit(grid, dx, dt, 0.0, 0.0),
-            _              => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+            "penalty"          => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
+            "mls"              => entry.ms.step_mls(grid, dx, dt),
+            "mls_original"     => entry.ms.step_mls_original(grid, dx, dt, 0.0, 0.0),
+            "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt, 0.0, 0.0),
+            "ivc"              => entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0),
+            "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt, 0.0, 0.0),
+            _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
         }
     }
 }
