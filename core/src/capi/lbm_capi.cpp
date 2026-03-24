@@ -1178,6 +1178,7 @@ int lbm_mpi_enabled()
 #include "ibm/interpolation.hpp"
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 extern "C" {
 
@@ -1375,6 +1376,119 @@ void lbm_ibm_compute_mls_implicit(lbm::LatticeGrid* g,
         g->force[i] += pre_force[i];
 }
 
+/// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+///
+/// 使用 MLS 插值（J）和 MLS 形状函数展布（含守恒因子 c_m = ds_m），单步直接力法。
+/// 与隐式 MLS 相比无迭代修正，无滑移残差较大，但计算量最小。
+///
+/// @param g          LatticeGrid 指针
+/// @param ms         IbmMarkerSet 句柄
+/// @param dx         格子间距
+/// @param dt         时间步长
+/// @param u_target_x 目标 x 速度
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
+                                    IbmMarkerSetHandle* ms,
+                                    double dx, double dt,
+                                    double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_original(*g, *marker_set, dx, dt,
+                                          ibm::DeltaKernel::FourPoint,
+                                          u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + 全局 Z 修正，Algorithm 2，JCP 2025）。
+///
+/// 在原始 MLS 基础上添加全局标量修正因子 Z（Eq.21），
+/// Z = Σ(F·g)/Σ|g|²，将 fluid.force 整体缩放。
+/// 注意：Z 修正破坏力和力矩守恒性（见 Table 1），推荐使用隐式 MLS。
+///
+/// @param g          LatticeGrid 指针
+/// @param ms         IbmMarkerSet 句柄
+/// @param dx         格子间距
+/// @param dt         时间步长
+/// @param u_target_x 目标 x 速度
+/// @param u_target_y 目标 y 速度
+void lbm_ibm_compute_mls_explicit(lbm::LatticeGrid* g,
+                                    IbmMarkerSetHandle* ms,
+                                    double dx, double dt,
+                                    double u_target_x, double u_target_y)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt,
+                                          u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 隐式 MLS-IBM 一步（固定物体，Scheme I：LU 分解缓存）。
+///
+/// 对于几何固定的浸入边界，在首次调用时构建相关矩阵 A 并完成 LU 分解（缓存），
+/// 后续步骤直接用 LU 代换求解 X = A⁻¹·B，避免每步重复构建矩阵（更高效）。
+///
+/// cache_handle 是指向持久化缓存对象的不透明指针：
+///   - 首次调用前传入 nullptr 的地址（*cache_handle == nullptr），函数自动分配并填充。
+///   - 后续调用传入相同指针（缓存已初始化，直接复用）。
+///   - 调用 lbm_ibm_mls_stationary_cache_free() 释放缓存。
+///
+/// @param g              LatticeGrid 指针
+/// @param ms             IbmMarkerSet 句柄（标记点位置在整个仿真中必须固定）
+/// @param dx             格子间距
+/// @param dt             时间步长
+/// @param cache_handle   指向缓存句柄的指针（in/out；首次调用前 *cache_handle = nullptr）
+/// @param u_target_x/y   目标速度（静止固体取 0.0）
+struct MlsStationaryCache {
+    std::vector<double>           A_lu;
+    std::vector<int>              piv;
+    std::vector<ibm::MlsSupportSet> phi;
+};
+
+void lbm_ibm_compute_mls_stationary(lbm::LatticeGrid* g,
+                                      IbmMarkerSetHandle* ms,
+                                      double dx, double dt,
+                                      void** cache_handle,
+                                      double u_target_x, double u_target_y)
+{
+    if (!g || !ms || !cache_handle) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+
+    // 懒惰分配缓存
+    if (*cache_handle == nullptr)
+        *cache_handle = new MlsStationaryCache();
+    auto* cache = reinterpret_cast<MlsStationaryCache*>(*cache_handle);
+
+    std::vector<double> pre_force = g->force;
+
+    ibm::compute_ibm_forces_mls_implicit_stationary(
+        *g, *marker_set, dx, dt,
+        cache->A_lu, cache->piv, cache->phi,
+        u_target_x, u_target_y);
+
+    for (std::size_t i = 0; i < g->force.size(); ++i)
+        g->force[i] += pre_force[i];
+}
+
+/// 释放由 lbm_ibm_compute_mls_stationary() 分配的缓存。
+void lbm_ibm_mls_stationary_cache_free(void** cache_handle)
+{
+    if (!cache_handle || !*cache_handle) return;
+    delete reinterpret_cast<MlsStationaryCache*>(*cache_handle);
+    *cache_handle = nullptr;
+}
+
 /// 从 MarkerSet 读取所有标记点的 Lagrangian 力（fx, fy）。
 /// out_fx/out_fy 长度须 ≥ lbm_ibm_marker_set_size()。
 void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* out_fy)
@@ -1398,6 +1512,49 @@ void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* ou
 /// 忽略以 '#' 开头的注释行和空行。
 ///
 /// @param filename  CSV 文件路径（null 终止字符串）
+/// @brief 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+///
+/// @param x         标记点 x 坐标数组（长度 n_markers）
+/// @param y         标记点 y 坐标数组（长度 n_markers）
+/// @param ds        弧长/面积元素数组（长度 n_markers；传 nullptr 则自动由相邻点距计算）
+/// @param n_markers 标记点数量
+/// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
+///         若 n_markers ≤ 0 或 x/y 为 nullptr，返回 nullptr。
+IbmMarkerSetHandle* lbm_ibm_marker_set_from_coords(const double* x, const double* y,
+                                                    const double* ds, int n_markers)
+{
+    if (!x || !y || n_markers <= 0) return nullptr;
+    ibm::MarkerSet ms;
+    ms.markers.resize(static_cast<size_t>(n_markers));
+    for (int k = 0; k < n_markers; ++k) {
+        ms.markers[k] = ibm::Marker{};
+        ms.markers[k].x  = x[k];
+        ms.markers[k].y  = y[k];
+        ms.markers[k].x0 = x[k];
+        ms.markers[k].y0 = y[k];
+    }
+    // Compute ds: use caller-supplied values when available, otherwise derive from
+    // arc-length between successive markers (closed loop assumed for the last gap).
+    if (ds) {
+        for (int k = 0; k < n_markers; ++k)
+            ms.markers[k].ds = ds[k];
+    } else {
+        // Average of forward and backward segment lengths.
+        for (int k = 0; k < n_markers; ++k) {
+            int prev = (k - 1 + n_markers) % n_markers;
+            int next = (k + 1) % n_markers;
+            double dx_f = ms.markers[next].x - ms.markers[k].x;
+            double dy_f = ms.markers[next].y - ms.markers[k].y;
+            double dx_b = ms.markers[k].x   - ms.markers[prev].x;
+            double dy_b = ms.markers[k].y   - ms.markers[prev].y;
+            double seg_f = std::sqrt(dx_f*dx_f + dy_f*dy_f);
+            double seg_b = std::sqrt(dx_b*dx_b + dy_b*dy_b);
+            ms.markers[k].ds = 0.5 * (seg_f + seg_b);
+        }
+    }
+    return reinterpret_cast<IbmMarkerSetHandle*>(new ibm::MarkerSet(std::move(ms)));
+}
+
 /// @return 新分配的 IbmMarkerSetHandle*；须通过 lbm_ibm_marker_set_free() 释放。
 ///         若文件无法打开或格式错误，返回 nullptr（不抛异常穿越 C ABI）。
 IbmMarkerSetHandle* lbm_ibm_marker_set_from_file(const char* filename)

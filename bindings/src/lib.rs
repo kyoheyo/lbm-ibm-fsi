@@ -259,6 +259,12 @@ mod ffi {
         /// 创建直线丝状体标记点集（沿 x 轴均匀分布）。
         pub fn lbm_ibm_marker_set_new_filament(x0: f64, y0: f64, length: f64, n_markers: c_int)
             -> *mut IbmMarkerSetHandle;
+        /// 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+        /// ds 为 nullptr 时自动由相邻点距计算弧长元素。
+        /// 返回 nullptr 若 n_markers ≤ 0 或 x/y 为 nullptr。
+        pub fn lbm_ibm_marker_set_from_coords(x: *const f64, y: *const f64,
+                                               ds: *const f64, n_markers: c_int)
+            -> *mut IbmMarkerSetHandle;
         /// 从 CSV 文件加载标记点（第三方网格接口）。
         /// 文件格式：每行 "x, y [, z [, ds]]"；忽略 '#' 注释行和空行。
         /// 返回 nullptr 若文件无法打开或格式错误。
@@ -292,6 +298,16 @@ mod ffi {
                                             dx: f64, dt: f64,
                                             n_iter: c_int,
                                             u_target_x: f64, u_target_y: f64);
+        /// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+        pub fn lbm_ibm_compute_mls_original(g: *mut LatticeGridHandle,
+                                             ms: *mut IbmMarkerSetHandle,
+                                             dx: f64, dt: f64,
+                                             u_target_x: f64, u_target_y: f64);
+        /// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + Z 修正，Algorithm 2，JCP 2025）。
+        pub fn lbm_ibm_compute_mls_explicit(g: *mut LatticeGridHandle,
+                                             ms: *mut IbmMarkerSetHandle,
+                                             dx: f64, dt: f64,
+                                             u_target_x: f64, u_target_y: f64);
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
@@ -1182,6 +1198,33 @@ impl LbmIbmMarkerSet {
         }
     }
 
+    /// 从坐标数组创建标记点集（Python FFI / 外部网格接口）。
+    ///
+    /// # 参数
+    /// - `x`, `y`：标记点坐标数组（格子单位，长度 `n_markers`）
+    /// - `ds`：弧长/面积元素数组（长度 `n_markers`）；传空 slice 时由 C++ 端自动计算
+    ///
+    /// # Panics
+    /// 若 `x.len() != y.len()` 或长度为 0。
+    pub fn new_from_coords(x: &[f64], y: &[f64], ds: &[f64]) -> Self {
+        assert_eq!(x.len(), y.len(), "x and y must have the same length");
+        assert!(!x.is_empty(), "marker coordinate arrays must not be empty");
+        let n = x.len();
+        let ds_ptr: *const f64 = if ds.len() == n { ds.as_ptr() } else { std::ptr::null() };
+        let ptr = unsafe {
+            ffi::lbm_ibm_marker_set_from_coords(
+                x.as_ptr(), y.as_ptr(), ds_ptr, n as i32,
+            )
+        };
+        assert!(!ptr.is_null(), "lbm_ibm_marker_set_from_coords returned null");
+        LbmIbmMarkerSet {
+            ptr,
+            n_markers: n,
+            integral_x: vec![0.0; n],
+            integral_y: vec![0.0; n],
+        }
+    }
+
     /// 从外部 CSV 文件加载标记点集（第三方网格接口）。
     ///
     /// 文件格式（每行一个标记点，以逗号分隔）：
@@ -1291,6 +1334,43 @@ impl LbmIbmMarkerSet {
         unsafe {
             ffi::lbm_ibm_compute_mls_implicit(
                 grid.ptr, self.ptr, dx, dt, n_iter, u_target_x, u_target_y)
+        }
+    }
+
+    /// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
+    ///
+    /// 单步直接力法，无迭代修正。无滑移残差大于隐式 MLS，但计算量最小。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距
+    /// @param dt         时间步长
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_mls_original(&mut self, grid: &mut LbmGrid,
+                              dx: f64, dt: f64,
+                              u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls_original(
+                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+        }
+    }
+
+    /// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + Z 修正，Algorithm 2，JCP 2025）。
+    ///
+    /// 在原始 MLS 基础上加全局标量修正 Z = Σ(F·g)/Σ|g|²。
+    /// 注意：Z 修正破坏守恒性，推荐使用 `step_mls`（隐式）。
+    ///
+    /// @param grid       格子网格
+    /// @param dx         格子间距
+    /// @param dt         时间步长
+    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
+    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
+    pub fn step_mls_explicit(&mut self, grid: &mut LbmGrid,
+                              dx: f64, dt: f64,
+                              u_target_x: f64, u_target_y: f64) {
+        unsafe {
+            ffi::lbm_ibm_compute_mls_explicit(
+                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
         }
     }
 

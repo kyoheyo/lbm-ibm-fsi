@@ -35,6 +35,7 @@
 #include "marker.hpp"
 #include "../lbm/lattice.hpp"
 #include "../lbm/mpi_decomp.hpp"
+#include <vector>
 
 namespace ibm {
 
@@ -45,6 +46,23 @@ namespace ibm {
 //   4 点（Peskin）— 支撑宽度 4h
 // ---------------------------------------------------------------------------
 enum class DeltaKernel { TwoPoint, FourPoint };
+
+// ===========================================================================
+// MLS 形状函数支撑集（隐式 MLS 方案内部数据结构）
+//
+// 用于缓存每个 Lagrangian 标记点的 MLS 形状函数值，避免固定物体每步重复构建。
+// 由 compute_ibm_forces_mls_implicit_stationary 的 phi_cache 参数持久化。
+//
+// 字段说明：
+//   idx  — 该标记点支撑域内各 Euler 节点的全局索引（行主序 grid.idx(i,j)）
+//   phi  — 对应的 MLS 形状函数值 φ_j^k（2025 JCP Eq.10–14）
+//
+// 注意：对非本进程拥有的标记点，idx 和 phi 均为空（MPI 归属过滤）。
+// ===========================================================================
+struct MlsSupportSet {
+    std::vector<int>    idx;   ///< Euler 节点全局索引
+    std::vector<double> phi;   ///< 对应 MLS 形状函数值 φ_j^k
+};
 
 // ---------------------------------------------------------------------------
 // 速度插值（标准 Peskin δ 函数）：
@@ -167,26 +185,19 @@ void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
 // 移动最小二乘速度插值（MLS 插值算子 J）
 //
 // 参考：Liu W.K. et al. (1997) Int. J. Numer. Meth. Fluids 25:1387-1407.
-//       Wang Z. et al. (2009) J. Comput. Phys. 228:1963-1978.
-//       2025 JCP "An implicit moving-least-squares immersed boundary method
-//       for high fidelity fluid-structure interaction simulations" §2.1
+//       Vanella & Balaras (2009) J. Comput. Phys. 228:2366-2391
+//       2025 JCP Wu & Fu §3.1, Eq.(10)–(14)
 //
-// 使用线性多项式基 {1, Δx, Δy}（3 个自由度）和 Gaussian 权函数
-//   w(r) = exp(−r² / h²)，h = 2.5 · dx，支撑半径 R_s = 2.5 · dx
-// 对每个标记点，在其邻域内构建加权最小二乘系统（3×3），求解后
+// 使用线性多项式基 {1, Δx/dx, Δy/dx}（3 个自由度）和 Gaussian 权函数
+//   w(r) = exp(−r²/(H_k·ε)²)，H_k = 1.5·dx，ε = 0.3（2025 JCP Eq.14）
+//   支撑域：矩形 |Δx|≤H_k 且 |Δy|≤H_k（2025 JCP Fig.2）
+// 对每个标记点，在其邻域内构建 3×3 加权最小二乘系统，求解后
 // 以多项式插值取代 Peskin δ 函数，得到更精确的速度估计。
 //
-// 与标准 interpolate_velocity() 接口相同：写入 mk.ux, mk.uy。
-// 适用场景：标记点密度不均匀、支撑域节点数目有限的情形。
-//
-// 此函数实现 MLS 插值算子 J，供三种 MLS-IBM 方案共用：
+// 写入 mk.ux, mk.uy。供三种 MLS-IBM 方案共用：
 //   - 原始 MLS（compute_ibm_forces_mls_original）
 //   - 显式 MLS（compute_ibm_forces_mls_explicit）
 //   - 隐式 MLS（compute_ibm_forces_mls_implicit）
-//
-// @param grid    Eulerian 流体网格
-// @param ms      拉格朗日标记点集（写入 mk.ux, mk.uy）
-// @param dx      格子间距
 // ===========================================================================
 void mls_interpolate_velocity(const lbm::LatticeGrid& grid,
                                MarkerSet& ms,
@@ -225,27 +236,19 @@ void mls_spread_force(lbm::LatticeGrid& grid,
                       double dx);
 
 // ===========================================================================
-// 原始 MLS-IBM（Original MLS）—— MLS 插值 + Peskin δ 函数展布
+// 原始 MLS-IBM（Original MLS）—— MLS 插值 + MLS 形状函数展布（含守恒因子 c_i）
 //
-// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
-//       for high fidelity fluid-structure interaction simulations" §2.1
+// 参考：2025 JCP Wu & Fu §3.1（Algorithm 1）
+//       Vanella & Balaras (2009) J. Comput. Phys. 228:2366-2391
 //
 // 算法（单步直接力法）：
-//   1. MLS 速度插值：U_m = J · u（调用 mls_interpolate_velocity）
+//   1. MLS 速度插值：U_m = J · u*
 //   2. 直接力：F_m = (u_target − U_m) / dt
-//   3. Peskin δ 函数展布：f(x) = Σ_m F_m · δ(x − X_m) · ds_m
+//   3. MLS 形状函数展布（Eq.16，含 c_m=ds_m 守恒因子）：
+//        f_j = Σ_m c_m φ_j^m F_m
 //
-// 与显式 MLS（compute_ibm_forces_mls_explicit）的关键区别：
-//   展布算子 S = δ（Peskin 核函数），而非 MLS 的伴随算子 J^T。
-//   因此 J ≠ S^T，不满足离散伴随一致性，动量守恒精度低于显式/隐式 MLS 方案。
-//
-// @param fluid      Eulerian 流体网格（grid.force 将被覆盖为 IBM 体力）
-// @param ms         拉格朗日标记点集（mk.fx/fy 被写入力密度；mk.ux/uy 写入插值速度）
-// @param dx         格子间距
-// @param dt         时间步长（格子单位通常 = 1）
-// @param kernel     Peskin δ 函数核（用于展布步）
-// @param u_target_x 目标 x 速度（静止固体取 0.0；移动边界取壁面速度）
-// @param u_target_y 目标 y 速度
+// 注意：展布与插值算子非完全伴随，存在无滑移误差（见 Fig.3a）。
+// `kernel` 参数保留供向后兼容但不再使用（展布已改为 MLS 形状函数）。
 // ===========================================================================
 void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
@@ -256,27 +259,22 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       double u_target_y  = 0.0);
 
 // ===========================================================================
-// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 伴随展布，单步
+// 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 展布 + 全局 Z 修正
 //
-// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
-//       for high fidelity fluid-structure interaction simulations" §2.2
+// 参考：2025 JCP Wu & Fu §3.2（Algorithm 2）
+//       Chen et al. (2022) Phys. Rev. E 106:015307
 //
-// 算法（单步显式直接力法）：
-//   1. MLS 速度插值：U_m = J · u（调用 mls_interpolate_velocity）
+// 算法：
+//   1. MLS 速度插值：U_m = J · u*
 //   2. 直接力：F_m = (u_target − U_m) / dt
-//   3. MLS 伴随展布：f = J^T · F（调用 mls_spread_force）
+//   3. 第一次 MLS 展布：f = J^T · F
+//   4. 重插值：g_k = J · f（再次 MLS 插值展布后的力场）
+//   5. Z 修正因子（Eq.21，最小化 ||Z·g − F||²）：
+//        Z = Σ_k(F_k·g_k) / Σ_k|g_k|²
+//   6. 最终展布：f → Z · f
 //
-// 特性：
-//   - 使用 J（插值）和 J^T（展布）互为伴随，满足离散伴随一致性
-//   - 比原始 MLS（δ 函数展布）精度更高，且实现简单（无需迭代）
-//   - 等价于 compute_ibm_forces_mls_implicit(n_iter=1)，但语义更明确
-//
-// @param fluid      Eulerian 流体网格（grid.force 将被覆盖为 IBM 体力）
-// @param ms         拉格朗日标记点集（mk.fx/fy 被写入力密度；mk.ux/uy 写入插值速度）
-// @param dx         格子间距
-// @param dt         时间步长（格子单位通常 = 1）
-// @param u_target_x 目标 x 速度
-// @param u_target_y 目标 y 速度
+// 注意：Z 因子破坏力和力矩守恒（见 Table 1），无滑移残差仍显著。
+// 推荐使用隐式 MLS（compute_ibm_forces_mls_implicit）。
 // ===========================================================================
 void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
@@ -286,47 +284,81 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       double u_target_y = 0.0);
 
 // ===========================================================================
-// 隐式 MLS-IBM 力计算（Implicit MLS）—— 迭代 MLS 插值与伴随展布
+// 隐式 MLS-IBM 力计算（Implicit MLS）—— Algorithm 3，Scheme II：GMRES 求解
 //
-// 参考：2025 JCP "An implicit moving-least-squares immersed boundary method
-//       for high fidelity fluid-structure interaction simulations" §2.3
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Eq.(24)–(28)
 //
-// 使用 MLS 插值（J）和 MLS 伴随展布（J^T）通过多步迭代逼近满足无滑移约束
-// 的 IBM 力，比单步显式 MLS（compute_ibm_forces_mls_explicit）精度更高、
-// 无滑移残差更小。
+// 完整实现论文 Algorithm 3：
+//   A1: 计算传递算子 Φ（每个 Lagrangian 点的 MLS 形状函数 φ_j^k，Eq.10–14）
+//   A2: 重建 Lagrangian 速度 U* = J·u*（MLS 插值）
+//   C2: 构建 N_l×N_l 相关矩阵 A（Eq.28）和右端向量 B（Eq.24c），
+//       用 GMRES（对角预处理，相对收敛判据 10⁻¹⁴）求解 A·X = B（Scheme II）
+//   A4: 展布 Lagrangian 还原力到 Eulerian 网格（Eq.16）
+//   A5: 速度更新由调用方执行
 //
-// 算法（n_iter 次 Richardson 迭代）：
-//   初始化：F = 0（总 Lagrangian 力），u_work = grid.u
-//   对 k = 0..n_iter-1：
-//     1. MLS 速度插值：U^k = J · u_work（调用 mls_interpolate_velocity）
-//     2. 增量力：δF^k = (u_target − U^k) / dt
-//     3. MLS 伴随展布：δf^k = J^T · δF^k（调用 mls_spread_force）
-//     4. 更新工作速度：u_work += dt · δf^k
-//     5. 累积总 Lagrangian 力：F += δF^k
-//   结束：
-//     - mk.fx/fy = F（总 Lagrangian 力，供 FSI 反作用力计算）
-//     - fluid.force = J^T · F（最终 MLS 伴随展布，= Σ_k δf^k 由线性性等价）
+// 与原 Richardson 迭代不同，本实现精确求解 N_l×N_l 线性系统，可将无滑移
+// 边界速度误差降至机器精度（2025 JCP Fig.3d），同时保持力和力矩守恒（Table 1）。
 //
-// 三种 MLS 方案对比（2025 JCP §3）：
-//   1. 原始 MLS (compute_ibm_forces_mls_original)：J 插值 + δ 展布，非伴随一致
-//   2. 显式 MLS (compute_ibm_forces_mls_explicit)：J + J^T，单步，伴随一致
-//   3. 隐式 MLS（本函数）：J + J^T，多步迭代，无滑移残差最小
-//
-// @param fluid      Eulerian 流体网格（grid.force 将被覆盖为最终 IBM 体力）
-// @param ms         拉格朗日标记点集（mk.fx/fy 将被写入**总**力密度；mk.ux/uy 写入末次插值速度）
-// @param dx         格子间距
-// @param dt         时间步长（格子单位通常 = 1）
-// @param n_iter     迭代次数（建议 2–4，默认 3）
-// @param u_target_x 目标 x 速度（静止固体取 0.0；移动边界取壁面速度）
-// @param u_target_y 目标 y 速度
+// @param fluid          Eulerian 流体网格（fluid.force 将被写入 IBM 体力）
+// @param ms             Lagrangian 标记点集（mk.fx/fy 写入 Lagrangian 还原力）
+// @param dx             格子间距
+// @param dt             时间步长（格子单位通常 = 1）
+// @param gmres_max_iter GMRES 最大迭代次数（原 n_iter 参数；默认 3 保留后向兼容）
+//                       注：对于机器精度结果，建议设 ≥ ms.size()（至少 50）；
+//                       对小 N_l（≤ 50）N 步内即可精确求解
+// @param u_target_x/y   边界目标速度（静止固体取 0；移动固体取壁面速度）
 // ===========================================================================
 void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
-                                      double dt         = 1.0,
-                                      int    n_iter     = 3,
-                                      double u_target_x = 0.0,
-                                      double u_target_y = 0.0);
+                                      double dt             = 1.0,
+                                      int    gmres_max_iter = 3,
+                                      double u_target_x     = 0.0,
+                                      double u_target_y     = 0.0);
+
+// ===========================================================================
+// 隐式 MLS-IBM 力计算（Algorithm 3，Scheme I：固定物体直接矩阵求逆）
+//
+// 参考：2025 JCP Wu & Fu §4，Algorithm 3，Scheme I
+//
+// 对于几何固定（stationary）的物体，传递算子 Φ（phi_cache）和相关矩阵 A 不随时间变化。
+// 本函数将 LU 分解结果缓存于 A_lu_cache / piv_cache，将 MLS 形状函数集缓存于
+// phi_cache（调用方持久化），后续每步仅需：
+//   1. 用 phi_cache 插值速度（O(N_l·N_e)）
+//   2. 构建右端向量 B（O(N_l)）
+//   3. LU 代换求解（O(N_l²)）
+// 与 Scheme II（每步 GMRES）相比，消除了 phi_data 重建和矩阵构建两处重复开销。
+//
+// 用法示例（在时间循环外声明缓存，在循环内每步调用）：
+// @code
+//   std::vector<double>           A_lu_cache;
+//   std::vector<int>              piv_cache;
+//   std::vector<ibm::MlsSupportSet> phi_cache;
+//   for (int step = 0; step < n_steps; ++step) {
+//       solver.step();
+//       compute_ibm_forces_mls_implicit_stationary(
+//           fluid, ms, dx, dt, A_lu_cache, piv_cache, phi_cache);
+//   }
+// @endcode
+//
+// @param fluid        Eulerian 流体网格
+// @param ms           Lagrangian 标记点集（必须固定不动；位置每步不变）
+// @param dx           格子间距
+// @param dt           时间步长
+// @param A_lu_cache   LU 分解缓存（首次调用时填充，后续复用；传入空 vector 即自动初始化）
+// @param piv_cache    LU 行主元缓存（与 A_lu_cache 配套）
+// @param phi_cache    MLS 形状函数集缓存（首次调用时填充，后续复用；传入空 vector 即自动初始化）
+// @param u_target_x/y 目标速度（静止固体通常为 0.0）
+// ===========================================================================
+void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
+                                                 MarkerSet& ms,
+                                                 double dx,
+                                                 double dt,
+                                                 std::vector<double>& A_lu_cache,
+                                                 std::vector<int>&    piv_cache,
+                                                 std::vector<MlsSupportSet>& phi_cache,
+                                                 double u_target_x = 0.0,
+                                                 double u_target_y = 0.0);
 
 // ===========================================================================
 // IBM 固体受力统计：合力计算

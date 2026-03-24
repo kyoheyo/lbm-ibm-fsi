@@ -493,9 +493,11 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
     grid.zero_force();
     for entry in ibm_entries.iter_mut() {
         match entry.method.to_lowercase().as_str() {
-            "penalty" => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
-            "mls"     => entry.ms.step_mls(grid, dx, dt),
-            _         => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+            "penalty"      => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
+            "mls"          => entry.ms.step_mls(grid, dx, dt),
+            "mls_original" => entry.ms.step_mls_original(grid, dx, dt, 0.0, 0.0),
+            "mls_explicit" => entry.ms.step_mls_explicit(grid, dx, dt, 0.0, 0.0),
+            _              => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
         }
     }
 }
@@ -819,9 +821,11 @@ fn generate_ibm_markers_ffi(cfg: &Config) {
                     x.len(), x_min, x_max, y_min, y_max,
                     ds.first().copied().unwrap_or(0.0),
                 );
-                // TODO: forward (x, y, ds) to the C++ IBM core once
-                //       lbm_bindings exposes the corresponding interface.
-                let _ = (x, y, ds);
+                // Forward (x, y, ds) to the C++ IBM core via lbm_bindings.
+                let ms = lbm_bindings::LbmIbmMarkerSet::new_from_coords(&x, &y, &ds);
+                println!("  => MarkerSet created ({} markers)", ms.len());
+                // ms is dropped here; in a full simulation loop it would be passed
+                // to step_mdf / step_mls / step_penalty each time step.
             }
             Err(e) => eprintln!("[python-ffi] marker generation skipped: {e}"),
         }
