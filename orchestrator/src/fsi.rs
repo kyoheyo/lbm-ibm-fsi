@@ -3,16 +3,17 @@
 //! 本模块将 FSI 流固耦合逻辑从 `main.rs` 中独立出来，提供：
 //!
 //! - [`FsiCouplingMode`]：三种耦合模式的类型安全枚举
-//! - [`IbmEntry`]：IBM 体的运行时状态（标记点集 + 受力输出配置）
+//! - [`IbmEntry`]：IBM 体的运行时状态（标记点集 + 受力输出配置 + 可选运动体）
+//! - [`SolidEntry`]：BB/IBB 固体体运行时状态（含可选刚体运动）
 //! - [`resolve_coupling_mode`]：根据配置（显式或自动推断）确定耦合模式
 //! - [`validate_coupling_mode`]：校验耦合模式与配置段是否一致
 //! - [`setup_solid_bodies`]：设置 BB/IBB 固体体（标记 + 反弹方案）
 //! - [`setup_ibm_bodies`]：创建 IBM 体（标记点集 + 日志）
 
 use anyhow::{Result, bail};
-use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet};
+use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet, LbmRigidBody2D, RigidBodyScheme};
 
-use crate::config::{Config, FsiConfig, IbmBodyConfig, SolidForceOutputConfig};
+use crate::config::{Config, FsiConfig, IbmBodyConfig, SolidForceOutputConfig, MotionType, RigidBodyMotionConfig};
 
 // ---------------------------------------------------------------------------
 // 耦合模式枚举
@@ -79,6 +80,13 @@ pub struct IbmEntry {
     pub alpha: f64,
     /// 罚函数积分增益（`method="penalty"` 时有效）
     pub beta: f64,
+    /// 运动类型（`Fixed` / `RigidFree` / `Prescribed` / `Flexible`）
+    pub motion_type: MotionType,
+    /// 刚体求解器（仅 `motion_type == RigidFree` 时非 None）
+    pub rigid_body: Option<LbmRigidBody2D>,
+    /// 该体质心当前坐标（`rigid_free` 时跟踪）
+    pub cx: f64,
+    pub cy: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +314,8 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
                 n_iter:       None,
                 alpha:        None,
                 beta:         None,
+                motion_type:  MotionType::Fixed,
+                motion:       Default::default(),
             }];
             &single_body_list
         } else {
@@ -400,8 +410,61 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             }
         }
 
-        entries.push(IbmEntry { ms, label, force_cfg, method, n_iter, alpha, beta });
+        // 构建可选刚体求解器
+        let (motion_type, rigid_body, cx, cy) = match &body.motion_type {
+            MotionType::RigidFree => {
+                let mc = &body.motion;
+                let scheme = parse_rigid_scheme(&mc.internal_mass_scheme);
+                // 建立边界点参考坐标（体固系）
+                let n = ms.len();
+                let ref_x: Vec<f64> = (0..n).map(|k| {
+                    let (x, _) = ms.get_marker_position(k);
+                    x - body.x0
+                }).collect();
+                let ref_y: Vec<f64> = (0..n).map(|k| {
+                    let (_, y) = ms.get_marker_position(k);
+                    y - body.y0
+                }).collect();
+                // 自动推算质量（若未给出）：m = rho_b * pi * r^2（圆形）
+                let mass = if mc.mass > 0.0 { mc.mass }
+                    else { mc.body_density * std::f64::consts::PI * body.size * body.size };
+                // 自动推算转动惯量（若未给出）：I = 0.5*m*r^2（实心圆柱）
+                let inertia = if mc.inertia > 0.0 { mc.inertia }
+                    else { 0.5 * mass * body.size * body.size };
+                let mut rb = LbmRigidBody2D::new(
+                    mass, inertia, mc.body_density.max(1.0), mc.rho_f,
+                    body.x0, body.y0, scheme, mc.is_closed,
+                    &ref_x, &ref_y, &[], &[],
+                );
+                if mc.vel_x0 != 0.0 || mc.vel_y0 != 0.0 || mc.omega0 != 0.0 {
+                    rb.set_velocity(mc.vel_x0, mc.vel_y0, mc.omega0);
+                }
+                if rank == 0 {
+                    println!(
+                        "  [IBM] body[{}] motion=rigid_free  mass={:.4}  inertia={:.4}  is_closed={}  scheme={}",
+                        body_idx, mass, inertia, mc.is_closed, &mc.internal_mass_scheme
+                    );
+                }
+                (MotionType::RigidFree, Some(rb), body.x0, body.y0)
+            }
+            other => (other.clone(), None, body.x0, body.y0),
+        };
+
+        entries.push(IbmEntry {
+            ms, label, force_cfg, method, n_iter, alpha, beta,
+            motion_type, rigid_body, cx, cy,
+        });
     }
 
     Ok(entries)
+}
+
+/// 解析内部质量方案字符串 → `RigidBodyScheme`。
+fn parse_rigid_scheme(s: &str) -> RigidBodyScheme {
+    match s.to_lowercase().as_str() {
+        "uhlmann"       => RigidBodyScheme::UhlmannRigidBody,
+        "feng"          => RigidBodyScheme::FengRigidBody,
+        "lagrangian"    => RigidBodyScheme::LagrangianPoints,
+        _               => RigidBodyScheme::None,
+    }
 }

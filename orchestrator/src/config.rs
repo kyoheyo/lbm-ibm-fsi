@@ -3,6 +3,54 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 // ---------------------------------------------------------------------------
+// 运动体配置（BB/IBB 刚体运动 + IBM 柔性/刚性体运动通用）
+// ---------------------------------------------------------------------------
+
+/// 运动类型枚举（对应字符串配置值）
+///
+/// - `"fixed"` / `"static"`：固定不动（默认）
+/// - `"rigid_free"`：自由刚性运动（流体合力 → Newton-Euler 积分）
+/// - `"prescribed"`：预定义运动（由外部插件 `[plugins].motion` 驱动）
+/// - `"flexible"`：柔性体运动（每个标记点速度可独立，仅 IBM 使用）
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionType {
+    #[default]
+    Fixed,
+    RigidFree,
+    Prescribed,
+    Flexible,
+}
+
+/// 刚体运动参数（`[solid.bodies.motion]` 或 `[ibm.bodies.motion]` 子表）
+///
+/// 仅当 `motion_type = "rigid_free"` 时读取。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RigidBodyMotionConfig {
+    /// 刚体质量（格子单位）
+    #[serde(default)] pub mass: f64,
+    /// 转动惯量 Izz（格子单位）
+    #[serde(default)] pub inertia: f64,
+    /// 刚体材料密度（格子单位；当 `mass` / `inertia` 未给出时由 `body_density` + 几何推算）
+    #[serde(default)] pub body_density: f64,
+    /// 参考流体密度（格子单位，通常 = 1.0）
+    #[serde(default = "default_rho_f")] pub rho_f: f64,
+    /// 是否为封闭结构（控制内部流体伪动量修正）
+    #[serde(default)] pub is_closed: bool,
+    /// 内部质量修正方案：`"none"` / `"uhlmann"` / `"feng"` / `"lagrangian"`（默认 `"none"`）
+    #[serde(default = "default_internal_mass_scheme")] pub internal_mass_scheme: String,
+    /// 初始 x 速度（格子单位/步）
+    #[serde(default)] pub vel_x0: f64,
+    /// 初始 y 速度
+    #[serde(default)] pub vel_y0: f64,
+    /// 初始角速度（rad/步）
+    #[serde(default)] pub omega0: f64,
+}
+
+fn default_rho_f() -> f64 { 1.0 }
+fn default_internal_mass_scheme() -> String { "none".to_string() }
+
+// ---------------------------------------------------------------------------
 // 顶层仿真配置（从 TOML 文件加载）
 // ---------------------------------------------------------------------------
 
@@ -313,6 +361,13 @@ pub struct SolidBodyConfig {
     /// 未设置时继承全局 `[solid].bc_type`。
     #[serde(default)]
     pub bc_type: Option<String>,
+    /// 运动类型（`"fixed"` / `"rigid_free"` / `"prescribed"`；默认 `"fixed"`）。
+    /// BB/IBB 固体仅支持 `"fixed"` 和 `"rigid_free"`（刚性运动；不支持柔性体）。
+    #[serde(default)]
+    pub motion_type: MotionType,
+    /// 刚体运动参数（仅 `motion_type = "rigid_free"` 时有效）。
+    #[serde(default)]
+    pub motion: RigidBodyMotionConfig,
 }
 
 /// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
@@ -370,6 +425,14 @@ pub struct IbmBodyConfig {
     #[serde(default)] pub alpha: Option<f64>,
     /// 该体的罚函数积分增益（可选；覆盖顶层 `[ibm].beta`）
     #[serde(default)] pub beta: Option<f64>,
+    /// 运动类型（`"fixed"` / `"rigid_free"` / `"prescribed"` / `"flexible"`；默认 `"fixed"`）。
+    /// - `"rigid_free"`：自由刚体（Newton-Euler 积分；含内部质量修正）
+    /// - `"flexible"`：柔性体（每标记点独立速度，须通过插件 `[plugins].flexible` 提供）
+    #[serde(default)]
+    pub motion_type: MotionType,
+    /// 刚体运动参数（仅 `motion_type = "rigid_free"` 时有效）。
+    #[serde(default)]
+    pub motion: RigidBodyMotionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]

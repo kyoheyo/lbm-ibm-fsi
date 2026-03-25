@@ -12,6 +12,7 @@ use clap::Parser;
 
 use config::Config;
 use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmSolver};
+use crate::config::MotionType;
 use output::PartitionInfo;
 
 // ---------------------------------------------------------------------------
@@ -492,6 +493,18 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
     // 意外累积到当前步（会导致 MLS/MDF 直接力方法逐步发散）。
     grid.zero_force();
     for entry in ibm_entries.iter_mut() {
+        // --- Step A：若为自由运动刚体，更新标记点目标速度 ---
+        if entry.motion_type == MotionType::RigidFree {
+            if let Some(rb) = &entry.rigid_body {
+                let (cx, cy, ux_cm, uy_cm, _theta, omega) = rb.state();
+                entry.cx = cx;
+                entry.cy = cy;
+                entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+            }
+        }
+        // 柔性体：目标速度由外部（插件）在每步 IBM 前已设置完毕；无需在此处操作。
+
+        // --- Step B：IBM 力计算（所有方法均从 mk.ux_target/uy_target 读取目标速度）---
         match entry.method.to_lowercase().as_str() {
             "penalty"          => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
             "mls"              => entry.ms.step_mls(grid, dx, dt),
@@ -500,6 +513,21 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
             "ivc"              => entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0),
             "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt, 0.0, 0.0),
             _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+        }
+
+        // --- Step C：若为自由运动刚体，用 IBM 合力/力矩推进刚体 Newton-Euler 积分 ---
+        if entry.motion_type == MotionType::RigidFree {
+            if let Some(rb) = &mut entry.rigid_body {
+                // IBM 力施加到流体（正方向）；固体所受反作用力为其负值（Newton III 定律）。
+                let cx = entry.cx;
+                let cy = entry.cy;
+                let (ftot_x, ftot_y, ttot) = entry.ms.compute_body_force_and_torque(cx, cy);
+                rb.advance(-ftot_x, -ftot_y, -ttot, dt);
+
+                // 同步标记点位置到刚体旋转后的新位置
+                let (bx, by) = rb.boundary_positions();
+                entry.ms.update_positions(&bx, &by);
+            }
         }
     }
 }

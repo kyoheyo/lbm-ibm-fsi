@@ -252,6 +252,18 @@ mod ffi {
                                        phys_i1: c_int, phys_j1: c_int,
                                        out_fx: *mut f64, out_fy: *mut f64);
 
+        // --- 运动刚体 BB/IBB ---
+        /// 清除所有固体节点标记（运动固体每步重标记前调用）。
+        pub fn lbm_clear_solid(g: *mut LatticeGridHandle);
+        /// 运动刚体半步长反弹（Ladd 1994 移动壁面修正）。
+        pub fn lbm_apply_solid_bb_moving_rigid(g: *mut LatticeGridHandle,
+            cx: f64, cy: f64, ux_cm: f64, uy_cm: f64, omega: f64,
+            phys_i0: c_int, phys_j0: c_int, phys_i1: c_int, phys_j1: c_int);
+        /// 运动刚体 Bouzidi IBB（Ladd 移动壁面修正）。
+        pub fn lbm_apply_solid_ibb_moving_rigid(g: *mut LatticeGridHandle,
+            cx: f64, cy: f64, ux_cm: f64, uy_cm: f64, omega: f64,
+            phys_i0: c_int, phys_j0: c_int, phys_i1: c_int, phys_j1: c_int);
+
         // --- IBM 浸入边界法 — 实现于 core/src/capi/lbm_capi.cpp (IBM section) ---
         /// 创建圆柱表面标记点集（均匀分布）。
         pub fn lbm_ibm_marker_set_new_circle(cx: f64, cy: f64, radius: f64, n_markers: c_int)
@@ -325,6 +337,9 @@ mod ffi {
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
         pub fn lbm_ibm_get_forces(ms: *const IbmMarkerSetHandle,
                                   out_fx: *mut f64, out_fy: *mut f64);
+        /// 读取所有标记点当前坐标 (x, y)；out_x/out_y 长度须 ≥ size()。
+        pub fn lbm_ibm_get_positions(ms: *const IbmMarkerSetHandle,
+                                     out_x: *mut f64, out_y: *mut f64);
         /// 计算 IBM 固体受力合力（力密度与弧长元素的加权和）。
         ///   out_fx = Σ mk.fx * mk.ds,  out_fy = Σ mk.fy * mk.ds
         /// 固体所受流体合力为其负值（牛顿第三定律）。
@@ -397,6 +412,19 @@ mod ffi {
             out_ux: *mut f64, out_uy: *mut f64);
         pub fn lbm_ibm_update_marker_positions(ms: *mut IbmMarkerSetHandle,
             x: *const f64, y: *const f64, n: c_int);
+
+        // --- IBM 柔性体逐标记点目标速度 ---
+        /// 设置所有标记点的统一目标速度（静止体：0,0）。
+        pub fn lbm_ibm_set_uniform_target(ms: *mut IbmMarkerSetHandle, ux: f64, uy: f64);
+        /// 设置各标记点的逐点目标速度（柔性体 / 旋转刚体）。
+        pub fn lbm_ibm_set_marker_targets(ms: *mut IbmMarkerSetHandle,
+            ux: *const f64, uy: *const f64, n: c_int);
+        /// 读取各标记点的目标速度。
+        pub fn lbm_ibm_get_marker_targets(ms: *const IbmMarkerSetHandle,
+            out_ux: *mut f64, out_uy: *mut f64);
+        /// 根据刚体运动状态（质心速度 + 角速度）为所有标记点设置目标速度。
+        pub fn lbm_ibm_set_rigid_body_targets(ms: *mut IbmMarkerSetHandle,
+            cx: f64, cy: f64, ux_cm: f64, uy_cm: f64, omega: f64);
 
         // --- 插件注册 — 实现于 core/src/plugins/plugin_registry.cpp ---
         // 对应 C++ 函数: lbm_set_plugins
@@ -1188,6 +1216,65 @@ pub fn mpi_allreduce_sum_f64(local_val: f64) -> f64 {
     result
 }
 
+/// 清除所有固体节点标记（`solid`、`q_ibb`、`solid_bc_node`）。
+///
+/// 在运动固体每步重新标记前调用，防止遗留上步的固体节点。
+/// 典型用法（每步循环内）：
+/// ```ignore
+/// clear_solid(grid);
+/// mark_solid_cylinder(grid, new_cx, new_cy, radius);
+/// assign_solid_bc_unmarked(grid, 2);  // IBB
+/// ```
+pub fn clear_solid(grid: &mut LbmGrid) {
+    unsafe { ffi::lbm_clear_solid(grid.ptr) }
+}
+
+/// 运动刚体半步长反弹（Ladd 1994 移动壁面修正）。
+///
+/// 用法同 [`solver.step()`] 内部的 BB，但增加了壁面速度 Ladd 修正项：
+///   `f_ᾱ(x_f) = f_α*(x_f) - 2*w_α*(c_α·U_wall)/cs²`
+///
+/// 须在 `solver.step()` 之后、下一步 `collide()` 之前调用。
+/// 固体节点须在本步已由 `mark_solid_cylinder()` 等函数重新标记。
+///
+/// # 参数
+/// - `cx, cy`：质心当前坐标（格子单位）
+/// - `ux_cm, uy_cm`：质心速度（格子单位/时间步）
+/// - `omega`：角速度（rad/时间步，逆时针为正）
+/// - `phys_i0/j0/i1/j1`：物理区域（MPI 时从 `PartitionInfo` 获取；非 MPI 传 0/0/nx-1/ny-1）
+pub fn apply_solid_bb_moving_rigid(
+    grid: &mut LbmGrid,
+    cx: f64, cy: f64,
+    ux_cm: f64, uy_cm: f64, omega: f64,
+    phys_i0: i32, phys_j0: i32,
+    phys_i1: i32, phys_j1: i32,
+) {
+    unsafe {
+        ffi::lbm_apply_solid_bb_moving_rigid(
+            grid.ptr, cx, cy, ux_cm, uy_cm, omega,
+            phys_i0, phys_j0, phys_i1, phys_j1,
+        )
+    }
+}
+
+/// 运动刚体 Bouzidi IBB（Ladd 移动壁面修正）。
+///
+/// 用法与 [`apply_solid_bb_moving_rigid`] 相同，但使用 IBB 插值（更精确的壁面位置）。
+pub fn apply_solid_ibb_moving_rigid(
+    grid: &mut LbmGrid,
+    cx: f64, cy: f64,
+    ux_cm: f64, uy_cm: f64, omega: f64,
+    phys_i0: i32, phys_j0: i32,
+    phys_i1: i32, phys_j1: i32,
+) {
+    unsafe {
+        ffi::lbm_apply_solid_ibb_moving_rigid(
+            grid.ptr, cx, cy, ux_cm, uy_cm, omega,
+            phys_i0, phys_j0, phys_i1, phys_j1,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 /// IBM（浸入边界法）Lagrangian 标记点集封装
 // ---------------------------------------------------------------------------
@@ -1492,6 +1579,91 @@ impl LbmIbmMarkerSet {
         }
     }
 
+    /// 设置所有标记点的统一目标速度（静止体使用 0.0, 0.0）。
+    ///
+    /// 调用此方法后，所有 IBM 方法（MDF/Penalty/MLS/IVC）将以此速度作为无滑移目标。
+    /// 对于运动刚体，建议使用 [`set_rigid_body_targets`] 逐点设置（包含旋转）。
+    pub fn set_uniform_target(&mut self, ux: f64, uy: f64) {
+        unsafe { ffi::lbm_ibm_set_uniform_target(self.ptr, ux, uy) }
+    }
+
+    /// 设置各标记点的逐点目标速度（柔性体 / 旋转刚体）。
+    ///
+    /// `ux` 和 `uy` 的长度须 ≥ `n_markers`。多余元素被忽略，不足时只更新前 N 个。
+    pub fn set_marker_targets(&mut self, ux: &[f64], uy: &[f64]) {
+        let n = ux.len().min(uy.len()).min(self.n_markers) as i32;
+        unsafe {
+            ffi::lbm_ibm_set_marker_targets(self.ptr, ux.as_ptr(), uy.as_ptr(), n)
+        }
+    }
+
+    /// 读取各标记点的当前目标速度（调用前须已通过 `set_*_targets` 设置）。
+    pub fn get_marker_targets(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut ux = vec![0.0_f64; self.n_markers];
+        let mut uy = vec![0.0_f64; self.n_markers];
+        unsafe {
+            ffi::lbm_ibm_get_marker_targets(self.ptr as *const _, ux.as_mut_ptr(), uy.as_mut_ptr())
+        }
+        (ux, uy)
+    }
+
+    /// 根据刚体运动状态设置逐点目标速度（含旋转）。
+    ///
+    /// 每个标记点 m 的目标速度：
+    ///   `Uk = (ux_cm - omega*(mk.y - cy), uy_cm + omega*(mk.x - cx))`
+    ///
+    /// # 参数
+    /// - `cx, cy`：刚体质心坐标（格子单位，本步更新后的位置）
+    /// - `ux_cm, uy_cm`：质心速度
+    /// - `omega`：角速度（逆时针为正）
+    pub fn set_rigid_body_targets(&mut self,
+                                   cx: f64, cy: f64,
+                                   ux_cm: f64, uy_cm: f64, omega: f64) {
+        unsafe { ffi::lbm_ibm_set_rigid_body_targets(self.ptr, cx, cy, ux_cm, uy_cm, omega) }
+    }
+
+    /// 同步更新标记点坐标（刚体运动后用来将当前位置写回 MarkerSet）。
+    ///
+    /// `x` / `y` 长度须 ≥ `n_markers`。
+    pub fn update_positions(&mut self, x: &[f64], y: &[f64]) {
+        let n = x.len().min(y.len()).min(self.n_markers) as i32;
+        unsafe { ffi::lbm_ibm_update_marker_positions(self.ptr, x.as_ptr(), y.as_ptr(), n) }
+    }
+
+    /// 读取所有标记点的插值流体速度（最近一次 IBM step 后的值）。
+    pub fn get_marker_velocities(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut ux = vec![0.0_f64; self.n_markers];
+        let mut uy = vec![0.0_f64; self.n_markers];
+        unsafe {
+            ffi::lbm_ibm_get_marker_velocities(
+                self.ptr as *const _, ux.as_mut_ptr(), uy.as_mut_ptr())
+        }
+        (ux, uy)
+    }
+
+    /// 计算 IBM 总力 + 总力矩（绕质心 `(cx, cy)`）。
+    ///
+    /// 返回：`(Ftot_x, Ftot_y, Ttot)`，均为施加到**流体**上的力/力矩；
+    /// 固体所受反作用力 = `(-Ftot_x, -Ftot_y, -Ttot)`。
+    pub fn compute_body_force_and_torque(&self, cx: f64, cy: f64) -> (f64, f64, f64) {
+        let mut fx = 0.0_f64;
+        let mut fy = 0.0_f64;
+        let mut torque = 0.0_f64;
+        unsafe {
+            ffi::lbm_ibm_compute_body_force_torque(
+                self.ptr as *const _, cx, cy,
+                &mut fx, &mut fy, &mut torque)
+        }
+        (fx, fy, torque)
+    }
+
+    /// 仅插值流体速度到所有标记点（不计算体力，不展布）。
+    ///
+    /// 用于对内部拉格朗日点做速度采样（内部质量方案 C）。
+    pub fn interpolate_only(&mut self, grid: &LbmGrid, dx: f64) {
+        unsafe { ffi::lbm_ibm_interpolate_only(grid.ptr as *const _, self.ptr, dx) }
+    }
+
     /// 读取所有标记点的 Lagrangian 力 `(fx, fy)`。
     /// 在 `step_*()` 调用后调用此函数以获取当前步的力值。
     pub fn get_forces(&self) -> (Vec<f64>, Vec<f64>) {
@@ -1501,6 +1673,22 @@ impl LbmIbmMarkerSet {
             ffi::lbm_ibm_get_forces(self.ptr as *const _, fx.as_mut_ptr(), fy.as_mut_ptr())
         }
         (fx, fy)
+    }
+
+    /// 读取所有标记点的当前坐标 `(x, y)`。
+    pub fn get_positions(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut x = vec![0.0_f64; self.n_markers];
+        let mut y = vec![0.0_f64; self.n_markers];
+        unsafe {
+            ffi::lbm_ibm_get_positions(self.ptr as *const _, x.as_mut_ptr(), y.as_mut_ptr())
+        }
+        (x, y)
+    }
+
+    /// 读取单个标记点的当前坐标 `(x, y)`（便捷方法）。
+    pub fn get_marker_position(&self, idx: usize) -> (f64, f64) {
+        let (x, y) = self.get_positions();
+        (x[idx.min(self.n_markers - 1)], y[idx.min(self.n_markers - 1)])
     }
 
     /// 重置 Penalty-IBM 积分（用于重启仿真）。
@@ -1605,8 +1793,175 @@ unsafe impl Send for LbmIbmMarkerSet {}
 unsafe impl Sync for LbmIbmMarkerSet {}
 
 // ---------------------------------------------------------------------------
-/// GPU（CUDA）求解器封装
+// 2D 刚体求解器封装（RigidBodySolver2D / Suzuki & Inamuro 2011）
 // ---------------------------------------------------------------------------
+
+/// `fsi::RigidBodySolver2D` 的安全封装（2D 自由运动刚体求解器）。
+///
+/// 封装了 Suzuki & Inamuro (2011) 的刚体运动方程积分，支持 4 种内部质量修正方案（A/B-1/B-2/C），
+/// 用于 IBM 中封闭结构的内部流体伪动量补偿。
+///
+/// # 典型用法（IBM 自由运动圆柱）
+///
+/// ```ignore
+/// // 建立标记点集（圆形）
+/// let mut ms = LbmIbmMarkerSet::new_circle(cx0, cy0, radius, n_markers);
+///
+/// // 建立刚体求解器
+/// let ref_x: Vec<f64> = ms.iter().map(|mk| mk.x - cx0).collect();
+/// let ref_y: Vec<f64> = ms.iter().map(|mk| mk.y - cy0).collect();
+/// let mut rb = LbmRigidBody2D::new(mass, inertia, rho_b, rho_f,
+///                                   cx0, cy0, Scheme::FengRigidBody,
+///                                   true, &ref_x, &ref_y, &[], &[]);
+///
+/// for _ in 0..n_steps {
+///     solver.step(&mut grid);
+///     // 用当前刚体状态设置逐标记点目标速度
+///     let (cx, cy, ux_cm, uy_cm, _, omega) = rb.state();
+///     ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+///     ms.step_mdf(&mut grid, dx, dt, n_iter);
+///     // 计算合力矩并推进刚体
+///     let (ftot_x, ftot_y, ttot) = ms.compute_body_force_and_torque(cx, cy);
+///     rb.advance(-ftot_x, -ftot_y, -ttot, dt);   // 固体受流体反作用力（符号取反）
+///     // 同步标记点位置
+///     let (bx, by) = rb.boundary_positions();
+///     ms.update_positions(&bx, &by);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct LbmRigidBody2D {
+    ptr: *mut ffi::RigidBody2DHandle,
+    n_bnd: usize,
+    n_int: usize,
+}
+
+/// 内部质量修正方案（对应 `fsi::InternalMassScheme`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigidBodyScheme {
+    /// 方案 A：无内部质量修正（仅适用于开放结构或外部不需要补偿的情况）。
+    None = 0,
+    /// 方案 B-1：Uhlmann (2005) 刚体内部质量修正。
+    UhlmannRigidBody = 1,
+    /// 方案 B-2：Feng & Michaelides (2004) 刚体内部质量修正。
+    FengRigidBody = 2,
+    /// 方案 C：内部拉格朗日点（Suzuki & Inamuro 2011 直接方法）。
+    LagrangianPoints = 3,
+}
+
+impl LbmRigidBody2D {
+    /// 创建 2D 刚体求解器。
+    ///
+    /// # 参数
+    /// - `mass, inertia`：刚体质量 m 与转动惯量 Izz（格子单位）
+    /// - `rho_b, rho_f`：刚体密度与流体参考密度（格子单位）
+    /// - `cx0, cy0`：初始质心坐标
+    /// - `scheme`：内部质量方案
+    /// - `is_closed`：是否为封闭结构（控制是否应用内部质量修正）
+    /// - `ref_x, ref_y`：边界标记点参考坐标（体固系，长度 n_bnd）
+    /// - `int_ref_x, int_ref_y`：内部点参考坐标（仅方案 C 使用）
+    pub fn new(mass: f64, inertia: f64,
+               rho_b: f64, rho_f: f64,
+               cx0: f64, cy0: f64,
+               scheme: RigidBodyScheme,
+               is_closed: bool,
+               ref_x: &[f64], ref_y: &[f64],
+               int_ref_x: &[f64], int_ref_y: &[f64]) -> Self {
+        let n_bnd = ref_x.len();
+        let n_int = int_ref_x.len();
+        let ptr = unsafe {
+            ffi::lbm_rigid2d_create(
+                mass, inertia, rho_b, rho_f, cx0, cy0,
+                scheme as std::os::raw::c_int,
+                if is_closed { 1 } else { 0 },
+                ref_x.as_ptr(), ref_y.as_ptr(), n_bnd as std::os::raw::c_int,
+                if int_ref_x.is_empty() { std::ptr::null() } else { int_ref_x.as_ptr() },
+                if int_ref_y.is_empty() { std::ptr::null() } else { int_ref_y.as_ptr() },
+                n_int as std::os::raw::c_int,
+            )
+        };
+        Self { ptr, n_bnd, n_int }
+    }
+
+    /// 获取当前运动状态：`(cx, cy, ux, uy, theta, omega)`。
+    pub fn state(&self) -> (f64, f64, f64, f64, f64, f64) {
+        let (mut cx, mut cy) = (0.0_f64, 0.0_f64);
+        let (mut ux, mut uy) = (0.0_f64, 0.0_f64);
+        let (mut theta, mut omega) = (0.0_f64, 0.0_f64);
+        unsafe {
+            ffi::lbm_rigid2d_get_state(self.ptr as *const _,
+                &mut cx, &mut cy, &mut ux, &mut uy, &mut theta, &mut omega);
+        }
+        (cx, cy, ux, uy, theta, omega)
+    }
+
+    /// 设置初始速度（质心速度 + 角速度）。
+    pub fn set_velocity(&mut self, ux: f64, uy: f64, omega: f64) {
+        unsafe { ffi::lbm_rigid2d_set_velocity(self.ptr, ux, uy, omega) }
+    }
+
+    /// 获取边界标记点当前绝对坐标 `(x[], y[])`。
+    pub fn boundary_positions(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut x = vec![0.0_f64; self.n_bnd];
+        let mut y = vec![0.0_f64; self.n_bnd];
+        unsafe { ffi::lbm_rigid2d_get_boundary_positions(self.ptr as *const _, x.as_mut_ptr(), y.as_mut_ptr()) }
+        (x, y)
+    }
+
+    /// 获取边界标记点当前速度（由刚体旋转算出）`(ux[], uy[])`。
+    pub fn boundary_velocities(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut ux = vec![0.0_f64; self.n_bnd];
+        let mut uy = vec![0.0_f64; self.n_bnd];
+        unsafe { ffi::lbm_rigid2d_get_boundary_velocities(self.ptr as *const _, ux.as_mut_ptr(), uy.as_mut_ptr()) }
+        (ux, uy)
+    }
+
+    /// 获取内部点当前绝对坐标（方案 C）。
+    pub fn internal_positions(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut x = vec![0.0_f64; self.n_int];
+        let mut y = vec![0.0_f64; self.n_int];
+        unsafe { ffi::lbm_rigid2d_get_internal_positions(self.ptr as *const _, x.as_mut_ptr(), y.as_mut_ptr()) }
+        (x, y)
+    }
+
+    /// 设置内部点的插值流体速度（方案 C，调用前须先 `interpolate_only(grid, ms_int, dx)`）。
+    pub fn set_internal_velocities(&mut self, ux: &[f64], uy: &[f64]) {
+        if ux.len() < self.n_int || uy.len() < self.n_int { return; }
+        unsafe { ffi::lbm_rigid2d_set_internal_velocities(self.ptr, ux.as_ptr(), uy.as_ptr()) }
+    }
+
+    /// 计算内部动量 Pin, Lin（方案 C）。须先设置内部点速度。
+    pub fn compute_internal_momentum(&mut self) {
+        unsafe { ffi::lbm_rigid2d_compute_internal_momentum(self.ptr) }
+    }
+
+    /// 推进刚体一个时间步。
+    ///
+    /// # 参数
+    /// - `total_fx/fy`：IBM 施加到**固体**上的总力（= -IBM 流体力，调用方取反）
+    /// - `total_torque`：IBM 施加到固体上的总力矩（同上，取反）
+    /// - `dt`：时间步长
+    pub fn advance(&mut self, total_fx: f64, total_fy: f64, total_torque: f64, dt: f64) {
+        unsafe { ffi::lbm_rigid2d_advance(self.ptr, total_fx, total_fy, total_torque, dt) }
+    }
+
+    /// 边界标记点数量。
+    pub fn n_boundary(&self) -> usize { self.n_bnd }
+
+    /// 内部点数量（方案 C）。
+    pub fn n_internal(&self) -> usize { self.n_int }
+}
+
+impl Drop for LbmRigidBody2D {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::lbm_rigid2d_free(self.ptr) }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for LbmRigidBody2D {}
+unsafe impl Sync for LbmRigidBody2D {}
 
 /// `lbm::GpuSolver` 的安全封装（D2Q9 BGK on CUDA）
 ///

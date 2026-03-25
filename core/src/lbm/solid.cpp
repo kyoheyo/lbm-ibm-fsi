@@ -296,7 +296,172 @@ void apply_solid_ibb(LatticeGrid& grid)
 }
 
 // ===========================================================================
-// 逐固体节点标记反弹方案
+// 清除所有固体节点标记（用于每步重新标记的运动固体）
+// ===========================================================================
+void clear_solid(LatticeGrid& grid)
+{
+    std::fill(grid.solid.begin(), grid.solid.end(), 0);
+    if (!grid.q_ibb.empty())
+        std::fill(grid.q_ibb.begin(), grid.q_ibb.end(), 0.5f);
+    if (!grid.solid_bc_node.empty())
+        std::fill(grid.solid_bc_node.begin(), grid.solid_bc_node.end(), 0);
+}
+
+// ===========================================================================
+// 运动刚体反弹（Ladd 1994 移动壁面修正版 BB）
+//
+// 公式（Ladd 1994, Eq.3.5）：
+//   f_ᾱ(x_f) = f_α*(x_f) - 2*w_α*ρ*(c_α·U_wall)/cs²
+//
+// 其中：
+//   c_α    — 速度方向向量（格子单位）
+//   w_α    — D2Q9 权重
+//   cs²    = 1/3 （格子单位）
+//   U_wall = U_cm + omega × r_w  （r_w = x_f + 0.5*c_α - x_cm）
+//          = (ux_cm - omega * ry_w, uy_cm + omega * rx_w)
+//
+// 注意：ρ 在流体节点处已知；为简便取 ρ=1（格子单位）以与现有 IBM 一致。
+// ===========================================================================
+void apply_solid_bounce_back_moving_rigid(LatticeGrid& grid,
+                                          double cx, double cy,
+                                          double ux_cm, double uy_cm, double omega,
+                                          int phys_i0, int phys_j0,
+                                          int phys_i1, int phys_j1)
+{
+    if (grid.model != LatticeModel::D2Q9) return;
+    if (grid.solid.empty()) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int Q  = d2q9::Q;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) collapse(2)
+#endif
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
+            const int nf = grid.idx(i, j);
+            if (grid.solid[nf]) continue;
+
+            for (int a = 1; a < Q; ++a) {
+                const int ca = d2q9::C[a][0];
+                const int cb = d2q9::C[a][1];
+                const int ni = i + ca;
+                const int nj = j + cb;
+                if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
+                if (!grid.solid[grid.idx(ni, nj)]) continue;
+
+                const int oa = d2q9::OPP[a];
+
+                // 壁面位置（流体节点沿 c_α 方向的半步处）
+                const double rx_w = (i + 0.5 * ca) - cx;
+                const double ry_w = (j + 0.5 * cb) - cy;
+
+                // 壁面速度（刚体旋转）
+                const double uw_x = ux_cm - omega * ry_w;
+                const double uw_y = uy_cm + omega * rx_w;
+
+                // c_α · U_wall
+                const double cu = ca * uw_x + cb * uw_y;
+
+                // Ladd 修正（cs² = 1/3，ρ = 1 格子单位）
+                const double correction = 6.0 * d2q9::W[a] * cu;  // 6 = 2/cs²
+
+                grid.f[nf * Q + oa] = grid.f_tmp[nf * Q + a] - correction;
+            }
+        }
+    }
+}
+
+void apply_solid_bounce_back_moving_rigid(LatticeGrid& grid,
+                                          double cx, double cy,
+                                          double ux_cm, double uy_cm, double omega)
+{
+    apply_solid_bounce_back_moving_rigid(grid, cx, cy, ux_cm, uy_cm, omega,
+                                         0, 0, grid.nx - 1, grid.ny - 1);
+}
+
+// ===========================================================================
+// 运动刚体 Bouzidi IBB（Ladd 移动壁面修正版 IBB）
+//
+// 在 IBB 基础上叠加 Ladd 壁面速度修正项（同 BB 移动版）：
+//   f_ᾱ(x_f) = [IBB 插值结果] - 2*w_α*ρ*(c_α·U_wall)/cs²
+// ===========================================================================
+void apply_solid_ibb_moving_rigid(LatticeGrid& grid,
+                                  double cx, double cy,
+                                  double ux_cm, double uy_cm, double omega,
+                                  int phys_i0, int phys_j0,
+                                  int phys_i1, int phys_j1)
+{
+    if (grid.model != LatticeModel::D2Q9) return;
+    if (grid.solid.empty()) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int Q  = d2q9::Q;
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for schedule(static) collapse(2)
+#endif
+    for (int j = phys_j0; j <= phys_j1; ++j) {
+        for (int i = phys_i0; i <= phys_i1; ++i) {
+            const int nf = grid.idx(i, j);
+            if (grid.solid[nf]) continue;
+
+            for (int a = 1; a < Q; ++a) {
+                const int ca = d2q9::C[a][0];
+                const int cb = d2q9::C[a][1];
+                const int ni = i + ca;
+                const int nj = j + cb;
+                if (ni < 0 || ni >= nx || nj < 0 || nj >= ny) continue;
+                if (!grid.solid[grid.idx(ni, nj)]) continue;
+
+                const int    oa = d2q9::OPP[a];
+                const double q  = static_cast<double>(grid.q_ibb[nf * Q + a]);
+
+                // Bouzidi IBB 无壁面速度项
+                double f_ibb;
+                if (q <= 0.5) {
+                    const int nni = i - ca;
+                    const int nnj = j - cb;
+                    if (nni >= 0 && nni < nx && nnj >= 0 && nnj < ny) {
+                        const int nnn = grid.idx(nni, nnj);
+                        if (!grid.solid[nnn]) {
+                            f_ibb = 2.0 * q * grid.f_tmp[nf * Q + a]
+                                  + (1.0 - 2.0 * q) * grid.f_tmp[nnn * Q + a];
+                        } else {
+                            f_ibb = grid.f_tmp[nf * Q + a];
+                        }
+                    } else {
+                        f_ibb = grid.f_tmp[nf * Q + a];
+                    }
+                } else {
+                    const double inv2q = 1.0 / (2.0 * q);
+                    f_ibb = inv2q * grid.f_tmp[nf * Q + a]
+                          + (1.0 - inv2q) * grid.f_tmp[nf * Q + oa];
+                }
+
+                // Ladd 壁面速度修正（r_w 从质心到壁面）
+                const double rx_w = (i + 0.5 * ca) - cx;
+                const double ry_w = (j + 0.5 * cb) - cy;
+                const double uw_x = ux_cm - omega * ry_w;
+                const double uw_y = uy_cm + omega * rx_w;
+                const double cu   = ca * uw_x + cb * uw_y;
+                const double correction = 6.0 * d2q9::W[a] * cu;
+
+                grid.f[nf * Q + oa] = f_ibb - correction;
+            }
+        }
+    }
+}
+
+void apply_solid_ibb_moving_rigid(LatticeGrid& grid,
+                                  double cx, double cy,
+                                  double ux_cm, double uy_cm, double omega)
+{
+    apply_solid_ibb_moving_rigid(grid, cx, cy, ux_cm, uy_cm, omega,
+                                  0, 0, grid.nx - 1, grid.ny - 1);
+}
 // ===========================================================================
 void assign_solid_bc_unmarked(LatticeGrid& grid, int bc_mode)
 {

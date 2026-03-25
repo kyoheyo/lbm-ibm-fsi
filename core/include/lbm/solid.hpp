@@ -74,6 +74,14 @@ enum class SolidBCType {
 void mark_solid_cylinder(LatticeGrid& grid, double cx, double cy, double radius);
 
 // ---------------------------------------------------------------------------
+// 清除所有固体节点标记
+//
+// 将 grid.solid 全部置零，并清空 q_ibb / solid_bc_node（若存在）。
+// 用于运动固体每步重新标记前的初始化，避免遗留上一步的固体节点标记。
+// ---------------------------------------------------------------------------
+void clear_solid(LatticeGrid& grid);
+
+// ---------------------------------------------------------------------------
 // 几何标记：将矩形区域 [i0,i1] × [j0,j1]（含边界）标记为固体
 //
 // 矩形面上的 q_ibb 保留默认值 0.5（即退化为标准半步长反弹）。
@@ -137,6 +145,45 @@ void apply_solid_ibb(LatticeGrid& grid);
 void apply_solid_ibb(LatticeGrid& grid,
                      int phys_i0, int phys_j0,
                      int phys_i1, int phys_j1);
+
+// ---------------------------------------------------------------------------
+// 运动刚体的 Ladd（1994）移动反弹边界条件
+//
+// 在反弹步中加入壁面动量修正项：
+//   f_ᾱ(x_f) = f_α*(x_f) - 2*w_α*ρ*(c_α·U_wall)/cs²
+// 其中 U_wall 为壁面速度，对运动刚体：
+//   U_wall = U_cm + omega × r_w   (2D: r_w = x_f + 0.5*c_α - x_cm)
+//
+// 参考：Ladd A.J.C. (1994) J. Fluid Mech. 271, 285-309, §3.
+//
+// @param grid        格子网格（须已由 mark_solid_cylinder 标记）
+// @param cx, cy      质心当前坐标（格子单位）
+// @param ux_cm, uy_cm 质心速度（格子单位/时间步）
+// @param omega       刚体角速度（rad/时间步；逆时针为正）
+// @param phys_i0/j0/i1/j1  物理区域（本地坐标，含端点）
+// ---------------------------------------------------------------------------
+void apply_solid_bounce_back_moving_rigid(LatticeGrid& grid,
+                                          double cx, double cy,
+                                          double ux_cm, double uy_cm, double omega,
+                                          int phys_i0, int phys_j0,
+                                          int phys_i1, int phys_j1);
+
+/// 向后兼容版（非 MPI，覆盖全网格）。
+void apply_solid_bounce_back_moving_rigid(LatticeGrid& grid,
+                                          double cx, double cy,
+                                          double ux_cm, double uy_cm, double omega);
+
+/// 运动刚体的 Bouzidi IBB 移动壁面版本（Ladd 修正 + IBB 插值）。
+void apply_solid_ibb_moving_rigid(LatticeGrid& grid,
+                                  double cx, double cy,
+                                  double ux_cm, double uy_cm, double omega,
+                                  int phys_i0, int phys_j0,
+                                  int phys_i1, int phys_j1);
+
+/// 向后兼容版（非 MPI，覆盖全网格）。
+void apply_solid_ibb_moving_rigid(LatticeGrid& grid,
+                                  double cx, double cy,
+                                  double ux_cm, double uy_cm, double omega);
 
 // ---------------------------------------------------------------------------
 // 逐固体节点标记反弹方案（用于多固体混合 BC 场景）
