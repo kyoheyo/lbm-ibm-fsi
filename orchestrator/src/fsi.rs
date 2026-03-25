@@ -436,20 +436,22 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
     let effective_bodies: &[IbmBodyConfig] = if ibm_cfg.bodies.is_empty() {
         if !ibm_cfg.geometry.is_empty() {
             single_body_list = vec![IbmBodyConfig {
-                geometry:     ibm_cfg.geometry.clone(),
-                x0:           ibm_cfg.x0,
-                y0:           ibm_cfg.y0,
-                size:         ibm_cfg.size,
-                n_markers:    ibm_cfg.n_markers,
-                mesh_file:    ibm_cfg.mesh_file.clone(),
-                label:        String::new(),
-                force_output: None,
-                method:       None,
-                n_iter:       None,
-                alpha:        None,
-                beta:         None,
-                motion_type:  MotionType::Fixed,
-                motion:       Default::default(),
+                geometry:      ibm_cfg.geometry.clone(),
+                x0:            ibm_cfg.x0,
+                y0:            ibm_cfg.y0,
+                size:          ibm_cfg.size,
+                n_markers:     ibm_cfg.n_markers,
+                mesh_file:     ibm_cfg.mesh_file.clone(),
+                label:         String::new(),
+                force_output:  None,
+                method:        None,
+                n_iter:        None,
+                alpha:         None,
+                beta:          None,
+                motion_type:   MotionType::Fixed,
+                motion:        Default::default(),
+                prescribed:    Default::default(),
+                flexible_beam: None,
             }];
             &single_body_list
         } else {
@@ -544,25 +546,32 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             }
         }
 
-        // 构建可选刚体求解器
-        let (motion_type, rigid_body, cx, cy) = match &body.motion_type {
+        // 构建可选刚体求解器 / 主动运动 / 柔性体求解器
+        let dt = 1.0_f64; // 格子单位时间步长（初始化时使用，advance时由step_ibm传入）
+        let n_markers = ms.len();
+
+        // 记录初始标记点位置（prescribed 旋转模式需要）
+        let (init_bx, init_by): (Vec<f64>, Vec<f64>) = {
+            let (xs, ys) = ms.get_positions();
+            (xs, ys)
+        };
+
+        let (motion_type, rigid_body, prescribed_motion, beam_solver, beam_s, cx, cy)
+            = match &body.motion_type
+        {
             MotionType::RigidFree => {
                 let mc = &body.motion;
                 let scheme = parse_rigid_scheme(&mc.internal_mass_scheme);
-                // 建立边界点参考坐标（体固系）
-                let n = ms.len();
-                let ref_x: Vec<f64> = (0..n).map(|k| {
+                let ref_x: Vec<f64> = (0..n_markers).map(|k| {
                     let (x, _) = ms.get_marker_position(k);
                     x - body.x0
                 }).collect();
-                let ref_y: Vec<f64> = (0..n).map(|k| {
+                let ref_y: Vec<f64> = (0..n_markers).map(|k| {
                     let (_, y) = ms.get_marker_position(k);
                     y - body.y0
                 }).collect();
-                // 自动推算质量（若未给出）：m = rho_b * pi * r^2（圆形）
                 let mass = if mc.mass > 0.0 { mc.mass }
                     else { mc.body_density * std::f64::consts::PI * body.size * body.size };
-                // 自动推算转动惯量（若未给出）：I = 0.5*m*r^2（实心圆柱）
                 let inertia = if mc.inertia > 0.0 { mc.inertia }
                     else { 0.5 * mass * body.size * body.size };
                 let mut rb = LbmRigidBody2D::new(
@@ -579,14 +588,61 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
                         body_idx, mass, inertia, mc.is_closed, &mc.internal_mass_scheme
                     );
                 }
-                (MotionType::RigidFree, Some(rb), body.x0, body.y0)
+                (MotionType::RigidFree, Some(rb), None, None, vec![], body.x0, body.y0)
             }
-            other => (other.clone(), None, body.x0, body.y0),
+
+            MotionType::Prescribed => {
+                // 主动刚体：解析运动公式驱动
+                let pm = PrescribedMotion::new(&body.prescribed);
+                if rank == 0 {
+                    println!(
+                        "  [IBM] body[{}] motion=prescribed  mode={}  amplitude={:.4}  frequency={:.6}",
+                        body_idx, body.prescribed.mode, body.prescribed.amplitude, body.prescribed.frequency
+                    );
+                }
+                (MotionType::Prescribed, None, Some(pm), None, vec![], body.x0, body.y0)
+            }
+
+            MotionType::Flexible => {
+                // 柔性体：被动（梁求解器）或主动（行波）
+                let arc_s = uniform_arc_s(n_markers, body.size);
+
+                if let Some(ref beam_cfg) = body.flexible_beam {
+                    // 被动柔性体：Euler-Bernoulli 梁 FEM
+                    let bs = BeamSolver::new(beam_cfg, dt);
+                    if rank == 0 {
+                        println!(
+                            "  [IBM] body[{}] motion=flexible(passive beam)  L={:.2}  EI={:.4}  n_elem={}",
+                            body_idx, beam_cfg.length, beam_cfg.young_modulus * beam_cfg.second_moment, beam_cfg.n_elements
+                        );
+                    }
+                    (MotionType::Flexible, None, None, Some(bs), arc_s, body.x0, body.y0)
+                } else {
+                    // 主动柔性体：行波/振荡驱动（prescribed 参数）
+                    let pm = PrescribedMotion::new(&body.prescribed);
+                    if rank == 0 {
+                        println!(
+                            "  [IBM] body[{}] motion=flexible(active prescribed)  mode={}  amplitude={:.4}  frequency={:.6}",
+                            body_idx, body.prescribed.mode, body.prescribed.amplitude, body.prescribed.frequency
+                        );
+                    }
+                    (MotionType::Flexible, None, Some(pm), None, arc_s, body.x0, body.y0)
+                }
+            }
+
+            other => (other.clone(), None, None, None, vec![], body.x0, body.y0),
         };
 
         entries.push(IbmEntry {
             ms, label, force_cfg, method, n_iter, alpha, beta,
-            motion_type, rigid_body, cx, cy,
+            motion_type, rigid_body,
+            prescribed: prescribed_motion,
+            beam_solver,
+            beam_s,
+            cx, cy,
+            init_bx,
+            init_by,
+            theta: 0.0,
         });
     }
 

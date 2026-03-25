@@ -634,6 +634,8 @@ fn step_solid_moving(
         }
     }
 }
+
+fn write_step_snapshot(
     cfg: &Config,
     grid: &LbmGrid,
     step: u64,
