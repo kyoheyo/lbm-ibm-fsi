@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet, LbmRigidBody2D, RigidBodyScheme};
 
 use crate::config::{Config, FsiConfig, IbmBodyConfig, SolidForceOutputConfig, MotionType, RigidBodyMotionConfig};
+use crate::motion::{PrescribedMotion, BeamSolver, uniform_arc_s};
 
 // ---------------------------------------------------------------------------
 // 耦合模式枚举
@@ -72,21 +73,33 @@ pub struct IbmEntry {
     pub label: String,
     /// 受力输出配置
     pub force_cfg: SolidForceOutputConfig,
-    /// IBM 力计算方法（`"mdf"` / `"mls"` / `"penalty"` / `"ivc"` / `"ivc_stationary"`）；来自体级覆盖或全局默认
+    /// IBM 力计算方法
     pub method: String,
-    /// MDF 子迭代次数（`method="mdf"` 时有效）
+    /// MDF 子迭代次数
     pub n_iter: i32,
-    /// 罚函数比例增益（`method="penalty"` 时有效）
+    /// 罚函数比例增益
     pub alpha: f64,
-    /// 罚函数积分增益（`method="penalty"` 时有效）
+    /// 罚函数积分增益
     pub beta: f64,
-    /// 运动类型（`Fixed` / `RigidFree` / `Prescribed` / `Flexible`）
+    /// 运动类型
     pub motion_type: MotionType,
-    /// 刚体求解器（仅 `motion_type == RigidFree` 时非 None）
+    /// 被动刚体求解器（仅 `RigidFree` 时非 None）
     pub rigid_body: Option<LbmRigidBody2D>,
-    /// 该体质心当前坐标（`rigid_free` 时跟踪）
+    /// 主动运动求解器（`Prescribed` 或柔性体行波时非 None）
+    pub prescribed: Option<PrescribedMotion>,
+    /// 被动柔性体梁求解器（`Flexible` + `flexible_beam` 时非 None）
+    pub beam_solver: Option<BeamSolver>,
+    /// 标记点弧坐标（柔性体时使用）
+    pub beam_s: Vec<f64>,
+    /// 质心坐标（`rigid_free` / `prescribed` 时跟踪）
     pub cx: f64,
     pub cy: f64,
+    /// 标记点初始 x 坐标（prescribed 刚体旋转位置更新用）
+    pub init_bx: Vec<f64>,
+    /// 标记点初始 y 坐标
+    pub init_by: Vec<f64>,
+    /// 当前累计旋转角（prescribed rotate 模式）
+    pub theta: f64,
 }
 
 // ---------------------------------------------------------------------------

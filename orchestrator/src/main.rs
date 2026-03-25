@@ -1,6 +1,7 @@
 mod async_output;
 mod config;
 mod fsi;
+mod motion;
 mod output;
 mod python_bridge;
 mod sim;
