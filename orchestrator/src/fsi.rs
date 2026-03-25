@@ -90,8 +90,53 @@ pub struct IbmEntry {
 }
 
 // ---------------------------------------------------------------------------
-// 耦合模式解析与校验
+// 固体体运行时状态
 // ---------------------------------------------------------------------------
+
+/// 单个 BB/IBB 固体体的运行时状态（每步固体更新所需数据）
+pub struct SolidEntry {
+    /// 体形状（"cylinder" / "rectangle" / "mesh"；小写）
+    pub shape: String,
+    /// 圆柱：质心 x 坐标（全局格子单位，运动时逐步更新）
+    pub cx: f64,
+    /// 圆柱：质心 y 坐标（全局格子单位）
+    pub cy: f64,
+    /// 圆柱半径（格子单位）
+    pub radius: f64,
+    /// 矩形：西南角（全局格子坐标）
+    pub i0: i32, pub j0: i32,
+    /// 矩形：东北角
+    pub i1: i32, pub j1: i32,
+    /// 网格文件路径（仅 mesh 形状）
+    pub mesh_file: String,
+    /// 反弹方案：1 = BB，2 = IBB
+    pub bc_mode: i32,
+    /// 运动类型（`Fixed` / `RigidFree`）
+    pub motion_type: MotionType,
+    /// 刚体求解器（仅 `motion_type == RigidFree` 时非 None）
+    pub rigid_body: Option<LbmRigidBody2D>,
+    /// 体标签
+    pub label: String,
+    /// 受力输出配置
+    pub force_cfg: crate::config::SolidForceOutputConfig,
+}
+
+impl SolidEntry {
+    /// 该体是否为运动刚体（需要 Ladd 移动壁面修正）。
+    pub fn is_moving(&self) -> bool {
+        self.motion_type == MotionType::RigidFree
+    }
+
+    /// 质心当前速度 (ux, uy, omega)；静止体返回 (0,0,0)。
+    pub fn wall_velocity(&self) -> (f64, f64, f64) {
+        if let Some(rb) = &self.rigid_body {
+            let (_, _, ux, uy, _, omega) = rb.state();
+            (ux, uy, omega)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    }
+}
 
 /// 根据 TOML 配置确定最终使用的耦合模式。
 ///
@@ -171,7 +216,14 @@ pub fn validate_coupling_mode(
 /// 设置 BB / IBB 固体体：依次标记几何体并配置反弹方案。
 ///
 /// 遍历 `cfg.solid.bodies`，对每个体调用对应的几何标记函数，
-/// 最后根据 `cfg.solid.bc_type` 设置求解器的反弹方案。
+/// 根据 `cfg.solid.bc_type` 设置求解器的反弹方案。
+///
+/// - 若任一固体体 `motion_type = "rigid_free"`，求解器的自动 BB/IBB 被禁用
+///   （设为 None），由调用方在每步手动调用 [`step_solid_moving`] 施加移动壁面 BC。
+/// - 若所有固体体均为静止（`motion_type = "fixed"` 或缺省），则求解器自动处理 BC，
+///   与旧行为完全兼容。
+///
+/// 返回 `(Vec<SolidEntry>, has_moving)` 其中 `has_moving` 标识是否有运动刚体。
 ///
 /// MPI 坐标转换参数 `(x_start, y_start, phys_x0, phys_y0)` 用于将全局坐标
 /// 映射到本进程的本地网格坐标；单进程模式下均传 `(0, 0, 0, 0)`。
@@ -182,15 +234,21 @@ pub fn setup_solid_bodies(
     x_start: i32, y_start: i32,
     phys_x0: i32, phys_y0: i32,
     rank: i32,
-) {
+) -> (Vec<SolidEntry>, bool) {
     if cfg.solid.bodies.is_empty() {
-        return;
+        return (Vec::new(), false);
     }
 
     let to_local_i = |gi: i32| gi - x_start + phys_x0;
     let to_local_j = |gj: i32| gj - y_start + phys_y0;
 
-    for body in &cfg.solid.bodies {
+    // Pre-scan: check if any body is rigid_free
+    let has_moving = cfg.solid.bodies.iter()
+        .any(|b| b.motion_type == MotionType::RigidFree);
+
+    let mut entries: Vec<SolidEntry> = Vec::with_capacity(cfg.solid.bodies.len());
+
+    for (body_idx, body) in cfg.solid.bodies.iter().enumerate() {
         match body.shape.to_lowercase().as_str() {
             "cylinder" => {
                 let local_cx = body.cx - x_start as f64 + phys_x0 as f64;
@@ -198,8 +256,9 @@ pub fn setup_solid_bodies(
                 lbm_bindings::mark_solid_cylinder(grid, local_cx, local_cy, body.radius);
                 if rank == 0 {
                     println!(
-                        "  [solid] cylinder: center=({:.2}, {:.2}), radius={:.2}",
-                        body.cx, body.cy, body.radius
+                        "  [solid] cylinder[{}]: center=({:.2}, {:.2}), radius={:.2}{}",
+                        body_idx, body.cx, body.cy, body.radius,
+                        if body.motion_type == MotionType::RigidFree { " [rigid_free]" } else { "" }
                     );
                 }
             }
@@ -211,23 +270,20 @@ pub fn setup_solid_bodies(
                 );
                 if rank == 0 {
                     println!(
-                        "  [solid] rectangle: [{}, {}] x [{}, {}]",
-                        body.i0, body.i1, body.j0, body.j1
+                        "  [solid] rectangle[{}]: [{}, {}] x [{}, {}]",
+                        body_idx, body.i0, body.i1, body.j0, body.j1
                     );
                 }
             }
             "mesh" => {
                 if body.mesh_file.is_empty() {
                     if rank == 0 {
-                        eprintln!("  [warn] solid.bodies shape=\"mesh\" but mesh_file is empty, skipping");
+                        eprintln!("  [warn] solid.bodies[{}] shape=\"mesh\" but mesh_file is empty, skipping", body_idx);
                     }
                 } else {
                     lbm_bindings::mark_solid_from_mesh_file(grid, &body.mesh_file);
                     if rank == 0 {
-                        println!(
-                            "  [solid] mesh file: file={:?}",
-                            body.mesh_file
-                        );
+                        println!("  [solid] mesh[{}] file={:?}", body_idx, body.mesh_file);
                     }
                 }
             }
@@ -247,23 +303,86 @@ pub fn setup_solid_bodies(
             _                                                => 0_i32,
         };
         lbm_bindings::assign_solid_bc_unmarked(grid, body_bc_mode);
+
+        // --- 构建刚体求解器（仅 rigid_free）---
+        let (motion_type, rigid_body) = if body.motion_type == MotionType::RigidFree
+            && body.shape.to_lowercase() == "cylinder"
+        {
+            let mc = &body.motion;
+            let scheme = parse_rigid_scheme(&mc.internal_mass_scheme);
+            let mass = if mc.mass > 0.0 { mc.mass }
+                else { mc.body_density * std::f64::consts::PI * body.radius * body.radius };
+            let inertia = if mc.inertia > 0.0 { mc.inertia }
+                else { 0.5 * mass * body.radius * body.radius };
+            // BB/IBB 刚体不需要边界/内部标记点参考坐标（不使用 IBM 力计算）
+            let mut rb = LbmRigidBody2D::new(
+                mass, inertia,
+                mc.body_density.max(1.0), mc.rho_f,
+                body.cx, body.cy,
+                scheme, mc.is_closed,
+                &[], &[], &[], &[],
+            );
+            if mc.vel_x0 != 0.0 || mc.vel_y0 != 0.0 || mc.omega0 != 0.0 {
+                rb.set_velocity(mc.vel_x0, mc.vel_y0, mc.omega0);
+            }
+            if rank == 0 {
+                println!(
+                    "  [solid] body[{}] motion=rigid_free  mass={:.4}  inertia={:.4}  scheme={}",
+                    body_idx, mass, inertia, &mc.internal_mass_scheme
+                );
+            }
+            (MotionType::RigidFree, Some(rb))
+        } else {
+            (body.motion_type.clone(), None)
+        };
+
+        let label = if body.label.is_empty() {
+            format!("solid_body_{}", body_idx)
+        } else {
+            body.label.clone()
+        };
+
+        entries.push(SolidEntry {
+            shape:      body.shape.to_lowercase(),
+            cx:         body.cx,
+            cy:         body.cy,
+            radius:     body.radius,
+            i0: body.i0, j0: body.j0, i1: body.i1, j1: body.j1,
+            mesh_file:  body.mesh_file.clone(),
+            bc_mode:    body_bc_mode,
+            motion_type,
+            rigid_body,
+            label,
+            force_cfg:  Default::default(),  // global force_output is logged separately
+        });
     }
 
-    // 全局方案：供所有 solid_bc_node==0 的节点（即未被逐体覆盖的节点）使用。
-    let bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
+    // --- 全局方案：若无运动体，注册到求解器（solver.step 自动施加 BC）---
+    let global_bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
         "bounce_back"                                    => 1_i32,
         "interpolated_bounce_back" | "ibb" | "bouzidi"  => 2_i32,
         _                                                => 0_i32,
     };
-    lbm_bindings::mark_solid_bc(solver, bc_mode);
+
+    if has_moving {
+        // 运动刚体：禁用 solver 内的自动 BB/IBB；每步由 step_solid_moving 手动施加
+        lbm_bindings::mark_solid_bc(solver, 0);
+        if rank == 0 {
+            println!("  [solid] BC mode: MANUAL (rigid_free body detected — Ladd moving wall correction enabled)");
+        }
+    } else {
+        lbm_bindings::mark_solid_bc(solver, global_bc_mode);
+        if rank == 0 {
+            let scheme_name = match global_bc_mode {
+                1 => "BounceBack (half-way, Ladd 1994, 1st-order)",
+                2 => "InterpolatedBounceBack (Bouzidi 2001, 2nd-order)",
+                _ => "None (solid nodes marked, no bounce-back applied; debug only)",
+            };
+            println!("  [solid] BC scheme: {}", scheme_name);
+        }
+    }
 
     if rank == 0 {
-        let scheme_name = match bc_mode {
-            1 => "BounceBack (half-way, Ladd 1994, 1st-order)",
-            2 => "InterpolatedBounceBack (Bouzidi 2001, 2nd-order)",
-            _ => "None (solid nodes marked, no bounce-back applied; debug only)",
-        };
-        println!("  [solid] BC scheme: {}", scheme_name);
         if cfg.solid.force_output.enabled {
             let nprocs = lbm_bindings::mpi_size();
             println!(
@@ -277,6 +396,8 @@ pub fn setup_solid_bodies(
             }
         }
     }
+
+    (entries, has_moving)
 }
 
 // ---------------------------------------------------------------------------

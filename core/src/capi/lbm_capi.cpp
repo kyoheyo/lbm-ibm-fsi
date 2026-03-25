@@ -994,74 +994,7 @@ void lbm_apply_solid_ibb_moving_rigid(lbm::LatticeGrid* g,
 
 } // extern "C" (moving solid)
 
-// ===========================================================================
-// IBM 柔性体辅助 C-API：逐标记点目标速度设置
-// ===========================================================================
 extern "C" {
-
-/// 设置所有标记点的目标速度（统一值）。
-/// 等价于将所有 mk.ux_target = ux, mk.uy_target = uy。
-/// 静止固体调用 lbm_ibm_set_uniform_target(ms, 0, 0)；
-/// 运动刚体用 lbm_ibm_set_marker_targets() 设置逐点速度。
-void lbm_ibm_set_uniform_target(IbmMarkerSetHandle* ms, double ux, double uy)
-{
-    if (!ms) return;
-    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
-    for (auto& mk : marker_set->markers) {
-        mk.ux_target = ux;
-        mk.uy_target = uy;
-    }
-}
-
-/// 设置各标记点的目标速度（逐点，柔性体 / 旋转刚体使用）。
-/// @param ux   长度 ≥ ms.size() 的 x 速度数组
-/// @param uy   长度 ≥ ms.size() 的 y 速度数组
-/// @param n    实际写入的标记点数（取 min(n, ms.size())）
-void lbm_ibm_set_marker_targets(IbmMarkerSetHandle* ms,
-                                  const double* ux, const double* uy, int n)
-{
-    if (!ms || !ux || !uy) return;
-    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
-    const int nm = std::min(n, marker_set->size());
-    for (int m = 0; m < nm; ++m) {
-        marker_set->markers[m].ux_target = ux[m];
-        marker_set->markers[m].uy_target = uy[m];
-    }
-}
-
-/// 读取各标记点当前目标速度。
-void lbm_ibm_get_marker_targets(const IbmMarkerSetHandle* ms,
-                                  double* out_ux, double* out_uy)
-{
-    if (!ms || !out_ux || !out_uy) return;
-    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
-    for (int m = 0; m < marker_set->size(); ++m) {
-        out_ux[m] = marker_set->markers[m].ux_target;
-        out_uy[m] = marker_set->markers[m].uy_target;
-    }
-}
-
-/// 根据刚体运动状态（质心速度 + 角速度）为圆形标记点集设置逐点目标速度。
-///
-/// 目标速度（刚体旋转公式）：
-///   Uk = (ux_cm - omega*(mk.y - cy), uy_cm + omega*(mk.x - cx))
-///
-/// 适用于圆形 IBM 标记点集，不要求标记点按顺序排列。
-void lbm_ibm_set_rigid_body_targets(IbmMarkerSetHandle* ms,
-                                     double cx, double cy,
-                                     double ux_cm, double uy_cm, double omega)
-{
-    if (!ms) return;
-    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
-    for (auto& mk : marker_set->markers) {
-        const double rx = mk.x - cx;
-        const double ry = mk.y - cy;
-        mk.ux_target = ux_cm - omega * ry;
-        mk.uy_target = uy_cm + omega * rx;
-    }
-}
-
-} // extern "C" (IBM flexible helpers)
 
 /// 指向堆上 lbm::GpuSolver 的不透明句柄
 struct GpuSolverHandle;
@@ -1718,6 +1651,72 @@ void lbm_ibm_get_positions(const IbmMarkerSetHandle* ms, double* out_x, double* 
     for (int i = 0; i < marker_set->size(); ++i) {
         out_x[i] = marker_set->markers[i].x;
         out_y[i] = marker_set->markers[i].y;
+    }
+}
+
+// ===========================================================================
+// IBM 柔性体辅助 C-API：逐标记点目标速度设置
+// ===========================================================================
+
+/// 设置所有标记点的目标速度（统一值）。
+/// 等价于将所有 mk.ux_target = ux, mk.uy_target = uy。
+/// 静止固体调用 lbm_ibm_set_uniform_target(ms, 0, 0)；
+/// 运动刚体用 lbm_ibm_set_marker_targets() 设置逐点速度。
+void lbm_ibm_set_uniform_target(IbmMarkerSetHandle* ms, double ux, double uy)
+{
+    if (!ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    for (auto& mk : marker_set->markers) {
+        mk.ux_target = ux;
+        mk.uy_target = uy;
+    }
+}
+
+/// 设置各标记点的目标速度（逐点，柔性体 / 旋转刚体使用）。
+/// @param ux   长度 ≥ ms.size() 的 x 速度数组
+/// @param uy   长度 ≥ ms.size() 的 y 速度数组
+/// @param n    实际写入的标记点数（取 min(n, ms.size())）
+void lbm_ibm_set_marker_targets(IbmMarkerSetHandle* ms,
+                                  const double* ux, const double* uy, int n)
+{
+    if (!ms || !ux || !uy) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    const int nm = std::min(n, marker_set->size());
+    for (int m = 0; m < nm; ++m) {
+        marker_set->markers[m].ux_target = ux[m];
+        marker_set->markers[m].uy_target = uy[m];
+    }
+}
+
+/// 读取各标记点当前目标速度。
+void lbm_ibm_get_marker_targets(const IbmMarkerSetHandle* ms,
+                                  double* out_ux, double* out_uy)
+{
+    if (!ms || !out_ux || !out_uy) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    for (int m = 0; m < marker_set->size(); ++m) {
+        out_ux[m] = marker_set->markers[m].ux_target;
+        out_uy[m] = marker_set->markers[m].uy_target;
+    }
+}
+
+/// 根据刚体运动状态（质心速度 + 角速度）为圆形标记点集设置逐点目标速度。
+///
+/// 目标速度（刚体旋转公式）：
+///   Uk = (ux_cm - omega*(mk.y - cy), uy_cm + omega*(mk.x - cx))
+///
+/// 适用于圆形 IBM 标记点集，不要求标记点按顺序排列。
+void lbm_ibm_set_rigid_body_targets(IbmMarkerSetHandle* ms,
+                                     double cx, double cy,
+                                     double ux_cm, double uy_cm, double omega)
+{
+    if (!ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    for (auto& mk : marker_set->markers) {
+        const double rx = mk.x - cx;
+        const double ry = mk.y - cy;
+        mk.ux_target = ux_cm - omega * ry;
+        mk.uy_target = uy_cm + omega * rx;
     }
 }
 

@@ -1038,7 +1038,188 @@ int test_ibm_main()
     failures += test_ivc_ibm_force_nonzero();
     failures += test_ivc_ibm_machine_precision();
     failures += test_ivc_ibm_stationary_cache();
+    // 逐标记点目标速度 + 运动刚体 BB/IBB
+    failures += test_marker_target_velocity_default_zero();
+    failures += test_marker_target_velocity_set_uniform();
+    failures += test_moving_bb_zero_velocity_equals_static();
+    failures += test_moving_bb_ladd_correction_nonzero();
+    failures += test_clear_solid_resets_marks();
     return failures;
+}
+
+// ===========================================================================
+// 逐标记点目标速度测试
+// ===========================================================================
+
+// 测试：Marker 初始化后 ux_target / uy_target 默认为 0.0
+static int test_marker_target_velocity_default_zero()
+{
+    auto ms = ibm::MarkerSet::make_circle(10.0, 10.0, 3.0, 16);
+    bool ok = true;
+    for (const auto& mk : ms.markers) {
+        if (mk.ux_target != 0.0 || mk.uy_target != 0.0) {
+            ok = false;
+            break;
+        }
+    }
+    std::printf("[IBM] marker target velocity default zero: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：手动设置所有标记点目标速度后可正确读回
+static int test_marker_target_velocity_set_uniform()
+{
+    auto ms = ibm::MarkerSet::make_circle(10.0, 10.0, 3.0, 16);
+    const double ux_t = 0.05, uy_t = -0.02;
+    for (auto& mk : ms.markers) {
+        mk.ux_target = ux_t;
+        mk.uy_target = uy_t;
+    }
+    bool ok = true;
+    for (const auto& mk : ms.markers) {
+        if (std::abs(mk.ux_target - ux_t) > 1e-14 ||
+            std::abs(mk.uy_target - uy_t) > 1e-14) {
+            ok = false;
+            break;
+        }
+    }
+    std::printf("[IBM] marker target velocity set uniform: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// ===========================================================================
+// 运动 BB/IBB 测试
+// ===========================================================================
+
+// 测试：apply_solid_bounce_back_moving_rigid 在壁面速度为零时与静止 BB 等价
+static int test_moving_bb_zero_velocity_equals_static()
+{
+    // 建立两个完全相同的 32×32 均匀流场
+    const int nx = 32, ny = 32;
+    auto make_grid = [&]() {
+        lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+        // 以 u=(0.05,0) 均匀场初始化
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < nx; ++i) {
+                double rho = 1.0, ux = 0.05, uy = 0.0;
+                int n = g.idx(i, j);
+                for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                    double ci = static_cast<double>(lbm::d2q9::C[a][0]);
+                    double cj = static_cast<double>(lbm::d2q9::C[a][1]);
+                    double cu = ci*ux + cj*uy;
+                    double feq = lbm::d2q9::W[a] * rho *
+                                 (1.0 + 3.0*cu + 4.5*cu*cu - 1.5*(ux*ux+uy*uy));
+                    g.f[n * lbm::d2q9::Q + a] = feq;
+                    g.f_tmp[n * lbm::d2q9::Q + a] = feq;
+                }
+            }
+        return g;
+    };
+
+    auto g_static = make_grid();
+    auto g_moving = make_grid();
+
+    // 标记圆柱
+    const double cx = 16.0, cy = 16.0, r = 5.0;
+    lbm::mark_solid_cylinder(g_static, cx, cy, r);
+    lbm::mark_solid_cylinder(g_moving, cx, cy, r);
+
+    // 静止 BB
+    lbm::apply_solid_bounce_back(g_static, 0, 0, nx-1, ny-1);
+
+    // 移动 BB，壁面速度为零
+    lbm::apply_solid_bounce_back_moving_rigid(g_moving, cx, cy, 0.0, 0.0, 0.0,
+                                               0, 0, nx-1, ny-1);
+
+    // 比较所有流体节点 f
+    const int Q = lbm::d2q9::Q;
+    double max_diff = 0.0;
+    for (int n = 0; n < nx * ny; ++n) {
+        if (g_static.solid[n]) continue;
+        for (int a = 0; a < Q; ++a) {
+            double diff = std::abs(g_static.f[n * Q + a] - g_moving.f[n * Q + a]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    const bool ok = (max_diff < 1e-14);
+    std::printf("[IBM] moving BB (zero vel) == static BB: %s  (max_diff=%.2e)\n",
+                ok ? "PASS" : "FAIL", max_diff);
+    return ok ? 0 : 1;
+}
+
+// 测试：apply_solid_bounce_back_moving_rigid 在非零壁面速度时产生非零 Ladd 修正
+static int test_moving_bb_ladd_correction_nonzero()
+{
+    const int nx = 32, ny = 32;
+    lbm::LatticeGrid g_static(nx, ny, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid g_moving(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 均匀静止场（u=0）初始化
+    const double rho0 = 1.0;
+    for (int n = 0; n < nx * ny; ++n) {
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            g_static.f[n * lbm::d2q9::Q + a] = lbm::d2q9::W[a] * rho0;
+            g_static.f_tmp[n * lbm::d2q9::Q + a] = lbm::d2q9::W[a] * rho0;
+            g_moving.f[n * lbm::d2q9::Q + a] = lbm::d2q9::W[a] * rho0;
+            g_moving.f_tmp[n * lbm::d2q9::Q + a] = lbm::d2q9::W[a] * rho0;
+        }
+    }
+
+    const double cx = 16.0, cy = 16.0, r = 5.0;
+    lbm::mark_solid_cylinder(g_static, cx, cy, r);
+    lbm::mark_solid_cylinder(g_moving, cx, cy, r);
+
+    // 静止 BB
+    lbm::apply_solid_bounce_back(g_static, 0, 0, nx-1, ny-1);
+
+    // 移动 BB（圆柱以 ux=0.1 向右运动）
+    lbm::apply_solid_bounce_back_moving_rigid(g_moving, cx, cy, 0.1, 0.0, 0.0,
+                                               0, 0, nx-1, ny-1);
+
+    // 找至少一个流体节点的 f 值应有差异（Ladd 修正）
+    const int Q = lbm::d2q9::Q;
+    double max_diff = 0.0;
+    for (int n = 0; n < nx * ny; ++n) {
+        if (g_static.solid[n]) continue;
+        for (int a = 0; a < Q; ++a) {
+            double diff = std::abs(g_static.f[n * Q + a] - g_moving.f[n * Q + a]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    const bool ok = (max_diff > 1e-10);  // 应有非零差值
+    std::printf("[IBM] moving BB Ladd correction nonzero: %s  (max_diff=%.2e)\n",
+                ok ? "PASS" : "FAIL", max_diff);
+    return ok ? 0 : 1;
+}
+
+// 测试：clear_solid 正确重置所有固体标记
+static int test_clear_solid_resets_marks()
+{
+    const int nx = 24, ny = 24;
+    lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+
+    // 先标记圆柱
+    lbm::mark_solid_cylinder(g, 12.0, 12.0, 4.0);
+
+    // 确认有固体节点
+    int solid_count_before = 0;
+    for (int n = 0; n < nx * ny; ++n)
+        if (g.solid[n]) ++solid_count_before;
+
+    // 清除
+    lbm::clear_solid(g);
+
+    // 确认全部清零
+    int solid_count_after = 0;
+    for (int n = 0; n < nx * ny; ++n)
+        if (g.solid[n]) ++solid_count_after;
+
+    const bool ok = (solid_count_before > 0) && (solid_count_after == 0);
+    std::printf("[IBM] clear_solid resets marks: %s  (before=%d after=%d)\n",
+                ok ? "PASS" : "FAIL", solid_count_before, solid_count_after);
+    return ok ? 0 : 1;
 }
 
 // 从临时 CSV 文件加载标记点——验证坐标和 ds 正确

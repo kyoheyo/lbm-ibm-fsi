@@ -81,5 +81,108 @@ int test_fsi_main()
     failures += test_beam_node_count();
     failures += test_beam_at_rest();
     failures += test_beam_tip_deflection();
+    // RigidBodySolver2D 新测试
+    failures += test_rigid_body_at_rest_no_force();
+    failures += test_rigid_body_free_fall();
+    failures += test_rigid_body_rotation();
     return failures;
+}
+
+// ===========================================================================
+// RigidBodySolver2D 测试
+// ===========================================================================
+
+// 测试 4：无外力时刚体保持静止
+static int test_rigid_body_at_rest_no_force()
+{
+    fsi::RigidBodyParams2D p;
+    p.mass    = 1.0;
+    p.inertia = 0.5;
+    p.rho_b   = 2.0;
+    p.rho_f   = 1.0;
+    p.cx0 = 10.0;  p.cy0 = 10.0;
+    p.scheme  = fsi::InternalMassScheme::None;
+
+    fsi::RigidBodySolver2D rb(p, {}, {});
+    rb.set_ibm_forces(0.0, 0.0, 0.0);
+
+    const double dt = 0.1;
+    for (int t = 0; t < 100; ++t) rb.advance(dt);
+
+    const auto& s = rb.state();
+    const bool ok = (std::abs(s.cx - 10.0) < 1e-12 &&
+                     std::abs(s.cy - 10.0) < 1e-12 &&
+                     std::abs(s.ux)  < 1e-12 &&
+                     std::abs(s.uy)  < 1e-12 &&
+                     std::abs(s.omega) < 1e-12);
+    std::printf("[FSI] rigid body at rest (no force): %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试 5：恒定力作用下刚体做匀加速运动（a = F/m）
+static int test_rigid_body_free_fall()
+{
+    fsi::RigidBodyParams2D p;
+    p.mass    = 2.0;
+    p.inertia = 1.0;
+    p.rho_b   = 2.0;
+    p.rho_f   = 1.0;
+    p.cx0 = 0.0;  p.cy0 = 0.0;
+    p.scheme  = fsi::InternalMassScheme::None;
+
+    fsi::RigidBodySolver2D rb(p, {}, {});
+
+    const double F = 1.0;   // 恒力（方案 None：直接 F_total = F）
+    const double dt = 0.01;
+    const int    N  = 100;
+
+    for (int t = 0; t < N; ++t) {
+        rb.set_ibm_forces(F, 0.0, 0.0);
+        rb.advance(dt);
+    }
+    const double T = N * dt;
+    const auto& s = rb.state();
+    const double expected_ux = (F / p.mass) * T;
+    const double expected_cx = 0.5 * (F / p.mass) * T * T;
+
+    const bool ok = (std::abs(s.ux - expected_ux) < 1e-6 &&
+                     std::abs(s.cx - expected_cx)  < 1e-6);
+    std::printf("[FSI] rigid body free fall (a=F/m): %s  (cx=%.4f expected=%.4f)\n",
+                ok ? "PASS" : "FAIL", s.cx, expected_cx);
+    return ok ? 0 : 1;
+}
+
+// 测试 6：恒力矩作用下刚体做匀角加速度旋转（α = T/I）
+static int test_rigid_body_rotation()
+{
+    fsi::RigidBodyParams2D p;
+    p.mass    = 1.0;
+    p.inertia = 2.0;
+    p.rho_b   = 1.5;
+    p.rho_f   = 1.0;
+    p.cx0 = 5.0;  p.cy0 = 5.0;
+    p.scheme  = fsi::InternalMassScheme::None;
+
+    fsi::RigidBodySolver2D rb(p, {}, {});
+
+    const double Torque = 1.0;  // 恒力矩
+    const double dt     = 0.01;
+    const int    N      = 100;
+
+    for (int t = 0; t < N; ++t) {
+        rb.set_ibm_forces(0.0, 0.0, Torque);
+        rb.advance(dt);
+    }
+
+    // α = T/I = 0.5; omega = α*T = 0.5; theta = 0.5*α*T^2 = 0.25 (T=1.0)
+    const double T = N * dt;
+    const auto& s = rb.state();
+    const double expected_omega = (Torque / p.inertia) * T;
+    const double expected_theta = 0.5 * (Torque / p.inertia) * T * T;
+
+    const bool ok = (std::abs(s.omega - expected_omega) < 1e-6 &&
+                     std::abs(s.theta - expected_theta) < 1e-6);
+    std::printf("[FSI] rigid body rotation (alpha=T/I): %s  (omega=%.4f expected=%.4f)\n",
+                ok ? "PASS" : "FAIL", s.omega, expected_omega);
+    return ok ? 0 : 1;
 }

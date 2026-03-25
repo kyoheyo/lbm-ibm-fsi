@@ -146,13 +146,15 @@ fn run() -> Result<()> {
         coupling_mode, has_solid, has_ibm, cfg.fsi.normalized_coupling())?;
 
     // 固体标记与反弹方案（BB / IBB）
-    if coupling_mode.needs_solid() {
+    let (mut solid_entries, has_moving_solid) = if coupling_mode.needs_solid() {
         let (x_start, y_start, phys_x0, phys_y0) = mpi.global_coords();
         fsi::setup_solid_bodies(
             &cfg, &mut grid, &mut solver,
             x_start, y_start, phys_x0, phys_y0, rank,
-        );
-    }
+        )
+    } else {
+        (Vec::new(), false)
+    };
 
     // 注册流体边界条件
     sim::register_boundary_conditions(&cfg, &mut solver, &mpi, nprocs, rank);
@@ -229,7 +231,9 @@ fn run() -> Result<()> {
     // 时间循环
     let csv_path = format!("{}/monitor.csv", output_dir);
     run_time_loop(
-        &cfg, &mut grid, &mut solver, &mut ibm_entries,
+        &cfg, &mut grid, &mut solver,
+        &mut solid_entries, has_moving_solid,
+        &mut ibm_entries,
         &mut mpi, partition, &output_dir, &csv_path, combine_blocks, rank,
     )?;
 
@@ -285,6 +289,8 @@ fn run_time_loop(
     cfg: &Config,
     grid: &mut LbmGrid,
     solver: &mut LbmSolver,
+    solid_entries: &mut Vec<fsi::SolidEntry>,
+    has_moving_solid: bool,
     ibm_entries: &mut Vec<fsi::IbmEntry>,
     mpi: &mut sim::MpiDecomp,
     partition: Option<PartitionInfo>,
@@ -304,6 +310,18 @@ fn run_time_loop(
         solver.step(grid);
         // solver.step() → stream() 在 compute_macroscopic() 之后自动完成幽灵层 u 交换，
         // 无需在此显式调用 ibm_halo_exchange_u_2d()。
+
+        // 运动刚体 BB/IBB：手动施加 Ladd 移动壁面修正（在 solver.step 内已禁用自动 BC）
+        if has_moving_solid && !solid_entries.is_empty() {
+            let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                (p.phys_x0 as i32, p.phys_y0 as i32,
+                 (p.phys_x0 + p.local_nx - 1) as i32,
+                 (p.phys_y0 + p.local_ny - 1) as i32)
+            } else {
+                (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+            };
+            step_solid_moving(cfg, grid, solid_entries, pi0, pj0, pi1, pj1);
+        }
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
         if !ibm_entries.is_empty() {
@@ -532,8 +550,79 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
     }
 }
 
-/// 将当前欧拉场写出为本进程分区快照（格式由 `cfg.output.format` 决定）。
-fn write_step_snapshot(
+/// 运动刚体 BB/IBB 每步更新：施加 Ladd 移动壁面修正，推进 Newton-Euler 刚体积分，
+/// 并在步末清除旧标记、重新标记圆柱于新位置。
+///
+/// ## 时序（步 N 内）
+/// 1. 按当前位置/速度对每个体调用 `apply_solid_bb_moving_rigid` 或
+///    `apply_solid_ibb_moving_rigid`（Ladd 1994 移动壁面修正）。
+/// 2. 通过动量交换法（MEA）计算各刚体受力。
+/// 3. 用 Newton-Euler 方程推进刚体状态到步 N+1。
+/// 4. `clear_solid()` + `mark_solid_cylinder()` → 重新标记步 N+1 位置。
+///
+/// 对静止体（`motion_type != RigidFree`）调用移动版本但传零速度，
+/// 结果等价于标准半步长反弹（Ladd correction 为 0）。
+fn step_solid_moving(
+    cfg: &Config,
+    grid: &mut LbmGrid,
+    solid_entries: &mut [fsi::SolidEntry],
+    phys_i0: i32, phys_j0: i32,
+    phys_i1: i32, phys_j1: i32,
+) {
+    let dt = cfg.simulation.dt;
+
+    // --- Step A：对每个固体施加移动壁面 BB/IBB ---
+    for entry in solid_entries.iter() {
+        let (ux_cm, uy_cm, omega) = entry.wall_velocity();
+        let cx = entry.cx;
+        let cy = entry.cy;
+        match entry.bc_mode {
+            2 => lbm_bindings::apply_solid_ibb_moving_rigid(
+                grid, cx, cy, ux_cm, uy_cm, omega,
+                phys_i0, phys_j0, phys_i1, phys_j1),
+            _ => lbm_bindings::apply_solid_bb_moving_rigid(
+                grid, cx, cy, ux_cm, uy_cm, omega,
+                phys_i0, phys_j0, phys_i1, phys_j1),
+        }
+    }
+
+    // --- Step B + C：对运动刚体求力并推进状态 ---
+    let any_moving = solid_entries.iter().any(|e| e.is_moving());
+    if !any_moving { return; }
+
+    // 计算全局 MEA 合力（所有固体的总受力，通过 MPI_Allreduce 求和）
+    let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
+        grid, phys_i0, phys_j0, phys_i1, phys_j1);
+    // Note: 若多个刚体共存，目前简化为所有体共用总力；单体情形正确。
+    // 多体场景的精确 MEA 需要逐体 mask，此处不作区分。
+    let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+    let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+
+    for entry in solid_entries.iter_mut() {
+        if !entry.is_moving() { continue; }
+        if let Some(rb) = &mut entry.rigid_body {
+            // 固体所受流体合力 = MEA 合力（MEA 返回的是固体给流体的力，取负）
+            rb.advance(-global_fx, -global_fy, 0.0, dt);
+            let (cx, cy, _, _, _, _) = rb.state();
+            entry.cx = cx;
+            entry.cy = cy;
+        }
+    }
+
+    // --- Step D：清除标记并在新位置重新标记 ---
+    lbm_bindings::clear_solid(grid);
+    for entry in solid_entries.iter() {
+        if entry.shape == "cylinder" {
+            lbm_bindings::mark_solid_cylinder(grid, entry.cx, entry.cy, entry.radius);
+            lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+        }
+        // 矩形/mesh 不支持运动，但如果有标记也重新写入（静止位置）
+        if entry.shape == "rectangle" {
+            lbm_bindings::mark_solid_rectangle(grid, entry.i0, entry.j0, entry.i1, entry.j1);
+            lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+        }
+    }
+}
     cfg: &Config,
     grid: &LbmGrid,
     step: u64,
