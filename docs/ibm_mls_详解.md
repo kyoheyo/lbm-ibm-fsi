@@ -67,6 +67,8 @@
     - 19.5 MLS 插值回退策略的不一致性
     - 19.6 GMRES 收敛判据
     - 19.7 ✅ MDF Lagrangian 力累加修正（已修复）
+    - 19.8 ✅ 新增 `interpolate_velocity_at_points`（任意点速度插值接口）
+    - 19.9 ✅ 删除 MLS/IVC 函数死参数 `u_target_x/y`
 
 ---
 
@@ -1606,6 +1608,87 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
 
 **验证**：新增测试 `test_mdf_marker_force_accumulates`：3 次迭代后 `rms(mk.fx)` 与 1 次迭代量级相当（均非零），而修复前 3 次迭代后值趋近于 0。
 
+### 19.8 ✅ 新增 `interpolate_velocity_at_points`（任意点速度插值接口）
+
+**背景**：`RigidBodySolver2D` 方案 (C)（Lagrangian 内部点，见 `docs/运行时实现详解.md` §10.4.2）需要在每步 `advance()` 前，对刚体内部散点坐标插值流体速度，以计算真实内部动量 $\mathbf{P}_{in}(t)$。现有 `interpolate_velocity()` 仅能作用于 `MarkerSet`（边界标记点集合），无法直接用于任意散点集合。
+
+**新增接口**（不依赖 `MarkerSet`，直接接受坐标数组）：
+
+| 层 | 函数签名 | 行号范围 |
+|----|---------|---------|
+| C++ | `void interpolate_velocity_at_points(const LatticeGrid& g, const double* xs, const double* ys, int n, double dx, double* out_ux, double* out_uy)` | `interpolation.cpp` 第 1560–1610 行 |
+| C API | `void lbm_ibm_interpolate_at_points(const lbm::LatticeGrid* g, const double* xs, const double* ys, int n, double dx, double* out_ux, double* out_uy)` | `lbm_capi.cpp` 第 2161–2195 行 |
+| Rust | `LbmGrid::interpolate_at_points(&self, xs: &[f64], ys: &[f64], dx: f64) -> (Vec<f64>, Vec<f64>)` | `bindings/src/lib.rs` 第 ~1080–1100 行 |
+
+**算法**（TwoPoint 线性核，$\Delta x = 1$）：
+
+对每个点 $k$，以最近整格点为中心，取 $2 \times 2$ 支撑域：
+
+$$u^k_{x} = \sum_{i=i_0}^{i_0+1} \sum_{j=j_0}^{j_0+1} u_x(i,j) \cdot \phi\!\left(\frac{x^k - i \Delta x}{\Delta x}\right) \phi\!\left(\frac{y^k - j \Delta x}{\Delta x}\right)$$
+
+其中 $i_0 = \lfloor x^k/\Delta x \rfloor$，$\phi(r) = 1 - |r|$（2 点线性核，$|r| < 1$）。
+
+选用 2 点核（而非 4 点 Peskin 核）是因为内部点密集均匀分布，线性核已能精确表示近似刚体运动速度场（无插值误差），且计算量最小。
+
+**Rust 调用示例**：
+
+```rust
+// step_ibm() 中，method=Lagrangian 方案：
+if rb.n_internal() > 0 {
+    let (ix, iy) = rb.internal_positions();              // 取内部点绝对坐标
+    let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
+    rb.set_internal_velocities(&iux, &iuy);             // 写入 internal_pts_[k].ux/uy
+    rb.compute_internal_momentum();                     // 计算 P_in(t)（公式 38）
+}
+```
+
+**与 `interpolate_velocity()` 的对比**：
+
+| 特性 | `interpolate_velocity()` | `interpolate_velocity_at_points()` |
+|------|--------------------------|-------------------------------------|
+| 输入点集 | `MarkerSet`（边界标记点） | 任意坐标数组 `(xs, ys)` |
+| δ 核 | 可选（TwoPoint / FourPoint） | 固定 TwoPoint |
+| 结果写入 | `mk.ux` / `mk.uy` | 输出数组 `out_ux` / `out_uy` |
+| 设计用途 | IBM 边界无滑移插值 | 刚体内部点动量计算 / 通用散点采样 |
+
+### 19.9 ✅ 删除 MLS/IVC 函数死参数 `u_target_x/y`
+
+**背景**：以下四个 IBM 力计算函数的历史接口中含有 `u_target_x` / `u_target_y` 参数（用于指定全局统一的目标速度），但这两个参数在实现中**从未被读取**——各方法均通过 `mk.ux_target` / `mk.uy_target`（逐标记点存储的目标速度）来读取目标速度，而非函数参数。
+
+**受影响函数**（已从所有层删除死参数）：
+
+| 函数 | C++ 头文件 | C API | Rust 绑定 |
+|------|-----------|-------|-----------|
+| `compute_ibm_forces_mls_original` | `interpolation.hpp` | `lbm_capi.cpp` | `step_mls_original()` |
+| `compute_ibm_forces_mls_explicit` | `interpolation.hpp` | `lbm_capi.cpp` | `step_mls_explicit()` |
+| `compute_ibm_forces_ivc` | `interpolation.hpp` | `lbm_capi.cpp` | `step_ivc()` |
+| `compute_ibm_forces_ivc_stationary` | `interpolation.hpp` | `lbm_capi.cpp` | `step_ivc_stationary()` |
+
+**修改前签名（以 `compute_ibm_forces_mls_original` 为例）**：
+```cpp
+void compute_ibm_forces_mls_original(
+    LatticeGrid& grid, const MarkerSet& ms,
+    double dx, double dt,
+    double u_target_x, double u_target_y);   // ← 死参数，从未读取
+```
+
+**修改后签名**：
+```cpp
+void compute_ibm_forces_mls_original(
+    LatticeGrid& grid, const MarkerSet& ms,
+    double dx, double dt);
+```
+
+**Rust 侧对应删除**（`orchestrator/src/main.rs` 中 4 处调用点同步删除了多余的 `0.0, 0.0`）：
+```rust
+// 修改前
+entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0);
+// 修改后
+entry.ms.step_ivc(grid, dx, dt);
+```
+
+**影响范围**：无行为变更（死参数从未影响计算结果），仅清理接口，消除调用方的混淆与误用风险。
+
 ---
 
 ## 附录 A：符号速查表
@@ -1649,6 +1732,27 @@ IBM 力展布可能向幽灵行写入贡献（属于邻居进程物理行的一�
   5. 下一步 solver.step() 的碰撞步使用 fluid.force（Guo 体力格式）
 ```
 
+**含 `RigidBodySolver2D` 的完整调用顺序（单进程，方案 C）：**
+
+```
+每个时间步 n：
+  1. solver.step()
+  2. [可选] ibm_halo_exchange_u_2d()
+  3. step_ibm()：
+     a. ms.set_rigid_body_targets(cx, cy, ux, uy, omega)       ← 更新标记点目标速度
+     b. compute_ibm_forces_xxx()                                ← IBM 力计算（写入 fluid.force）
+     c. [仅方案 C] grid.interpolate_at_points(internal_pts)     ← §19.8 新接口：采样内部点速度
+        → rb.set_internal_velocities(iux, iuy)
+        → rb.compute_internal_momentum()                        ← 计算 P_in(t)（公式 38）
+     d. ms.compute_body_force_and_torque(cx, cy) → (Ftot, Ttot)
+        rb.advance(-Ftot_x, -Ftot_y, -Ttot, dt)               ← Newton-Euler 积分（公式 26–27）
+          内部：apply_internal_mass_scheme()                    ← 方案 A/B-1/B-2/C（公式 33–40）
+          末尾：update_boundary_markers()                       ← 公式 A.8–A.9
+        ms.update_positions(bx, by)                            ← 同步标记点到新位置
+  4. [可选] ibm_halo_reduce_force_2d()
+  5. 下一步 solver.step() 的碰撞步使用 fluid.force（Guo 体力格式）
+```
+
 ---
 
-*文档生成日期：2026-03-24；对应代码版本：commit `3a23166`（interpolation.cpp 行 1–1440）*
+*文档生成日期：2026-03-25；对应代码版本：commit `bc47b3b`（interpolation.cpp，structure.cpp，lbm_capi.cpp，bindings/src/lib.rs，orchestrator/src/main.rs）*
