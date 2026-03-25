@@ -47,6 +47,8 @@ mod ffi {
     pub enum MgTreeHandle {}
     /// 指向 `lbm::MgNode` 的不透明句柄（由树管理所有权，不由 Rust 释放）。
     pub enum MgNodeHandle {}
+    /// 指向堆上 `RigidBodySolver2D` 的不透明句柄（2D 刚体动力学求解器）。
+    pub enum RigidBody2DHandle {}
 
     /// 插件 ABI 使用的 C 兼容函数指针类型。
     /// 对应 lbm_capi.cpp / plugin_registry.cpp 中的同名 typedef（lbm_boundary_fn 等）。
@@ -361,7 +363,6 @@ mod ffi {
                                              h: *mut MpiDecomp2DHandle);
 
         // --- 刚体求解器 C-API（RigidBodySolver2D）---
-        pub enum RigidBody2DHandle {}
 
         /// 创建 2D 刚体求解器。scheme: 0=None,1=Uhlmann,2=Feng,3=Lagrangian
         pub fn lbm_rigid2d_create(
