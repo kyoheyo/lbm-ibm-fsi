@@ -75,6 +75,11 @@ static int test_beam_tip_deflection()
     return ok ? 0 : 1;
 }
 
+// 前向声明：RigidBodySolver2D 测试（定义在 test_fsi_main 之后）
+static int test_rigid_body_at_rest_no_force();
+static int test_rigid_body_free_fall();
+static int test_rigid_body_rotation();
+
 int test_fsi_main()
 {
     int failures = 0;

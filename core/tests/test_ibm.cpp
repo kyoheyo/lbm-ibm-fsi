@@ -1001,6 +1001,13 @@ static int test_ivc_ibm_stationary_cache()
     return ok ? 0 : 1;
 }
 
+// 前向声明：逐标记点目标速度 + 运动刚体 BB/IBB 测试（定义在 test_ibm_main 之后）
+static int test_marker_target_velocity_default_zero();
+static int test_marker_target_velocity_set_uniform();
+static int test_moving_bb_zero_velocity_equals_static();
+static int test_moving_bb_ladd_correction_nonzero();
+static int test_clear_solid_resets_marks();
+
 int test_ibm_main()
 {
     int failures = 0;

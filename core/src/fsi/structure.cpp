@@ -437,12 +437,12 @@ void RigidBodySolver2D::advance(double dt)
     state_.uy    += dt * inv_M   * (ibm_fy_     + fin_y);
     state_.omega += dt * inv_Izz * (ibm_torque_ + tin);
 
-    // 运动学积分（公式 A.6）
-    // Xc(t+dt) = Xc(t) + dt * Uc(t)
-    // theta(t+dt) = theta(t) + dt * omega(t)
-    state_.cx    += dt * state_.prev_ux;      // 用更新前速度（Euler）
-    state_.cy    += dt * state_.prev_uy;
-    state_.theta += dt * state_.prev_omega;
+    // 运动学积分（梯形法，二阶精度）
+    // Xc(t+dt) = Xc(t) + dt * 0.5*(Uc(t) + Uc(t+dt))
+    // theta(t+dt) = theta(t) + dt * 0.5*(omega(t) + omega(t+dt))
+    state_.cx    += dt * 0.5 * (state_.prev_ux    + state_.ux);
+    state_.cy    += dt * 0.5 * (state_.prev_uy    + state_.uy);
+    state_.theta += dt * 0.5 * (state_.prev_omega + state_.omega);
 
     // 用新位置/角度更新所有标记点坐标
     update_boundary_markers();
