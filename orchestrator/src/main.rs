@@ -526,16 +526,26 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
         match entry.method.to_lowercase().as_str() {
             "penalty"          => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
             "mls"              => entry.ms.step_mls(grid, dx, dt),
-            "mls_original"     => entry.ms.step_mls_original(grid, dx, dt, 0.0, 0.0),
-            "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt, 0.0, 0.0),
-            "ivc"              => entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0),
-            "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt, 0.0, 0.0),
+            "mls_original"     => entry.ms.step_mls_original(grid, dx, dt),
+            "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt),
+            "ivc"              => entry.ms.step_ivc(grid, dx, dt),
+            "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt),
             _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
         }
 
         // --- Step C：若为自由运动刚体，用 IBM 合力/力矩推进刚体 Newton-Euler 积分 ---
         if entry.motion_type == MotionType::RigidFree {
             if let Some(rb) = &mut entry.rigid_body {
+                // 方案 C（Lagrangian 内部点）：在 advance() 前插值内部点速度，
+                // 计算当前步内部动量 Pin(t)，供 advance() 中的内部质量修正使用。
+                // 插值使用 IBM 力施加前的流体速度 u*(t)（当前 grid.u，IBM 力尚未写入）。
+                if rb.n_internal() > 0 {
+                    let (ix, iy) = rb.internal_positions();
+                    let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
+                    rb.set_internal_velocities(&iux, &iuy);
+                    rb.compute_internal_momentum();
+                }
+
                 // IBM 力施加到流体（正方向）；固体所受反作用力为其负值（Newton III 定律）。
                 let cx = entry.cx;
                 let cy = entry.cy;

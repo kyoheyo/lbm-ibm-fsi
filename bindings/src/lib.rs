@@ -313,25 +313,21 @@ mod ffi {
         /// 原始 MLS-IBM 一步（MLS 插值 + MLS 形状函数展布，Algorithm 1，JCP 2025）。
         pub fn lbm_ibm_compute_mls_original(g: *mut LatticeGridHandle,
                                              ms: *mut IbmMarkerSetHandle,
-                                             dx: f64, dt: f64,
-                                             u_target_x: f64, u_target_y: f64);
+                                             dx: f64, dt: f64);
         /// 显式 MLS-IBM 一步（MLS 插值 + MLS 展布 + Z 修正，Algorithm 2，JCP 2025）。
         pub fn lbm_ibm_compute_mls_explicit(g: *mut LatticeGridHandle,
                                              ms: *mut IbmMarkerSetHandle,
-                                             dx: f64, dt: f64,
-                                             u_target_x: f64, u_target_y: f64);
+                                             dx: f64, dt: f64);
         /// IVC-IBM 一步（隐式速度校正，Wu & Shu 2009）。每步重建矩阵 A，适用于移动物体。
         pub fn lbm_ibm_compute_ivc(g: *mut LatticeGridHandle,
                                     ms: *mut IbmMarkerSetHandle,
-                                    dx: f64, dt: f64,
-                                    u_target_x: f64, u_target_y: f64);
+                                    dx: f64, dt: f64);
         /// IVC-IBM 一步（固定物体，LU 分解缓存）。首次调用构建并缓存 A 的 LU 分解，
         /// 后续步骤直接 LU 代换，更高效。*cache_handle 首次调用前须为 null。
         pub fn lbm_ibm_compute_ivc_stationary(g: *mut LatticeGridHandle,
                                                ms: *mut IbmMarkerSetHandle,
                                                dx: f64, dt: f64,
-                                               cache_handle: *mut *mut c_void,
-                                               u_target_x: f64, u_target_y: f64);
+                                               cache_handle: *mut *mut c_void);
         /// 释放由 lbm_ibm_compute_ivc_stationary() 分配的缓存。
         pub fn lbm_ibm_ivc_stationary_cache_free(cache_handle: *mut *mut c_void);
         /// 读取 Lagrangian 力 (fx, fy)；out_fx/out_fy 长度须 ≥ size()。
@@ -408,6 +404,12 @@ mod ffi {
             out_fx: *mut f64, out_fy: *mut f64, out_torque: *mut f64);
         pub fn lbm_ibm_interpolate_only(g: *const LatticeGridHandle,
             ms: *mut IbmMarkerSetHandle, dx: f64);
+        /// 在任意位置插值流体速度（TwoPoint δ 核，适用于内部拉格朗日点）。
+        /// out_ux/out_uy 长度须 ≥ n。
+        pub fn lbm_ibm_interpolate_at_points(g: *const LatticeGridHandle,
+            x: *const f64, y: *const f64, n: c_int,
+            dx: f64,
+            out_ux: *mut f64, out_uy: *mut f64);
         pub fn lbm_ibm_get_marker_velocities(ms: *const IbmMarkerSetHandle,
             out_ux: *mut f64, out_uy: *mut f64);
         pub fn lbm_ibm_update_marker_positions(ms: *mut IbmMarkerSetHandle,
@@ -587,6 +589,31 @@ impl LbmGrid {
 
     /// 将体力场清零（每个 IBM 时间步开始前调用，防止上一步残留力场被累积）。
     pub fn zero_force(&mut self) { unsafe { ffi::lbm_grid_zero_force(self.ptr) } }
+
+    /// 在任意位置插值流体速度（TwoPoint δ 核，适用于内部拉格朗日点）。
+    ///
+    /// 将欧拉流体速度场 u 插值到给定的 n 个点 (x[], y[]) 处。
+    /// x/y 须等长；返回 (out_ux, out_uy) 两个向量，长度与输入相同。
+    ///
+    /// 用途：为 Lagrangian 方案（`internal_mass_scheme = "lagrangian"`）的
+    /// 内部拉格朗日点插值流体速度 u*(t)，供 `compute_internal_momentum()` 使用。
+    pub fn interpolate_at_points(&self, x: &[f64], y: &[f64], dx: f64)
+        -> (Vec<f64>, Vec<f64>)
+    {
+        let n = x.len().min(y.len());
+        let mut out_ux = vec![0.0_f64; n];
+        let mut out_uy = vec![0.0_f64; n];
+        if n > 0 {
+            unsafe {
+                ffi::lbm_ibm_interpolate_at_points(
+                    self.ptr as *const _,
+                    x.as_ptr(), y.as_ptr(), n as i32,
+                    dx,
+                    out_ux.as_mut_ptr(), out_uy.as_mut_ptr())
+            }
+        }
+        (out_ux, out_uy)
+    }
 
     /// 原始可变指针 — 仅供 `LbmSolver::step` 内部使用。
     ///
@@ -1500,14 +1527,11 @@ impl LbmIbmMarkerSet {
     /// @param grid       格子网格
     /// @param dx         格子间距
     /// @param dt         时间步长
-    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
-    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
     pub fn step_mls_original(&mut self, grid: &mut LbmGrid,
-                              dx: f64, dt: f64,
-                              u_target_x: f64, u_target_y: f64) {
+                              dx: f64, dt: f64) {
         unsafe {
             ffi::lbm_ibm_compute_mls_original(
-                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+                grid.ptr, self.ptr, dx, dt)
         }
     }
 
@@ -1519,14 +1543,11 @@ impl LbmIbmMarkerSet {
     /// @param grid       格子网格
     /// @param dx         格子间距
     /// @param dt         时间步长
-    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
-    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
     pub fn step_mls_explicit(&mut self, grid: &mut LbmGrid,
-                              dx: f64, dt: f64,
-                              u_target_x: f64, u_target_y: f64) {
+                              dx: f64, dt: f64) {
         unsafe {
             ffi::lbm_ibm_compute_mls_explicit(
-                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+                grid.ptr, self.ptr, dx, dt)
         }
     }
 
@@ -1545,14 +1566,11 @@ impl LbmIbmMarkerSet {
     /// @param grid       格子网格
     /// @param dx         格子间距（通常 = 1.0）
     /// @param dt         时间步长（通常 = 1.0）
-    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
-    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
     pub fn step_ivc(&mut self, grid: &mut LbmGrid,
-                     dx: f64, dt: f64,
-                     u_target_x: f64, u_target_y: f64) {
+                     dx: f64, dt: f64) {
         unsafe {
             ffi::lbm_ibm_compute_ivc(
-                grid.ptr, self.ptr, dx, dt, u_target_x, u_target_y)
+                grid.ptr, self.ptr, dx, dt)
         }
     }
 
@@ -1567,15 +1585,12 @@ impl LbmIbmMarkerSet {
     /// @param grid       格子网格
     /// @param dx         格子间距（通常 = 1.0）
     /// @param dt         时间步长（通常 = 1.0）
-    /// @param u_target_x 目标 x 速度（静止固体取 0.0）
-    /// @param u_target_y 目标 y 速度（静止固体取 0.0）
     pub fn step_ivc_stationary(&mut self, grid: &mut LbmGrid,
-                                dx: f64, dt: f64,
-                                u_target_x: f64, u_target_y: f64) {
+                                dx: f64, dt: f64) {
         unsafe {
             ffi::lbm_ibm_compute_ivc_stationary(
                 grid.ptr, self.ptr, dx, dt,
-                &mut self.ivc_cache, u_target_x, u_target_y)
+                &mut self.ivc_cache)
         }
     }
 

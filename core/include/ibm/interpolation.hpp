@@ -75,6 +75,30 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
                           DeltaKernel kernel = DeltaKernel::FourPoint);
 
 // ---------------------------------------------------------------------------
+// 在任意位置插值流体速度（使用标准 Peskin δ 函数）。
+//
+// 将欧拉流体速度场 u 插值到给定的 n 个点 (x[], y[]) 处，
+// 结果写入 out_ux[], out_uy[]（调用方须保证长度 ≥ n）。
+//
+// 用途：为刚体内部拉格朗日点（方案 C 内部质量）插值流体速度，
+//       无需为此构造完整 MarkerSet。
+//
+// @param grid     流体网格
+// @param x        点的 x 坐标数组（格子单位）
+// @param y        点的 y 坐标数组（格子单位）
+// @param n        点的数量
+// @param dx       格子间距
+// @param out_ux   输出 x 速度（长度 ≥ n）
+// @param out_uy   输出 y 速度（长度 ≥ n）
+// @param kernel   δ 核类型（默认 TwoPoint，内部点一般分布均匀，TwoPoint 足够）
+// ---------------------------------------------------------------------------
+void interpolate_velocity_at_points(const lbm::LatticeGrid& grid,
+                                    const double* x, const double* y, int n,
+                                    double dx,
+                                    double* out_ux, double* out_uy,
+                                    DeltaKernel kernel = DeltaKernel::TwoPoint);
+
+// ---------------------------------------------------------------------------
 // 力展布（标准 Peskin δ 函数）：
 //   f(x) = Σ_{X} F(X) δ(x − X) ΔS
 // 将拉格朗日 IBM 力密度展布到欧拉体力场（写入 grid.force）。
@@ -254,9 +278,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
                                       double dt          = 1.0,
-                                      DeltaKernel kernel = DeltaKernel::FourPoint,
-                                      double u_target_x  = 0.0,
-                                      double u_target_y  = 0.0);
+                                      DeltaKernel kernel = DeltaKernel::FourPoint);
 
 // ===========================================================================
 // 显式 MLS-IBM（Explicit MLS）—— MLS 插值 + MLS 展布 + 全局 Z 修正
@@ -279,9 +301,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
 void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
-                                      double dt         = 1.0,
-                                      double u_target_x = 0.0,
-                                      double u_target_y = 0.0);
+                                      double dt         = 1.0);
 
 // ===========================================================================
 // 隐式 MLS-IBM 力计算（Implicit MLS）—— Algorithm 3，Scheme II：GMRES 求解
@@ -411,9 +431,7 @@ void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
                               MarkerSet& ms,
                               double dx,
                               double dt             = 1.0,
-                              DeltaKernel kernel    = DeltaKernel::FourPoint,
-                              double u_target_x     = 0.0,
-                              double u_target_y     = 0.0);
+                              DeltaKernel kernel    = DeltaKernel::FourPoint);
 
 // ===========================================================================
 // 隐式速度校正 IBM（IVC-IBM）— 固定物体优化版（LU 缓存）
@@ -445,9 +463,7 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
                                         double dt,
                                         std::vector<double>& A_lu_cache,
                                         std::vector<int>&    piv_cache,
-                                        DeltaKernel kernel    = DeltaKernel::FourPoint,
-                                        double u_target_x     = 0.0,
-                                        double u_target_y     = 0.0);
+                                        DeltaKernel kernel    = DeltaKernel::FourPoint);
 
 // ===========================================================================
 // IBM 固体受力统计：合力计算

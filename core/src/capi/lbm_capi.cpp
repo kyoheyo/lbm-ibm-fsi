@@ -1439,8 +1439,7 @@ void lbm_ibm_compute_mls_implicit(lbm::LatticeGrid* g,
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
                                     IbmMarkerSetHandle* ms,
-                                    double dx, double dt,
-                                    double u_target_x, double u_target_y)
+                                    double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1448,8 +1447,7 @@ void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
     std::vector<double> pre_force = g->force;
 
     ibm::compute_ibm_forces_mls_original(*g, *marker_set, dx, dt,
-                                          ibm::DeltaKernel::FourPoint,
-                                          u_target_x, u_target_y);
+                                          ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1469,16 +1467,14 @@ void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_mls_explicit(lbm::LatticeGrid* g,
                                     IbmMarkerSetHandle* ms,
-                                    double dx, double dt,
-                                    double u_target_x, double u_target_y)
+                                    double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
 
     std::vector<double> pre_force = g->force;
 
-    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt,
-                                          u_target_x, u_target_y);
+    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1558,8 +1554,7 @@ void lbm_ibm_mls_stationary_cache_free(void** cache_handle)
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_ivc(lbm::LatticeGrid* g,
                            IbmMarkerSetHandle* ms,
-                           double dx, double dt,
-                           double u_target_x, double u_target_y)
+                           double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1568,8 +1563,7 @@ void lbm_ibm_compute_ivc(lbm::LatticeGrid* g,
     std::vector<double> pre_force = g->force;
 
     ibm::compute_ibm_forces_ivc(*g, *marker_set, dx, dt,
-                                  ibm::DeltaKernel::FourPoint,
-                                  u_target_x, u_target_y);
+                                  ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1599,8 +1593,7 @@ struct IvcStationaryCache {
 void lbm_ibm_compute_ivc_stationary(lbm::LatticeGrid* g,
                                       IbmMarkerSetHandle* ms,
                                       double dx, double dt,
-                                      void** cache_handle,
-                                      double u_target_x, double u_target_y)
+                                      void** cache_handle)
 {
     if (!g || !ms || !cache_handle) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1615,8 +1608,7 @@ void lbm_ibm_compute_ivc_stationary(lbm::LatticeGrid* g,
     ibm::compute_ibm_forces_ivc_stationary(
         *g, *marker_set, dx, dt,
         cache->A_lu, cache->piv,
-        ibm::DeltaKernel::FourPoint,
-        u_target_x, u_target_y);
+        ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -2151,6 +2143,30 @@ void lbm_ibm_interpolate_only(const lbm::LatticeGrid* g,
         *reinterpret_cast<ibm::MarkerSet*>(ms),
         dx,
         ibm::DeltaKernel::FourPoint);
+}
+
+/// 在任意位置插值流体速度（供内部拉格朗日点使用）。
+///
+/// 将欧拉流体速度场 u 插值到给定的 n 个点 (x[], y[]) 处，
+/// 结果写入 out_ux[], out_uy[]（调用方须保证长度 ≥ n）。
+/// 使用 TwoPoint（双线性）δ 核，适用于均匀分布的内部点。
+///
+/// @param g       LatticeGrid 指针
+/// @param x       点的 x 坐标数组（格子单位），长度 n
+/// @param y       点的 y 坐标数组（格子单位），长度 n
+/// @param n       点的数量
+/// @param dx      格子间距（通常 = 1.0）
+/// @param out_ux  输出 x 速度，长度 ≥ n
+/// @param out_uy  输出 y 速度，长度 ≥ n
+void lbm_ibm_interpolate_at_points(const lbm::LatticeGrid* g,
+                                    const double* x, const double* y, int n,
+                                    double dx,
+                                    double* out_ux, double* out_uy)
+{
+    if (!g || n <= 0 || !x || !y || !out_ux || !out_uy) return;
+    ibm::interpolate_velocity_at_points(
+        *g, x, y, n, dx, out_ux, out_uy,
+        ibm::DeltaKernel::TwoPoint);
 }
 
 /// 获取所有标记点的插值速度（插值后调用）。

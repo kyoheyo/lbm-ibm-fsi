@@ -102,6 +102,50 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
 }
 
 // ---------------------------------------------------------------------------
+// 在任意位置插值流体速度（供内部拉格朗日点等使用）
+// ---------------------------------------------------------------------------
+void interpolate_velocity_at_points(const lbm::LatticeGrid& grid,
+                                    const double* x, const double* y, int n,
+                                    double dx,
+                                    double* out_ux, double* out_uy,
+                                    DeltaKernel kernel)
+{
+    if (grid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("interpolate_velocity_at_points: only D2Q9 supported");
+    }
+    if (n <= 0 || !x || !y || !out_ux || !out_uy) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int support = (kernel == DeltaKernel::TwoPoint) ? 1 : 2;
+
+    for (int m = 0; m < n; ++m) {
+        const double xm = x[m] / dx;
+        const double ym = y[m] / dx;
+        const int i0 = static_cast<int>(std::floor(xm));
+        const int j0 = static_cast<int>(std::floor(ym));
+
+        double ux_sum = 0.0, uy_sum = 0.0;
+        for (int dj = -support; dj <= support + 1; ++dj) {
+            for (int di = -support; di <= support + 1; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+                const double phi_x = delta_phi(x[m] - ii * dx, dx, kernel);
+                const double phi_y = delta_phi(y[m] - jj * dx, dx, kernel);
+                const double phi = phi_x * phi_y * dx * dx;
+                ux_sum += grid.u[node * 2 + 0] * phi;
+                uy_sum += grid.u[node * 2 + 1] * phi;
+            }
+        }
+        out_ux[m] = ux_sum;
+        out_uy[m] = uy_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 力展布（二维，D2Q9）
 // ---------------------------------------------------------------------------
 void spread_force(lbm::LatticeGrid& grid,
@@ -1077,9 +1121,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
                                       double dt,
-                                      DeltaKernel /*kernel*/,
-                                      double u_target_x,
-                                      double u_target_y)
+                                      DeltaKernel /*kernel*/)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("Original MLS-IBM: only D2Q9 supported currently");
@@ -1119,9 +1161,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
 void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
-                                      double dt,
-                                      double u_target_x,
-                                      double u_target_y)
+                                      double dt)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("Explicit MLS-IBM: only D2Q9 supported currently");
@@ -1324,9 +1364,7 @@ void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
                               MarkerSet& ms,
                               double dx,
                               double dt,
-                              DeltaKernel kernel,
-                              double u_target_x,
-                              double u_target_y)
+                              DeltaKernel kernel)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("IVC-IBM: only D2Q9 supported currently");
@@ -1405,9 +1443,7 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
                                         double dt,
                                         std::vector<double>& A_lu_cache,
                                         std::vector<int>&    piv_cache,
-                                        DeltaKernel kernel,
-                                        double u_target_x,
-                                        double u_target_y)
+                                        DeltaKernel kernel)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("IVC-IBM stationary: only D2Q9 supported currently");
@@ -1427,8 +1463,7 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
             // 奇异矩阵：清空缓存，退化为逐步重建
             A_lu_cache.clear();
             piv_cache.clear();
-            compute_ibm_forces_ivc(fluid, ms, dx, dt, kernel,
-                                    u_target_x, u_target_y);
+            compute_ibm_forces_ivc(fluid, ms, dx, dt, kernel);
             return;
         }
     }
