@@ -326,7 +326,7 @@ fn run_time_loop(
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
         if !ibm_entries.is_empty() {
-            step_ibm(cfg, grid, ibm_entries);
+            step_ibm(cfg, grid, ibm_entries, step);
 
             // MPI 修正：spread_force() 可能向幽灵行写入力贡献；将这些贡献归还邻居并累加。
             if let Some(ref mut d2) = mpi.decomp2d {
@@ -505,23 +505,64 @@ fn run_time_loop(
 /// 每个体的方法参数优先使用体级覆盖（`[[ibm.bodies]]` 中的 `method`/`n_iter`/
 /// `alpha`/`beta` 字段），未设置时继承全局 `[ibm]` 设置。这允许同一仿真中
 /// 不同 IBM 体使用不同的力计算方案，以便直接对比各方法的效果。
-fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry]) {
+fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry], step: u64) {
     let dx = 1.0_f64;
     let dt = cfg.simulation.dt;
+    let t  = step as f64 * dt;  // 当前物理时刻（格子步）
     // 每个 IBM 时间步开始前清零体力场，防止上一步的力场残留被 pre_force 机制
     // 意外累积到当前步（会导致 MLS/MDF 直接力方法逐步发散）。
     grid.zero_force();
     for entry in ibm_entries.iter_mut() {
-        // --- Step A：若为自由运动刚体，更新标记点目标速度 ---
-        if entry.motion_type == MotionType::RigidFree {
-            if let Some(rb) = &entry.rigid_body {
-                let (cx, cy, ux_cm, uy_cm, _theta, omega) = rb.state();
-                entry.cx = cx;
-                entry.cy = cy;
-                entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+        // --- Step A：更新标记点目标速度 ---
+        match entry.motion_type {
+            MotionType::RigidFree => {
+                if let Some(rb) = &entry.rigid_body {
+                    let (cx, cy, ux_cm, uy_cm, _theta, omega) = rb.state();
+                    entry.cx = cx;
+                    entry.cy = cy;
+                    entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+                }
             }
+            MotionType::Prescribed => {
+                // 主动刚体：解析公式给出质心速度，再用刚体运动学分配到各标记点
+                if let Some(ref pm) = entry.prescribed {
+                    let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                    let cx = entry.cx;
+                    let cy = entry.cy;
+                    if omega != 0.0 {
+                        // 旋转模式：更新累计转角，重新计算标记点位置（从初始位置旋转）
+                        entry.theta += omega * dt;
+                        let cos_th = entry.theta.cos();
+                        let sin_th = entry.theta.sin();
+                        let n = entry.init_bx.len();
+                        let bx: Vec<f64> = (0..n).map(|k| {
+                            let rx = entry.init_bx[k] - entry.cx;
+                            let ry = entry.init_by[k] - entry.cy;
+                            entry.cx + rx * cos_th - ry * sin_th
+                        }).collect();
+                        let by: Vec<f64> = (0..n).map(|k| {
+                            let rx = entry.init_bx[k] - entry.cx;
+                            let ry = entry.init_by[k] - entry.cy;
+                            entry.cy + rx * sin_th + ry * cos_th
+                        }).collect();
+                        entry.ms.update_positions(&bx, &by);
+                    }
+                    entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+                }
+            }
+            MotionType::Flexible => {
+                if let Some(ref bs) = entry.beam_solver {
+                    // 被动柔性体：将当前梁速度写入标记点目标速度
+                    let (vx, vy) = bs.marker_velocities(&entry.beam_s);
+                    entry.ms.set_marker_targets(&vx, &vy);
+                } else if let Some(ref pm) = entry.prescribed {
+                    // 主动柔性体（行波/振荡）：解析速度写入各标记点
+                    let (vx, vy) = pm.eval_markers(t, &entry.beam_s);
+                    entry.ms.set_marker_targets(&vx, &vy);
+                }
+            }
+            _ => {}  // Fixed：不更新目标速度（保持零）
         }
-        // 柔性体：目标速度由外部（插件）在每步 IBM 前已设置完毕；无需在此处操作。
 
         // --- Step B：IBM 力计算（所有方法均从 mk.ux_target/uy_target 读取目标速度）---
         match entry.method.to_lowercase().as_str() {
@@ -534,29 +575,55 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry])
             _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
         }
 
-        // --- Step C：若为自由运动刚体，用 IBM 合力/力矩推进刚体 Newton-Euler 积分 ---
-        if entry.motion_type == MotionType::RigidFree {
-            if let Some(rb) = &mut entry.rigid_body {
-                // 方案 C（Lagrangian 内部点）：在 advance() 前插值内部点速度，
-                // 计算当前步内部动量 Pin(t)，供 advance() 中的内部质量修正使用。
-                // 插值使用 IBM 力施加前的流体速度 u*(t)（当前 grid.u，IBM 力尚未写入）。
-                if rb.n_internal() > 0 {
-                    let (ix, iy) = rb.internal_positions();
-                    let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
-                    rb.set_internal_velocities(&iux, &iuy);
-                    rb.compute_internal_momentum();
+        // --- Step C：根据运动类型推进结构状态 ---
+        match entry.motion_type {
+            MotionType::RigidFree => {
+                if let Some(rb) = &mut entry.rigid_body {
+                    // 方案 C（Lagrangian 内部点）：在 advance() 前插值内部点速度
+                    if rb.n_internal() > 0 {
+                        let (ix, iy) = rb.internal_positions();
+                        let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
+                        rb.set_internal_velocities(&iux, &iuy);
+                        rb.compute_internal_momentum();
+                    }
+                    let cx = entry.cx;
+                    let cy = entry.cy;
+                    let (ftot_x, ftot_y, ttot) = entry.ms.compute_body_force_and_torque(cx, cy);
+                    rb.advance(-ftot_x, -ftot_y, -ttot, dt);
+                    let (bx, by) = rb.boundary_positions();
+                    entry.ms.update_positions(&bx, &by);
                 }
-
-                // IBM 力施加到流体（正方向）；固体所受反作用力为其负值（Newton III 定律）。
-                let cx = entry.cx;
-                let cy = entry.cy;
-                let (ftot_x, ftot_y, ttot) = entry.ms.compute_body_force_and_torque(cx, cy);
-                rb.advance(-ftot_x, -ftot_y, -ttot, dt);
-
-                // 同步标记点位置到刚体旋转后的新位置
-                let (bx, by) = rb.boundary_positions();
-                entry.ms.update_positions(&bx, &by);
             }
+            MotionType::Prescribed => {
+                // translate/oscillate 模式：按质心速度平移所有标记点
+                if let Some(ref pm) = entry.prescribed {
+                    let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                    // 仅平移模式（无旋转）才平移标记点；旋转模式已在 Step A 处理
+                    if omega == 0.0 && (ux_cm != 0.0 || uy_cm != 0.0) {
+                        let n = entry.ms.len();
+                        let (cur_bx, cur_by) = entry.ms.get_positions();
+                        let new_bx: Vec<f64> = cur_bx.iter().map(|&x| x + ux_cm * dt).collect();
+                        let new_by: Vec<f64> = cur_by.iter().map(|&y| y + uy_cm * dt).collect();
+                        entry.ms.update_positions(&new_bx, &new_by);
+                        // 同步质心位置
+                        entry.cx += ux_cm * dt;
+                        entry.cy += uy_cm * dt;
+                        let _ = n; // used via new_bx/by
+                    }
+                }
+            }
+            MotionType::Flexible => {
+                if let Some(ref mut bs) = entry.beam_solver {
+                    // 被动柔性体：推进梁方程，然后更新标记点位置和速度
+                    let (ibm_fx, ibm_fy) = entry.ms.get_forces();
+                    let arc_s = entry.beam_s.clone();
+                    bs.advance(&ibm_fx, &ibm_fy, &arc_s);
+                    let (bx, by) = bs.marker_positions(&arc_s);
+                    entry.ms.update_positions(&bx, &by);
+                }
+                // 主动柔性体：位置由外部解析公式给定，无需更新（标记点目标速度已在 Step A 设置）
+            }
+            _ => {}
         }
     }
 }
