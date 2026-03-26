@@ -71,6 +71,7 @@ mod ffi {
         pub fn lbm_grid_ny(g: *const LatticeGridHandle) -> c_int;
         pub fn lbm_grid_nz(g: *const LatticeGridHandle) -> c_int;
         pub fn lbm_grid_rho(g: *const LatticeGridHandle, idx: c_int) -> f64;
+        pub fn lbm_grid_fill_rho(g: *mut LatticeGridHandle, rho0: f64);
         pub fn lbm_grid_ux(g: *const LatticeGridHandle, idx: c_int) -> f64;
         pub fn lbm_grid_uy(g: *const LatticeGridHandle, idx: c_int) -> f64;
 
@@ -585,6 +586,14 @@ impl LbmGrid {
     pub fn nz(&self) -> i32 { unsafe { ffi::lbm_grid_nz(self.ptr) } }
 
     pub fn rho(&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_rho(self.ptr, idx) } }
+
+    /// 将所有节点的初始密度设为 rho0。
+    ///
+    /// 必须在 [`LbmSolver::new`] **之前**调用，使求解器构造函数用 rho0 初始化平衡态。
+    /// 若不调用，默认 rho0 = 1.0（格子单位）。
+    pub fn fill_rho(&mut self, rho0: f64) {
+        unsafe { ffi::lbm_grid_fill_rho(self.ptr, rho0) }
+    }
     pub fn ux (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_ux (self.ptr, idx) } }
     pub fn uy (&self, idx: i32) -> f64 { unsafe { ffi::lbm_grid_uy (self.ptr, idx) } }
 

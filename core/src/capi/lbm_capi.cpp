@@ -90,6 +90,14 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
     return g->rho[idx];
 }
 
+/// 将所有节点的初始密度设为 rho0（在 Solver 构造前调用，使平衡初始化使用非单位密度）。
+/// Rust 封装: LbmGrid::fill_rho()
+void lbm_grid_fill_rho(lbm::LatticeGrid* g, double rho0)
+{
+    if (!g) return;
+    std::fill(g->rho.begin(), g->rho.end(), rho0);
+}
+
 /// 返回节点 idx 处的 x 方向速度；越界时返回 0。
 /// Rust 封装: LbmGrid::ux()
 double lbm_grid_ux(const lbm::LatticeGrid* g, int idx)

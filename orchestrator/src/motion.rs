@@ -173,7 +173,10 @@ pub struct BeamSolver {
     lu_piv:   Vec<usize>, // LU 置换向量
     m_mat:    Vec<f64>,   // 质量矩阵（行优先密集）
     c_mat:    Vec<f64>,   // 阻尼矩阵（Rayleigh，质量比例）
+    #[allow(dead_code)]
     k_mat:    Vec<f64>,   // 刚度矩阵（去掉 clamped 约束后的缩减矩阵）
+                          // 保留用于将来的残差计算或自适应时步方案中需重建 K_eff 的场景。
+                          // TODO: 若长期不使用，可在 BeamSolver::new() 末尾 drop(k_mat)。
     ndof:     usize,
 
     // ---- Newmark-β 参数 ----
@@ -363,28 +366,22 @@ impl BeamSolver {
         let q_new = lu_solve(&self.k_eff_lu, &self.lu_piv, &rhs, ndof);
 
         // ── Step 4：更新速度、加速度 ─────────────────────────────────────────
+        // Newmark-β 公式（β=0.25，γ=0.5）：
+        //   qddot_{n+1} = a0·(q_{n+1}−q_n) − a2·qdot_n − a3·qddot_n
+        //   qdot_{n+1}  = qdot_n + dt·[(1−γ)·qddot_n + γ·qddot_{n+1}]
+        //              = qdot_n + dt_step·[0.5·qddot_n + 0.5·qddot_{n+1}]
+        // 其中 dt_step = a2/a0（= dt，由 a0=1/(β·dt²)，a2=1/(β·dt) 精确复原）
+        let dt_step = self.a2 / self.a0;
         let mut qddot_new = vec![0.0_f64; ndof];
         let mut qdot_new  = vec![0.0_f64; ndof];
         for i in 0..ndof {
             qddot_new[i] = self.a0 * (q_new[i] - self.q[i])
                          - self.a2 * self.qdot[i]
                          - self.a3 * self.qddot[i];
-            qdot_new[i]  = self.qdot[i]
-                         + (1.0 - 0.5) * self.qddot[i] * (1.0 / self.a1 * self.a0)  // dt·(1-γ)·qddot_n
-                         + 0.5 * qddot_new[i] * (1.0 / self.a1 * self.a0);           // dt·γ·qddot_{n+1}
         }
-        // 正确公式：qdot_{n+1} = qdot_n + dt·[(1−γ)·qddot_n + γ·qddot_{n+1}]
-        // dt = 1/(a1 * beta/gamma) = gamma/(a1*beta) = 0.5/(a1*0.25) = 2/a1
-        // 实际 dt = a2/a0 ，或等价 1/(a0^{1/2} * ...）
-        // 更简洁：dt·γ = a1/(a0/gamma·...) —— 用 a1*dt = gamma/beta ，dt = (gamma/beta)/a1
-        //  但我们可直接用 a0/a1: a0/a1 = 1/(β·dt²) / (γ/(β·dt)) = 1/(γ·dt)
-        //  所以 dt = (gamma/beta) / a1 ... 太绕。用 dt_internal = a2/a0 更直接：
-        //  a2 = 1/(β·dt) , a0 = 1/(β·dt²)  →  dt = a2/a0·dt·dt/dt = 1/a2·1/dt ... 
-        // 最清晰：dt_step = 1.0/(a0/a2) = a2/a0（因 a0 = 1/(β dt²)，a2 = 1/(β dt)）
-        let dt_step = self.a2 / self.a0;  // = dt（精确复原）
         for i in 0..ndof {
             qdot_new[i] = self.qdot[i]
-                + dt_step * ((1.0 - 0.5) * self.qddot[i] + 0.5 * qddot_new[i]);
+                + dt_step * (0.5 * self.qddot[i] + 0.5 * qddot_new[i]);
         }
 
         self.q     = q_new;

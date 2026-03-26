@@ -193,6 +193,8 @@ fn default_internal_mass_scheme() -> String { "none".to_string() }
 pub struct Config {
     pub simulation: SimulationConfig,
     pub fluid: FluidConfig,
+    /// 可选顶层结构力学配置（`[structure]`；预留给 BB/IBB + FEM 耦合，当前暂未启用）
+    #[allow(dead_code)]
     pub structure: Option<StructureConfig>,
     pub ibm: Option<IbmConfig>,
     /// 可选固体体配置（BB / IBB 反弹方案；圆柱、矩形等几何标记）
@@ -266,6 +268,7 @@ pub struct BoundaryConditionConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct StructureConfig {
     /// 杨氏模量
     pub young_modulus: f64,
@@ -511,6 +514,9 @@ pub struct SolidBodyConfig {
     /// 主动运动参数（仅 `motion_type = "prescribed"` 时有效）。
     #[serde(default)]
     pub prescribed: PrescribedMotionConfig,
+    /// 该固体体的受力输出配置（可选；缺省继承顶层 `[solid].force_output`）。
+    #[serde(default)]
+    pub force_output: Option<SolidForceOutputConfig>,
 }
 
 /// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
@@ -708,6 +714,7 @@ pub struct OutputConfig {
     /// 若未以 `--features python-ffi` 编译，本字段被忽略，
     /// 不会报错，只是不生成 FFI 云图。
     #[serde(default)]
+    #[cfg_attr(not(feature = "python-ffi"), allow(dead_code))]
     pub plot_interval: Option<u64>,
     /// 为 `true` 时每步向 CSV 文件追加一行监控量数据。
     /// 提供**逐步轻量级**时间序列输出。

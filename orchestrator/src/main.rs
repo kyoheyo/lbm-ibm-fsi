@@ -135,6 +135,10 @@ fn run() -> Result<()> {
 
     // 初始化格子网格与求解器
     let mut grid   = LbmGrid::new(grid_nx, grid_ny, grid_nz, model);
+    // 若用户配置了非单位初始密度，在求解器构造前写入（求解器构造时将 f 初始化为平衡态）
+    if (cfg.fluid.rho0 - 1.0).abs() > 1e-15 {
+        grid.fill_rho(cfg.fluid.rho0);
+    }
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
     mpi.attach_to_solver(&mut solver);
 
@@ -321,7 +325,7 @@ fn run_time_loop(
             } else {
                 (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
             };
-            step_solid_moving(cfg, grid, solid_entries, pi0, pj0, pi1, pj1);
+            step_solid_moving(cfg, grid, solid_entries, step, pi0, pj0, pi1, pj1);
         }
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
@@ -431,6 +435,46 @@ fn run_time_loop(
                         &force_csv, step + 1, time,
                         &[("fx", global_fx), ("fy", global_fy)],
                     ).with_context(|| format!("Failed to write solid force CSV at step {}", step + 1))?;
+                }
+            }
+        }
+
+        // 逐体受力输出（BB/IBB 多固体体，各体独立 CSV）
+        for entry in solid_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
+                    || step == cfg.simulation.n_steps - 1)
+            {
+                let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                    (p.phys_x0 as i32, p.phys_y0 as i32,
+                     (p.phys_x0 + p.local_nx - 1) as i32,
+                     (p.phys_y0 + p.local_ny - 1) as i32)
+                } else {
+                    (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+                };
+                let (local_fx, local_fy) = lbm_bindings::compute_solid_force(grid, pi0, pj0, pi1, pj1);
+                let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+                let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
+                    let label = entry.label.clone();
+                    if let Some(ref w) = writer {
+                        w.submit(move || {
+                            output::append_monitor_csv(
+                                &force_csv, step + 1, time,
+                                &[("fx", global_fx), ("fy", global_fy)],
+                            ).with_context(|| format!(
+                                "Failed to write solid force CSV ({}) at step {}", label, step + 1
+                            ))
+                        });
+                    } else {
+                        output::append_monitor_csv(
+                            &force_csv, step + 1, time,
+                            &[("fx", global_fx), ("fy", global_fy)],
+                        ).with_context(|| format!(
+                            "Failed to write solid force CSV ({}) at step {}", entry.label, step + 1
+                        ))?;
+                    }
                 }
             }
         }
@@ -644,14 +688,17 @@ fn step_solid_moving(
     cfg: &Config,
     grid: &mut LbmGrid,
     solid_entries: &mut [fsi::SolidEntry],
+    step: u64,
     phys_i0: i32, phys_j0: i32,
     phys_i1: i32, phys_j1: i32,
 ) {
     let dt = cfg.simulation.dt;
+    // 当前格子时刻（step 已完成流体推进；t = (step+1)*dt 为施加 Ladd 修正的时刻）
+    let t = (step + 1) as f64 * dt;
 
     // --- Step A：对每个固体施加移动壁面 BB/IBB ---
     for entry in solid_entries.iter() {
-        let (ux_cm, uy_cm, omega) = entry.wall_velocity();
+        let (ux_cm, uy_cm, omega) = entry.wall_velocity_at(t);
         let cx = entry.cx;
         let cy = entry.cy;
         match entry.bc_mode {
@@ -665,39 +712,53 @@ fn step_solid_moving(
     }
 
     // --- Step B + C：对运动刚体求力并推进状态 ---
-    let any_moving = solid_entries.iter().any(|e| e.is_moving());
-    if !any_moving { return; }
+    let any_rigid_free = solid_entries.iter().any(|e| e.motion_type == MotionType::RigidFree);
 
-    // 计算全局 MEA 合力（所有固体的总受力，通过 MPI_Allreduce 求和）
-    let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
-        grid, phys_i0, phys_j0, phys_i1, phys_j1);
-    // Note: 若多个刚体共存，目前简化为所有体共用总力；单体情形正确。
-    // 多体场景的精确 MEA 需要逐体 mask，此处不作区分。
-    let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
-    let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+    if any_rigid_free {
+        // 计算全局 MEA 合力（所有固体的总受力，通过 MPI_Allreduce 求和）
+        let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
+            grid, phys_i0, phys_j0, phys_i1, phys_j1);
+        // Note: 若多个刚体共存，目前简化为所有体共用总力；单体情形正确。
+        // 多体场景的精确 MEA 需要逐体 mask，此处不作区分。
+        let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+        let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
 
+        for entry in solid_entries.iter_mut() {
+            if entry.motion_type != MotionType::RigidFree { continue; }
+            if let Some(rb) = &mut entry.rigid_body {
+                // 固体所受流体合力 = MEA 合力（MEA 返回的是固体给流体的力，取负）
+                rb.advance(-global_fx, -global_fy, 0.0, dt);
+                let (cx, cy, _, _, _, _) = rb.state();
+                entry.cx = cx;
+                entry.cy = cy;
+            }
+        }
+    }
+
+    // --- Step B'：对主动 Prescribed 圆柱积分位置 ---
     for entry in solid_entries.iter_mut() {
-        if !entry.is_moving() { continue; }
-        if let Some(rb) = &mut entry.rigid_body {
-            // 固体所受流体合力 = MEA 合力（MEA 返回的是固体给流体的力，取负）
-            rb.advance(-global_fx, -global_fy, 0.0, dt);
-            let (cx, cy, _, _, _, _) = rb.state();
-            entry.cx = cx;
-            entry.cy = cy;
+        if entry.motion_type != MotionType::Prescribed { continue; }
+        if entry.shape == "cylinder" {
+            let (ux, uy, _omega) = entry.wall_velocity_at(t);
+            entry.cx += ux * dt;
+            entry.cy += uy * dt;
         }
     }
 
     // --- Step D：清除标记并在新位置重新标记 ---
-    lbm_bindings::clear_solid(grid);
-    for entry in solid_entries.iter() {
-        if entry.shape == "cylinder" {
-            lbm_bindings::mark_solid_cylinder(grid, entry.cx, entry.cy, entry.radius);
-            lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
-        }
-        // 矩形/mesh 不支持运动，但如果有标记也重新写入（静止位置）
-        if entry.shape == "rectangle" {
-            lbm_bindings::mark_solid_rectangle(grid, entry.i0, entry.j0, entry.i1, entry.j1);
-            lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+    let any_moving = solid_entries.iter().any(|e| e.is_moving());
+    if any_moving {
+        lbm_bindings::clear_solid(grid);
+        for entry in solid_entries.iter() {
+            if entry.shape == "cylinder" {
+                lbm_bindings::mark_solid_cylinder(grid, entry.cx, entry.cy, entry.radius);
+                lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+            }
+            // 矩形/mesh 不支持运动，但如果有标记也重新写入（静止位置）
+            if entry.shape == "rectangle" {
+                lbm_bindings::mark_solid_rectangle(grid, entry.i0, entry.j0, entry.i1, entry.j1);
+                lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+            }
         }
     }
 }
