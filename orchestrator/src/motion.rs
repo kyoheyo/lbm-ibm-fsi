@@ -179,13 +179,30 @@ pub struct BeamSolver {
                           // TODO: 若长期不使用，可在 BeamSolver::new() 末尾 drop(k_mat)。
     ndof:     usize,
 
+    // ---- 主动柔性体：锚点激励耦合向量（支持基础激励 base-excitation）----
+    // 从全局 K/M 矩阵中提取的第 0 列（锚点横向 DOF w_0 对自由 DOF 的耦合）
+    // 用于在 advance() 中组装等效载荷：F_eff -= K_fp·w_0 + M_fp·ẅ_0 + C_fp·ẇ_0
+    k_fp: Vec<f64>,  // len = ndof
+    m_fp: Vec<f64>,  // len = ndof
+    c_fp: Vec<f64>,  // len = ndof
+
+    // ---- 主动柔性体：激励参数 ----
+    anchor_amplitude: f64,   // 锚点横向振幅（格子单位；0 = 不激励）
+    anchor_frequency: f64,   // 锚点激励频率（步^{-1}）
+    anchor_phase:     f64,   // 锚点激励初始相位（rad）
+    tip_force_amp:    f64,   // 自由端横向外力幅值
+    tip_force_freq:   f64,   // 外力频率（步^{-1}）
+    tip_force_phase:  f64,   // 外力初始相位（rad）
+
     // ---- Newmark-β 参数 ----
     a0: f64, a1: f64, a2: f64, a3: f64, a4: f64, a5: f64,
+    dt: f64,  // 时间步长（保存用于时刻追踪）
 
     // ---- 当前状态 ----
-    q:      Vec<f64>,   // 位移 [w_1, θ_1, w_2, θ_2, ..., w_n, θ_n]
-    qdot:   Vec<f64>,   // 速度
-    qddot:  Vec<f64>,   // 加速度
+    q:         Vec<f64>,   // 位移 [w_1, θ_1, w_2, θ_2, ..., w_n, θ_n]
+    qdot:      Vec<f64>,   // 速度
+    qddot:     Vec<f64>,   // 加速度
+    current_t: f64,        // 当前格子时刻（步数；初始 0，每次 advance() 递增 dt）
 }
 
 impl BeamSolver {
@@ -253,8 +270,15 @@ impl BeamSolver {
             }
         }
 
+        // ── 提取锚点（DOF 0 = w_0）与自由 DOF 的耦合列向量（基础激励用）──
+        // k_fp[i] = K_full[(i+2)*n_full + 0]，即 K 第 0 列（w_0 列）中自由 DOF 部分
+        // 在基础激励支持运动公式中：F_equiv = −(K_fp·w_0 + M_fp·ẅ_0 + C_fp·ẇ_0)
+        let k_fp: Vec<f64> = (0..ndof).map(|i| k_full[(i+2) * n_full + 0]).collect();
+        let m_fp: Vec<f64> = (0..ndof).map(|i| m_full[(i+2) * n_full + 0]).collect();
+
         // ── Rayleigh 阻尼矩阵 C = α·M（质量比例）──────────────────────────
         let c_mat: Vec<f64> = m_mat.iter().map(|&v| alpha_r * v).collect();
+        let c_fp:  Vec<f64> = m_fp.iter().map(|&v| alpha_r * v).collect();
 
         // ── Newmark-β 参数（β=0.25，γ=0.5，无条件稳定）───────────────────
         let beta_nm  = 0.25_f64;
@@ -288,10 +312,21 @@ impl BeamSolver {
             c_mat,
             k_mat,
             ndof,
+            k_fp,
+            m_fp,
+            c_fp,
+            anchor_amplitude: cfg.anchor_amplitude,
+            anchor_frequency: cfg.anchor_frequency,
+            anchor_phase:     cfg.anchor_phase,
+            tip_force_amp:    cfg.tip_force_amplitude,
+            tip_force_freq:   cfg.tip_force_frequency,
+            tip_force_phase:  cfg.tip_force_phase,
             a0, a1, a2, a3, a4, a5,
-            q:     vec![0.0; ndof],
-            qdot:  vec![0.0; ndof],
-            qddot: vec![0.0; ndof],
+            dt,
+            q:         vec![0.0; ndof],
+            qdot:      vec![0.0; ndof],
+            qddot:     vec![0.0; ndof],
+            current_t: 0.0,
         }
     }
 
@@ -299,13 +334,16 @@ impl BeamSolver {
 
     /// 当前标记点全局位置 `(x, y)`。
     ///
+    /// 包含基础激励引起的锚点位移偏移：绝对横向位移 = w_anchor(t) + w_rel(s)。
+    ///
     /// `arc_s`：各标记点弧坐标（格子单位，长度 N）。
     pub fn marker_positions(&self, arc_s: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let n = arc_s.len();
         let mut px = Vec::with_capacity(n);
         let mut py = Vec::with_capacity(n);
+        let w_anc = self.anchor_transverse(self.current_t);
         for &s in arc_s {
-            let w = self.interp_w(s);
+            let w = w_anc + self.interp_w(s);
             // P = anchor + s·e₁ + w·e₂
             px.push(self.anchor_x + s * self.cos_ori - w * self.sin_ori);
             py.push(self.anchor_y + s * self.sin_ori + w * self.cos_ori);
@@ -313,15 +351,18 @@ impl BeamSolver {
         (px, py)
     }
 
-    /// 当前标记点速度 `(ux, uy)` = ẇ(s)·e₂。
+    /// 当前标记点速度 `(ux, uy)` = ẇ_abs(s)·e₂。
+    ///
+    /// 包含基础激励锚点速度：ẇ_abs = ẇ_anchor(t) + ẇ_rel(s)。
     ///
     /// `arc_s`：各标记点弧坐标（格子单位）。
     pub fn marker_velocities(&self, arc_s: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let n = arc_s.len();
         let mut vx = Vec::with_capacity(n);
         let mut vy = Vec::with_capacity(n);
+        let wdot_anc = self.anchor_transverse_vel(self.current_t);
         for &s in arc_s {
-            let wdot = self.interp_wdot(s);
+            let wdot = wdot_anc + self.interp_wdot(s);
             vx.push(-wdot * self.sin_ori);
             vy.push( wdot * self.cos_ori);
         }

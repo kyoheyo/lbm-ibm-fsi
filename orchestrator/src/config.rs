@@ -97,25 +97,33 @@ fn default_prescribed_mode() -> String { "translate".to_string() }
 // 被动柔性体梁参数配置
 // ---------------------------------------------------------------------------
 
-/// 被动柔性体 Euler-Bernoulli 梁参数配置（`[ibm.bodies.flexible_beam]`）
+/// 被动/主动柔性体 Euler-Bernoulli 梁参数配置（`[ibm.bodies.flexible_beam]`）
 ///
-/// 仅当 `motion_type = "flexible"` 且需要流体-结构耦合（被动柔性体）时读取。
-/// 结合 IBM 力计算，使用 Newmark-β 时间积分推进梁的有限元方程。
+/// 当 `motion_type = "flexible"` 时读取。结合 IBM 力计算，使用 Newmark-β 时间积分推进
+/// 梁的有限元方程。根据是否设置锚点激励/外力字段，支持两种工作模式：
+///
+/// - **被动柔性体**：仅设置基本梁参数，梁在流体力作用下自由变形。
+/// - **主动柔性体（部分节点激励）**：设置 `anchor_amplitude` 等字段——锚点（clamped 端）
+///   做简谐横向振荡（基础激励），梁的其余部分在流体力和弹性力联合作用下变形。
+///   这是"指定部分节点运动"场景的典型实现。
+/// - **主动柔性体（力/力矩驱动）**：设置 `tip_force_amplitude` 等字段——在梁自由端
+///   施加周期性横向外力（相当于驱动执行器），梁在外力与流体力共同作用下响应。
 ///
 /// ## 物理模型
 ///
 /// 悬臂梁（clamped-free），clamped 端位于 `(anchor_x, anchor_y)`，方向角 `orientation`。
 /// 梁坐标：
-/// - 轴向方向：e₁ = (cos θ, sin θ)  
-/// - 横向方向：e₂ = (-sin θ, cos θ)  
-/// - 横向位移 w(s,t) 满足 Euler-Bernoulli 方程：  
-///   ρA ẅ + c ẇ + EI w'''' = f⊥(s,t)
+/// - 轴向方向：e₁ = (cos θ, sin θ)
+/// - 横向方向：e₂ = (-sin θ, cos θ)
+/// - 横向位移 w(s,t) 满足 Euler-Bernoulli 方程：
+///   ρA ẅ + c ẇ + EI w'''' = f⊥(s,t) + f_tip·δ(s−L) + f_base(t)·等效载荷
 ///
 /// 其中 f⊥ 为 IBM 作用在梁上的横向流体力（每单位弧长）。
 ///
 /// ## TOML 示例
 ///
 /// ```toml
+/// # ── 被动柔性体 ──────────────────────────────────────────────────────
 /// [[ibm.bodies]]
 /// geometry  = "filament"
 /// x0 = 100.0  y0 = 50.0  size = 40.0  n_markers = 40
@@ -131,6 +139,28 @@ fn default_prescribed_mode() -> String { "translate".to_string() }
 /// linear_density = 1.5      # ρA（单位弧长质量，格子单位）
 /// n_elements    = 20
 /// damping       = 0.02      # 质量比例阻尼系数 α_R（Rayleigh 阻尼 C = α_R · M）
+///
+/// # ── 主动柔性体：锚点基础激励（指定部分节点运动）────────────────────
+/// [ibm.bodies.flexible_beam]
+/// anchor_x      = 100.0    anchor_y     = 50.0
+/// orientation   = 0.0      length       = 40.0
+/// young_modulus = 5000.0   second_moment = 0.01
+/// linear_density = 1.5     n_elements   = 20    damping = 0.02
+/// # 锚点横向正弦振荡：w_0(t) = A·sin(2πft + φ)
+/// anchor_amplitude = 2.0   # 横向振幅（格子单位）
+/// anchor_frequency = 0.01  # 频率（步^{-1}）
+/// anchor_phase     = 0.0   # 初始相位（rad）
+///
+/// # ── 主动柔性体：自由端外力驱动（指定力/力矩驱动）──────────────────
+/// [ibm.bodies.flexible_beam]
+/// anchor_x      = 100.0    anchor_y     = 50.0
+/// orientation   = 0.0      length       = 40.0
+/// young_modulus = 5000.0   second_moment = 0.01
+/// linear_density = 1.5     n_elements   = 20    damping = 0.02
+/// # 自由端横向简谐力：F_tip(t) = F_amp·cos(2πf_t·t + φ_f)
+/// tip_force_amplitude = 5.0   # 力幅值（格子单位·ρ·cs²）
+/// tip_force_frequency = 0.01  # 驱动频率（步^{-1}）
+/// tip_force_phase     = 0.0   # 初始相位（rad）
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct FlexibleBodyConfig {
@@ -152,6 +182,24 @@ pub struct FlexibleBodyConfig {
     #[serde(default = "default_beam_n_elements")] pub n_elements: u32,
     /// 质量比例 Rayleigh 阻尼系数 α（C = α·M；默认 0.01）
     #[serde(default = "default_beam_damping")] pub damping: f64,
+
+    // ── 主动柔性体：锚点基础激励（指定部分节点运动）──────────────────────
+    /// 锚点横向振荡幅值（格子单位；默认 0.0 = 不激励）。
+    /// 锚点横向位移：w₀(t) = `anchor_amplitude` · sin(2π·`anchor_frequency`·t + `anchor_phase`)
+    #[serde(default)] pub anchor_amplitude: f64,
+    /// 锚点激励频率（步^{-1}；仅 `anchor_amplitude` > 0 时有效）
+    #[serde(default)] pub anchor_frequency: f64,
+    /// 锚点激励初始相位（rad）
+    #[serde(default)] pub anchor_phase: f64,
+
+    // ── 主动柔性体：自由端外力驱动（指定力/力矩驱动）──────────────────────
+    /// 自由端横向外力幅值（格子单位压强·格子²；默认 0.0 = 无外力）。
+    /// F_tip(t) = `tip_force_amplitude` · cos(2π·`tip_force_frequency`·t + `tip_force_phase`)
+    #[serde(default)] pub tip_force_amplitude: f64,
+    /// 自由端外力频率（步^{-1}）
+    #[serde(default)] pub tip_force_frequency: f64,
+    /// 自由端外力初始相位（rad）
+    #[serde(default)] pub tip_force_phase: f64,
 }
 
 fn default_beam_damping() -> f64 { 0.01 }
