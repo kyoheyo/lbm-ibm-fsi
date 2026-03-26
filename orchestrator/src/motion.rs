@@ -369,6 +369,31 @@ impl BeamSolver {
         (vx, vy)
     }
 
+    // ---- 辅助：主动柔性体激励 -------------------------------------------
+
+    /// 锚点横向位移 w₀(t) = A·sin(2π·f·t + φ)（基础激励）。
+    fn anchor_transverse(&self, t: f64) -> f64 {
+        if self.anchor_amplitude == 0.0 { return 0.0; }
+        self.anchor_amplitude
+            * (2.0 * PI * self.anchor_frequency * t + self.anchor_phase).sin()
+    }
+
+    /// 锚点横向速度 ẇ₀(t) = A·2π·f·cos(2π·f·t + φ)。
+    fn anchor_transverse_vel(&self, t: f64) -> f64 {
+        if self.anchor_amplitude == 0.0 { return 0.0; }
+        let two_pi_f = 2.0 * PI * self.anchor_frequency;
+        self.anchor_amplitude * two_pi_f
+            * (two_pi_f * t + self.anchor_phase).cos()
+    }
+
+    /// 锚点横向加速度 ẅ₀(t) = −A·(2π·f)²·sin(2π·f·t + φ)。
+    fn anchor_transverse_acc(&self, t: f64) -> f64 {
+        if self.anchor_amplitude == 0.0 { return 0.0; }
+        let two_pi_f = 2.0 * PI * self.anchor_frequency;
+        -self.anchor_amplitude * two_pi_f * two_pi_f
+            * (two_pi_f * t + self.anchor_phase).sin()
+    }
+
     // ---- 时间推进 --------------------------------------------------------
 
     /// 推进一个时间步。
@@ -377,12 +402,36 @@ impl BeamSolver {
     /// - `ibm_fx`, `ibm_fy`：IBM 施加于**流体**的逐标记点力（`ms.get_forces()` 输出）；
     ///   结构所受反作用力在内部取负。
     /// - `arc_s`：标记点弧坐标（长度与 `ibm_fx/fy` 相同）。
-    /// - `dt`：时间步长（当前未使用，步进系数已在 `new()` 中预计算）。
     pub fn advance(&mut self, ibm_fx: &[f64], ibm_fy: &[f64], arc_s: &[f64]) {
         let ndof = self.ndof;
+        let dt_step = self.dt;
+        let t_next  = self.current_t + dt_step;
 
         // ── Step 1：组装外力向量（标记点 IBM 力 → 节点横向载荷）────────────
-        let f_ext = self.assemble_force(ibm_fx, ibm_fy, arc_s);
+        let mut f_ext = self.assemble_force(ibm_fx, ibm_fy, arc_s);
+
+        // ── Step 1b：基础激励等效载荷（支持运动公式）────────────────────────
+        // 当锚点以 w₀(t) 运动时，等效载荷：
+        //   F_equiv = −K_fp·w₀ − M_fp·ẅ₀ − C_fp·ẇ₀
+        if self.anchor_amplitude != 0.0 {
+            let w0   = self.anchor_transverse(t_next);
+            let wd0  = self.anchor_transverse_vel(t_next);
+            let wdd0 = self.anchor_transverse_acc(t_next);
+            for i in 0..ndof {
+                f_ext[i] -= self.k_fp[i] * w0
+                          + self.m_fp[i] * wdd0
+                          + self.c_fp[i] * wd0;
+            }
+        }
+
+        // ── Step 1c：自由端外力（指定力/力矩驱动）──────────────────────────
+        // F_tip(t) = F_amp·cos(2π·f_t·t + φ_f)，施加在最后自由节点横向 DOF
+        if self.tip_force_amp != 0.0 {
+            let f_tip = self.tip_force_amp
+                * (2.0 * PI * self.tip_force_freq * t_next + self.tip_force_phase).cos();
+            // 最后自由节点横向 DOF 索引 = ndof - 2
+            f_ext[ndof - 2] += f_tip;
+        }
 
         // ── Step 2：Newmark-β 预测值 ────────────────────────────────────────
         // q_pred  = q + dt·qdot + dt²·(0.5−β)·qddot  已内含在 K_eff 中的 a0/a1 系数里
@@ -409,10 +458,7 @@ impl BeamSolver {
         // ── Step 4：更新速度、加速度 ─────────────────────────────────────────
         // Newmark-β 公式（β=0.25，γ=0.5）：
         //   qddot_{n+1} = a0·(q_{n+1}−q_n) − a2·qdot_n − a3·qddot_n
-        //   qdot_{n+1}  = qdot_n + dt·[(1−γ)·qddot_n + γ·qddot_{n+1}]
-        //              = qdot_n + dt_step·[0.5·qddot_n + 0.5·qddot_{n+1}]
-        // 其中 dt_step = a2/a0（= dt，由 a0=1/(β·dt²)，a2=1/(β·dt) 精确复原）
-        let dt_step = self.a2 / self.a0;
+        //   qdot_{n+1}  = qdot_n + dt·[0.5·qddot_n + 0.5·qddot_{n+1}]
         let mut qddot_new = vec![0.0_f64; ndof];
         let mut qdot_new  = vec![0.0_f64; ndof];
         for i in 0..ndof {
@@ -425,9 +471,10 @@ impl BeamSolver {
                 + dt_step * (0.5 * self.qddot[i] + 0.5 * qddot_new[i]);
         }
 
-        self.q     = q_new;
-        self.qdot  = qdot_new;
-        self.qddot = qddot_new;
+        self.q        = q_new;
+        self.qdot     = qdot_new;
+        self.qddot    = qddot_new;
+        self.current_t = t_next;
     }
 
     // ---- 内部辅助 --------------------------------------------------------
