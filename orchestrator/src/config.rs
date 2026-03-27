@@ -266,6 +266,10 @@ pub struct Config {
     /// 可选 MPI 并行配置（域分解模式、块数等）
     #[serde(default)]
     pub mpi: MpiRunConfig,
+    /// 可选多重网格配置（`[multigrid]`）。
+    /// 存在且 `enabled=true` 且 `[[multigrid.levels]]` 非空时，激活多重网格模式。
+    #[serde(default)]
+    pub multigrid: Option<MultigridConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1103,6 +1107,70 @@ impl MpiRunConfig {
         (px, py, pz)
     }
 }
+
+// ---------------------------------------------------------------------------
+/// 单个细化层级配置（`[[multigrid.levels]]`）
+///
+/// 坐标系：**父层（parent level）格子坐标**（0-based，含端点）。
+/// 例如父层 600×100 中，`x_start=100, x_end=260, y_start=20, y_end=80` 表示
+/// 父层坐标系下 [100, 260] × [20, 80] 区域，细网格尺寸为 161×r × 61×r。
+#[derive(Debug, Deserialize, Clone)]
+pub struct MgLevelConfig {
+    /// 细化区域在父层坐标系中的 X 起始格子索引（含端点）
+    pub x_start: i32,
+    /// 细化区域在父层坐标系中的 X 终止格子索引（含端点）
+    pub x_end: i32,
+    /// 细化区域在父层坐标系中的 Y 起始格子索引（含端点）
+    pub y_start: i32,
+    /// 细化区域在父层坐标系中的 Y 终止格子索引（含端点）
+    pub y_end: i32,
+    /// 相对于父层的线性加密比（通常 2；细格间距 = 父格间距 / refine_ratio）
+    #[serde(default = "default_mg_refine_ratio")]
+    pub refine_ratio: i32,
+    /// 父层索引（0 = 根节点，即最粗网格；-1 = 自动：上一层级，线性链）
+    #[serde(default = "default_mg_parent_level")]
+    pub parent_level: i32,
+}
+
+fn default_mg_refine_ratio() -> i32 { 2 }
+fn default_mg_parent_level() -> i32 { -1 }
+
+/// 多重网格（重叠网格）配置（`[multigrid]`）
+///
+/// 当 `[multigrid]` 段存在且 `enabled = true` 且 `[[multigrid.levels]]` 非空时，
+/// 求解器进入多重网格模式：以 `mg_step_recursive()` 替代单层 `solver.step()` 驱动
+/// 主时间循环，每个细化层级（`[[multigrid.levels]]`）均创建独立的 LatticeGrid + Solver，
+/// 层间通过 fringe 耦合实现粗→细（`mg_apply_fringe_bc_temporal`）和
+/// 细→粗（`mg_couple_fine_to_coarse`）的信息传递。
+///
+/// # TOML 示例（两层嵌套）
+///
+/// ```toml
+/// [multigrid]
+/// enabled      = true
+/// fringe_width = 2     # fringe 层宽度（细格数）
+///
+/// [[multigrid.levels]]
+/// # 细化层 1：覆盖圆柱尾迹区域（父层=L0 粗网格坐标系）
+/// x_start = 180  x_end = 360
+/// y_start = 25   y_end = 75
+/// refine_ratio = 2
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MultigridConfig {
+    /// 是否启用多重网格模式（默认 true；若为 false 则退化为单层仿真）
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// fringe 区宽度（细网格格子数，建议 2；与 mg_apply_fringe_bc 的 fringe_width 参数对应）
+    #[serde(default = "default_mg_fringe_width")]
+    pub fringe_width: i32,
+    /// 细化层列表（由粗到细，支持任意深度嵌套；每条对应一个细化网格块）
+    #[serde(default)]
+    pub levels: Vec<MgLevelConfig>,
+}
+
+fn bool_true() -> bool { true }
+fn default_mg_fringe_width() -> i32 { 2 }
 
 // ---------------------------------------------------------------------------
 impl Config {

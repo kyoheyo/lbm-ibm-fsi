@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use config::Config;
-use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmSolver};
+use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmIbmMarkerSet, LbmMgTree, LbmSolver};
 use crate::config::MotionType;
 use output::PartitionInfo;
 
@@ -231,6 +231,27 @@ fn run() -> Result<()> {
     if cfg.simulation.n_steps == 0 {
         if rank == 0 { println!("n_steps is 0 — nothing to simulate."); }
         return Ok(());
+    }
+
+    // 多重网格模式（[multigrid] 段存在且 enabled=true 且 levels 非空）
+    if let Some(ref mg_cfg) = cfg.multigrid.clone() {
+        if mg_cfg.enabled && !mg_cfg.levels.is_empty() {
+            // 多重网格运行路径：以 mg_step_recursive 替代单层 solver.step()
+            run_multigrid_loop(
+                &cfg, mg_cfg, model, cm,
+                &mut grid, &mut solver,
+                &mut ibm_entries,
+                &output_dir, rank,
+            )?;
+            if rank == 0 { println!("\nSimulation complete (multigrid mode)."); }
+            if rank == 0 {
+                if let Some(ref script) = cfg.python.post_script.clone() {
+                    println!("\n--- Post-processing (Python subprocess) ---");
+                    python_bridge::run_subprocess(&cfg.python.interpreter, script, &[&output_dir])?;
+                }
+            }
+            return Ok(());
+        }
     }
 
     // 时间循环

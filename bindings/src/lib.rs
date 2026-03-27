@@ -197,6 +197,11 @@ mod ffi {
         pub fn lbm_mg_node_level  (h: *const MgNodeHandle) -> c_int;
         pub fn lbm_mg_node_refine_ratio(h: *const MgNodeHandle) -> c_int;
         pub fn lbm_mg_node_child_count (h: *const MgNodeHandle) -> c_int;
+        /// 将 Solver 绑定到多重网格节点（mg_step_recursive 需要每层均设置 solver）。
+        pub fn lbm_mg_node_set_solver(node: *mut MgNodeHandle, solver: *mut SolverHandle);
+        /// 递归多重网格时间步推进（Lagrava 2012 五步算法）。
+        /// 返回 0=成功, -1=参数错误（node 为 nullptr 或节点未绑定 solver/grid）。
+        pub fn lbm_mg_step_recursive(node: *mut MgNodeHandle, fringe_width: c_int) -> c_int;
 
         // --- OpenMP 线程数设置 — 实现于 core/src/capi/lbm_capi.cpp ---
         /// 设置 OpenMP 线程数（等价于 omp_set_num_threads()）。
@@ -1121,6 +1126,40 @@ impl LbmMgTree {
     /// 返回树中所有节点数（包括根节点）
     pub fn node_count(&self) -> i32 {
         unsafe { ffi::lbm_mg_tree_node_count(self.ptr) }
+    }
+
+    /// 将 LatticeGrid 绑定到根节点（最粗网格）。
+    pub fn set_grid_on_root(&mut self, grid: &mut LbmGrid) {
+        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
+        unsafe { ffi::lbm_mg_node_set_grid(root, grid.as_mut_ptr()) };
+    }
+
+    /// 将 LatticeGrid 绑定到指定树节点。
+    pub fn set_grid_on_node(&mut self, node: *mut ffi::MgNodeHandle, grid: &mut LbmGrid) {
+        unsafe { ffi::lbm_mg_node_set_grid(node, grid.as_mut_ptr()) };
+    }
+
+    /// 将 Solver 绑定到根节点（mg_step_recursive 需要每层均设置 solver）。
+    pub fn set_solver_on_root(&mut self, solver: &mut LbmSolver) {
+        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
+        unsafe { ffi::lbm_mg_node_set_solver(root, solver.ptr) };
+    }
+
+    /// 将 Solver 绑定到指定树节点（mg_step_recursive 需要每层均设置 solver）。
+    pub fn set_solver_on_node(&mut self, node: *mut ffi::MgNodeHandle, solver: &mut LbmSolver) {
+        unsafe { ffi::lbm_mg_node_set_solver(node, solver.ptr) };
+    }
+
+    /// 执行一次递归多重网格时间步推进（从根节点开始，Lagrava 2012 五步算法）。
+    ///
+    /// - 每层 MPI 幽灵层交换由各层 `Solver::step()` 内部完成，无需额外 MPI 调用。
+    /// - 必须在所有节点上先绑定 `solver`（通过 [`set_solver_on_root`] / [`set_solver_on_node`]），
+    ///   以及 `grid`（通过 [`set_grid_on_root`] / [`set_grid_on_node`]）。
+    ///
+    /// 返回 `0` 表示成功，`-1` 表示参数错误。
+    pub fn mg_step_recursive(&mut self, fringe_width: i32) -> i32 {
+        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
+        unsafe { ffi::lbm_mg_step_recursive(root, fringe_width) }
     }
 }
 
