@@ -1,0 +1,77 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 单层网格 · MPI 4进程
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 单层粗网格 600×100（无细化层）
+# 并行  : MPI 4进程，Y 方向 1D 切片（ny_blocks=4）
+#
+# MPI 域分解：
+#   全局网格 600×100 → 4个进程各持有 600×25（含幽灵行）
+#   切分方向：Y（ny_blocks=4），X 不切分（nx_blocks=1）
+#   幽灵层宽度：ibm_halo_width=2（四点 δ 核跨块安全裕量）
+#
+# 运行：
+#   mpirun -n 4 ./lbm-fsi configs/cylinder_mg_1level_mpi.toml
+#
+# 输出：
+#   分块快照 → output/cylinder_mg_1level_mpi/rank_{0..3}/fluid_*.npz
+#   合并快照 → output/cylinder_mg_1level_mpi/fluid_*.npz（rank-0 gather）
+#
+# 用途：与 serial/OMP 版本对比 MPI 并行加速比
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_1level_mpi"
+format         = "npz"
+combine_blocks = true   # rank-0 合并各块输出为全局快照
+
+[mpi]
+mode           = "block"
+nx_blocks      = 1      # X 方向不切分
+ny_blocks      = 4      # Y 方向切为 4 份 → mpirun -n 4
+ibm_halo_width = 2      # 四点 δ 核跨块时需要 ≥2 幽灵层

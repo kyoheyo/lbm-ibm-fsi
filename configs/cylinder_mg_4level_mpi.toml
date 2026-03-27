@@ -1,0 +1,118 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 四层网格 · MPI 4进程
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 四层线性嵌套（L0→L1→L2→L3），各层加密比 r=2
+# 并行  : MPI 4进程，Y 方向 1D 切片（ny_blocks=4）
+#
+# MPI 域分解：
+#   L0 粗网格 600×100 → 4进程，各持有 600×25 物理行（含幽灵行）
+#   切分方向：Y（ny_blocks=4），X 不切分（nx_blocks=1）
+#   L1/L2/L3 细网格在 run_multigrid_loop 中独立创建
+#   幽灵层宽度：ibm_halo_width=2
+#
+# 网格层级（omega 递推：ω_f = 2ω_c/(4-ω_c)）：
+#   L0 : 600×100，  ω₀ ≈ 1.8868
+#   L1 : 361×121，  ω₁ ≈ 1.9512  （覆盖 L0 [100,280]×[20,80]）
+#   L2 : 161×81，   ω₂ ≈ 1.9749  （覆盖 L1 [80,160]×[40,80]）
+#   L3 : 41×41，    ω₃ ≈ 1.9875  （覆盖 L2 [30,50]×[30,50]）
+#
+# 物理加密倍率：L3 格间距 = L0 格间距 / 8
+#
+# 运行：
+#   mpirun -n 4 ./lbm-fsi configs/cylinder_mg_4level_mpi.toml
+#
+# 输出：
+#   分块快照 → output/cylinder_mg_4level_mpi/rank_{0..3}/fluid_*.npz
+#   合并快照 → output/cylinder_mg_4level_mpi/fluid_*.npz（rank-0 gather）
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_4level_mpi"
+format         = "npz"
+combine_blocks = true   # rank-0 合并各块输出为全局快照
+
+[mpi]
+mode           = "block"
+nx_blocks      = 1
+ny_blocks      = 4      # → mpirun -n 4
+ibm_halo_width = 2
+
+# -----------------------------------------------------------------------------
+# 多重网格配置（4层，线性链）
+# -----------------------------------------------------------------------------
+[multigrid]
+enabled      = true
+fringe_width = 2
+
+# L1：覆盖圆柱及近尾迹，父=L0，细网格尺寸 361×121
+[[multigrid.levels]]
+x_start      = 100
+x_end        = 280
+y_start      = 20
+y_end        = 80
+refine_ratio = 2
+parent_level = 0
+
+# L2：聚焦圆柱周围，父=L1，细网格尺寸 161×81
+[[multigrid.levels]]
+x_start      = 80
+x_end        = 160
+y_start      = 40
+y_end        = 80
+refine_ratio = 2
+parent_level = 1
+
+# L3：最细层，紧贴圆柱表面，父=L2，细网格尺寸 41×41
+[[multigrid.levels]]
+x_start      = 30
+x_end        = 50
+y_start      = 30
+y_end        = 50
+refine_ratio = 2
+parent_level = 2
