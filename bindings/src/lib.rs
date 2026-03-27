@@ -134,6 +134,13 @@ mod ffi {
         pub fn lbm_mpi_decomp2d_new_n(global_nx: c_int, global_ny: c_int,
                                        px: c_int, py: c_int,
                                        n_ghost: c_int) -> *mut MpiDecomp2DHandle;
+        /// 与 lbm_mpi_decomp2d_new_n 相同，但 Y 方向使用调用者指定的自定义行数数组。
+        /// y_counts[r] 为第 r 个 row-rank 持有的物理行数（长度 = py，总和 = global_ny）。
+        /// 用于多重网格感知的负载均衡分区，令细化层完整落入单个 MPI 分块。
+        pub fn lbm_mpi_decomp2d_new_y_counts(global_nx: c_int, global_ny: c_int,
+                                              px: c_int, py: c_int,
+                                              y_counts: *const c_int,
+                                              n_ghost: c_int) -> *mut MpiDecomp2DHandle;
         pub fn lbm_mpi_decomp2d_free(h: *mut MpiDecomp2DHandle);
         /// 将 MpiDecomp2D 绑定到求解器（启用 2D 幽灵层自动交换）。
         pub fn lbm_solver_attach_mpi2d(s: *mut SolverHandle, h: *mut MpiDecomp2DHandle);
@@ -922,6 +929,26 @@ impl LbmMpiDecomp2D {
     /// 对应 TOML 配置 `[mpi] ibm_halo_width`。
     pub fn new_n(global_nx: i32, global_ny: i32, px: i32, py: i32, n_ghost: i32) -> Option<Self> {
         let ptr = unsafe { ffi::lbm_mpi_decomp2d_new_n(global_nx, global_ny, px, py, n_ghost) };
+        if ptr.is_null() { None } else { Some(LbmMpiDecomp2D { ptr }) }
+    }
+
+    /// 与 [`LbmMpiDecomp2D::new_n`] 相同，但 Y 方向使用调用者提供的自定义行数数组。
+    ///
+    /// - `y_counts[r]`：第 r 个 row-rank（0..py-1）持有的物理行数。
+    ///   数组长度必须为 `py`，所有元素之和必须等于 `global_ny`。
+    ///
+    /// 用于多重网格感知的负载均衡分区：通过令细化层完整地落入单个 MPI 分块，
+    /// 避免细化层跨 MPI 边界导致的边界数据缺失与负载不均衡问题。
+    /// 所有进程传入的 `y_counts` 必须完全一致（每个进程独立计算但结果相同）。
+    pub fn new_y_counts(global_nx: i32, global_ny: i32,
+                        px: i32, py: i32,
+                        y_counts: &[i32], n_ghost: i32) -> Option<Self> {
+        if y_counts.len() != py as usize { return None; }
+        let ptr = unsafe {
+            ffi::lbm_mpi_decomp2d_new_y_counts(
+                global_nx, global_ny, px, py,
+                y_counts.as_ptr(), n_ghost)
+        };
         if ptr.is_null() { None } else { Some(LbmMpiDecomp2D { ptr }) }
     }
 

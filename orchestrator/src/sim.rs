@@ -13,8 +13,104 @@ use std::io::Write as IoWrite;
 use anyhow::Result;
 use lbm_bindings::{BcType, Face, LbmMpiDecomp2D, LbmMpiDecomp3D, LbmSolver};
 
-use crate::config::Config;
+use crate::config::{Config, MgLevelConfig};
 use crate::output::PartitionInfo;
+
+// ---------------------------------------------------------------------------
+// 多重网格感知 Y 方向负载均衡分区
+// ---------------------------------------------------------------------------
+
+/// 计算多重网格感知的 Y 方向负载均衡分区行数。
+///
+/// ## 算法
+///
+/// 1. **构建每行有效工作权重**：粗网格每行基础权重 = 1.0；
+///    每个细化层覆盖的行 `[y_start, y_end]` 额外叠加 `refine_ratio²`，
+///    反映细网格子循环的计算开销（细化比 r 时每时间步执行 r 次细格迭代）。
+///
+/// 2. **标记禁止切割位置**：不允许在细化层 Y 范围内部切割分区边界，
+///    即禁止在 `y_start+1 .. y_end`（含）处开始新分区，确保每个细化层
+///    完整地落入单个 MPI 分块内。
+///
+/// 3. **贪心均匀分割**：对总权重均匀分为 `nprocs` 份，从左到右逐步分配，
+///    遇到禁止位置则向最近的允许位置（优先向右）移动。
+///    最后一个分区自动获得剩余所有行。
+///
+/// ## 安全保证
+///
+/// - 返回长度恰好等于 `nprocs`，所有元素 ≥ 1，总和 = `ny`。
+/// - 每个细化层的 `[y_start, y_end]` 区间不跨越任何分区边界。
+/// - 当没有细化层时等价于均匀分区（±1 行的舍入差）。
+/// - 不依赖 MPI，可在任意进程上独立调用并得到完全相同的结果。
+pub fn compute_mg_aware_y_partition(ny: usize, nprocs: usize,
+                                     levels: &[MgLevelConfig]) -> Vec<i32> {
+    // 步骤 1：每行工作权重
+    let mut w = vec![1.0f64; ny];
+    for lvl in levels {
+        let ys = (lvl.y_start.max(0) as usize).min(ny.saturating_sub(1));
+        let ye = (lvl.y_end.max(0) as usize).min(ny.saturating_sub(1));
+        let r2 = (lvl.refine_ratio * lvl.refine_ratio) as f64;
+        for j in ys..=ye { w[j] += r2; }
+    }
+    let total_w: f64 = w.iter().sum();
+    let target_w = total_w / nprocs as f64;   // 每个分区的目标权重
+
+    // 步骤 2：禁止的分区起始行（即不允许在此行开始一个新分区）
+    // 注意：j=0 是第一个分区必须从此开始，所以禁止的是内部切割点
+    let mut forbidden = vec![false; ny + 1];
+    for lvl in levels {
+        let ys = (lvl.y_start.max(0) as usize).min(ny.saturating_sub(1));
+        let ye = (lvl.y_end.max(0) as usize).min(ny.saturating_sub(1));
+        // 禁止在 ys+1 .. ye 处切割（切割点 c 表示分区边界在 c 行前）
+        for c in (ys + 1)..=ye { forbidden[c] = true; }
+    }
+
+    // 步骤 3：贪心均匀分割
+    let mut counts = Vec::with_capacity(nprocs);
+    let mut start = 0usize;
+
+    for rank in 0..nprocs {
+        if rank == nprocs - 1 {
+            // 最后一个分区：取剩余所有行
+            counts.push((ny - start) as i32);
+            break;
+        }
+
+        // 累积权重直到达到目标
+        let mut acc = 0.0f64;
+        let mut ideal_end = start; // 分区结束行（不含），即下一分区的起始行
+        for j in start..ny {
+            acc += w[j];
+            if acc >= target_w {
+                ideal_end = j + 1;
+                break;
+            }
+        }
+        if ideal_end == start { ideal_end = start + 1; } // 至少 1 行
+
+        // 向右找最近的允许切割点（不在 forbidden 内）
+        let mut cut = ideal_end;
+        while cut < ny && forbidden[cut] { cut += 1; }
+        // 如果向右找不到，退回向左找
+        if cut >= ny {
+            cut = ideal_end;
+            while cut > start + 1 && forbidden[cut] { cut -= 1; }
+            // 如果还在 forbidden，强制使用，避免无限循环
+        }
+        let local_ny = (cut - start).max(1) as i32;
+        counts.push(local_ny);
+        start += local_ny as usize;
+    }
+
+    // 边界修正：确保总和正好等于 ny（贪心舍入误差）
+    let sum: i32 = counts.iter().sum();
+    if sum != ny as i32 && !counts.is_empty() {
+        let diff = ny as i32 - sum;
+        *counts.last_mut().unwrap() += diff;
+    }
+
+    counts
+}
 
 // ---------------------------------------------------------------------------
 // MPI 域分解上下文
@@ -93,8 +189,25 @@ impl MpiDecomp {
                         decomp2d = LbmMpiDecomp2D::new_n(
                             cfg.fluid.nx as i32, cfg.fluid.ny as i32, 1, nprocs, n_ghost);
                     } else {
-                        decomp2d = LbmMpiDecomp2D::new_n(
-                            cfg.fluid.nx as i32, cfg.fluid.ny as i32, px as i32, py as i32, n_ghost);
+                        // 多重网格感知负载均衡：若配置了细化层，使用非均匀 Y 分区
+                        // 保证每个细化层完整落入单个 MPI 分块，避免跨边界问题
+                        let mg_levels: Vec<crate::config::MgLevelConfig> = cfg.multigrid
+                            .as_ref()
+                            .filter(|mg| mg.enabled && !mg.levels.is_empty())
+                            .map(|mg| mg.levels.clone())
+                            .unwrap_or_default();
+
+                        if !mg_levels.is_empty() && py > 1 {
+                            let y_counts = compute_mg_aware_y_partition(
+                                cfg.fluid.ny as usize, py as usize, &mg_levels);
+                            decomp2d = LbmMpiDecomp2D::new_y_counts(
+                                cfg.fluid.nx as i32, cfg.fluid.ny as i32,
+                                px as i32, py as i32, &y_counts, n_ghost);
+                        } else {
+                            decomp2d = LbmMpiDecomp2D::new_n(
+                                cfg.fluid.nx as i32, cfg.fluid.ny as i32,
+                                px as i32, py as i32, n_ghost);
+                        }
                     }
                 }
             }
