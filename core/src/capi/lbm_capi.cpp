@@ -739,6 +739,30 @@ int lbm_mg_apply_fringe_bc(const MgNodeHandle* coarse, MgNodeHandle* fine,
     }
 }
 
+/// 粗→细（C→F）时间+空间双重插值耦合（论文 Algorithm 步骤 3）。
+/// coarse_prev: 粗网格节点持有时刻 t 的状态；coarse: 持有时刻 t+δtc 的状态。
+/// t_alpha: 时间插值因子（0=纯 prev，0.5=中点，1=纯 next）。
+/// 返回 0 表示成功，-1 表示参数错误。
+int lbm_mg_apply_fringe_bc_temporal(const MgNodeHandle* coarse_prev,
+                                     const MgNodeHandle* coarse,
+                                     MgNodeHandle* fine,
+                                     double t_alpha,
+                                     int fringe_width,
+                                     double omega_c)
+{
+    if (!coarse_prev || !coarse || !fine) return -1;
+    try {
+        lbm::mg_apply_fringe_bc_temporal(
+            *reinterpret_cast<const lbm::MgNode*>(coarse_prev),
+            *reinterpret_cast<const lbm::MgNode*>(coarse),
+            *reinterpret_cast<lbm::MgNode*>(fine),
+            t_alpha, fringe_width, omega_c);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 /// 细→粗（F→C）耦合：用细网格 f 更新粗网格耦合区域分布函数（论文 Eqs. 7–8）。
 /// fringe_width: 细网格 fringe 宽度（格子数，默认 2）。
 /// omega_c: 粗网格松弛频率。

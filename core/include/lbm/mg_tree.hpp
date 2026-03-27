@@ -311,7 +311,8 @@ void mg_prolong_f(const MgNode& coarse, MgNode& fine);
 ///   (1/ωf − 0.5) = (δxf/δxc)² * (1/ωc − 0.5)
 ///   当 δxf = δxc/2 时解出 ωf = 2ωc/(4−ωc)。
 ///
-/// @param omega_c  粗网格松弛频率，需在 (0, 2) 内以保证 LBM 稳定性
+/// @param omega_c  粗网格松弛频率；数学有效范围 (0, 4)（4 为公式奇点），
+///                 LBM 稳定性要求 omega_c ∈ (0, 2)
 /// @return         细网格松弛频率 ωf
 /// @throws std::invalid_argument 若 omega_c ∉ (0, 4)（4 为公式奇点）
 inline double mg_omega_rescale(double omega_c)
@@ -328,7 +329,7 @@ inline double mg_omega_rescale(double omega_c)
 // 覆盖网格（Overset/Fringe）耦合 — 粗 → 细（C→F, 论文 Eqs. 9–10）
 // ---------------------------------------------------------------------------
 
-/// @brief 粗→细（C→F）耦合：在细网格 fringe 区域施加粗网格边界条件。
+/// @brief 粗→细（C→F）耦合（**纯空间插值**）：在细网格 fringe 区域施加粗网格边界条件。
 ///
 /// 实现论文 2015-multigrid.pdf（Lagrava 2012）Eqs. (9)–(10)：
 ///   对与粗节点重合的细 fringe 节点（xc_c→f）——(Eq. 9)：
@@ -340,13 +341,17 @@ inline double mg_omega_rescale(double omega_c)
 ///   f_neq_i,c = fi,c − f_eq_i(ρc, uc) 在四角粗节点计算后做双线性插值。
 ///   ωf 由 mg_omega_rescale(omega_c) 计算（Eq. 4）。
 ///
-/// 与旧版（纯平衡态重建）的区别：
-///   加入了粗网格非平衡项 f_neq 的缩放贡献，使应力信息透过耦合界面传递，
-///   避免在粗-细界面出现虚假速度梯度跳跃。
+/// @note 本函数仅做空间插值（使用 coarse.grid 的当前时刻值）。
+///       若需要按照论文 Algorithm 步骤 3 正确处理"先时间插值再空间插值"，
+///       请使用 mg_apply_fringe_bc_temporal，它在 t 和 t+δtc 两个时刻之间插值。
 ///
-/// 耦合时机（推荐，参考论文 Algorithm 步骤 3）：
-///   粗步 t₀ collide+stream → 调用 mg_apply_fringe_bc（t+δt/2 时刻 C→F）
-///   细步 × r → 调用 mg_couple_fine_to_coarse（F→C 更新粗网格）
+/// 耦合时序（论文 Algorithm）：
+///   步骤 1：粗步 collide+stream(t → t+δtc)
+///   步骤 2：细步 collide+stream(t → t+δtc/2)
+///   步骤 3：C→F 耦合 — 调用 mg_apply_fringe_bc_temporal(t, t+δtc, t_alpha=0.5) ← 推荐
+///              或       mg_apply_fringe_bc（简化版，仅使用 t+δtc）
+///   步骤 4：细步 collide+stream(t+δtc/2 → t+δtc)
+///   步骤 5：F→C 耦合 — 调用 mg_couple_fine_to_coarse
 ///
 /// @param coarse        粗网格节点（含有效 f、ρ、u；提供 C→F 数据）
 /// @param fine          细网格节点（fringe BC 施加目标）
@@ -358,6 +363,40 @@ inline double mg_omega_rescale(double omega_c)
 /// @throws std::invalid_argument 若 grid 为 nullptr 或 omega_c ∉ (0,4)
 void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
                         int fringe_width = 2, double omega_c = 1.0);
+
+/// @brief 粗→细（C→F）耦合（**时间+空间双重插值**，论文 Algorithm 步骤 3）。
+///
+/// 实现论文 2015-multigrid.pdf Algorithm Step 3 中的"double interpolation"：
+///   "First the values of ρc, uc and f_neq_i,c of the coarse sites in xc→f
+///    are interpolated at time t + δtc/2. Then the values of the fine sites
+///    ρc(t + δt/2), uc(t + δt/2) and f_neq_i,c(t + δt/2) are interpolated
+///    in space."
+///
+/// 算法（对 fringe 区域每个细节点）：
+///   1. **时间插值**：在四角粗节点处，线性混合 t 和 t+δtc 时刻的值：
+///        f_a_half = (1-t_alpha)*f_a_prev + t_alpha*f_a_next  （a = 0..Q-1）
+///        ρ_half   = Σ_a f_a_half；  u_half = Σ_a e_a·f_a_half / ρ_half
+///        f_neq_half = f_a_half - f_eq(ρ_half, u_half)
+///   2. **空间插值**：双线性插值 ρ_half、u_half、f_neq_half 到细 fringe 节点
+///   3. 应用 Eqs. 9–10：fi,f = f_eq(ρ_interp, u_interp) + (ωc/2ωf)*f_neq_interp
+///
+/// @param coarse_prev   粗网格节点持有的**时刻 t** 的分布函数（即步骤 1 之前保存的状态）
+/// @param coarse        粗网格节点（步骤 1 后处于时刻 t+δtc，提供 coarse.grid → f_next）
+/// @param fine          细网格节点（fringe BC 施加目标，处于时刻 t+δtc/2）
+/// @param t_alpha       时间插值因子（0.0=纯 prev，0.5=中点，1.0=纯 next）
+/// @param fringe_width  fringe 区域宽度（细网格格子数，默认 2）
+/// @param omega_c       粗网格松弛频率（默认 1.0）
+///
+/// @pre coarse_prev.has_grid() && coarse.has_grid() && fine.has_grid()
+/// @pre coarse_prev.grid->nx == coarse.grid->nx（两个粗网格尺寸必须相同）
+/// @pre fine.grid->model == D2Q9
+/// @throws std::invalid_argument 若 grid 为 nullptr 或 t_alpha ∉ [0,1]
+void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
+                                  const MgNode& coarse,
+                                  MgNode& fine,
+                                  double t_alpha    = 0.5,
+                                  int fringe_width  = 2,
+                                  double omega_c    = 1.0);
 
 // ---------------------------------------------------------------------------
 // 细 → 粗分布函数耦合（F→C coupling，论文 Eqs. 7–8）
@@ -437,5 +476,47 @@ int mg_total_subcycle_steps(const MgNode& node);
 void mg_compute_refinement_indicator(
     const MgNode& node,
     std::vector<double>& indicator);
+
+// ---------------------------------------------------------------------------
+// GPU 平台扩展预留（LBM_ENABLE_CUDA）
+// ---------------------------------------------------------------------------
+//
+// 当前所有多重网格耦合算子（mg_apply_fringe_bc / mg_apply_fringe_bc_temporal /
+// mg_couple_fine_to_coarse / mg_prolong_rho_u / mg_restrict_rho_u）均为
+// CPU 端纯 C++ 实现，支持 OpenMP 多核并行（#ifdef LBM_ENABLE_OPENMP）。
+//
+// 未来 GPU 扩展路径（参考论文 Section III GPU Implementation）：
+//
+// 1. 数据布局：
+//    - 细网格和粗网格各自使用 SoA（Structure-of-Arrays）内存布局（论文 "Coalesced" 策略）
+//      以最大化全局内存合并访问（coalesced memory access）。
+//    - LatticeGrid 的 f/f_tmp/rho/u 已是连续数组，适合直接 cudaMemcpy 或统一内存映射。
+//
+// 2. CUDA 核函数设计（每个 CPU 函数对应一个 .cu 核函数）：
+//    - mg_gpu_apply_fringe_bc: 每线程处理一个细 fringe 节点；
+//      线程数 = fringe 区域节点总数，线程块尺寸建议 128 或 256。
+//    - mg_gpu_couple_fine_to_coarse: 每线程处理一个粗 fringe 节点；
+//      利用 __ldg() 从只读缓存读取细网格 f，减少全局内存延迟。
+//    - mg_gpu_prolong_rho_u / mg_gpu_restrict_rho_u: 每线程一个目标节点。
+//
+// 3. CUDA Dynamic Parallelism（论文核心 GPU 策略）：
+//    - 粗网格主核函数完成 collide+stream 后，由子核函数直接在 GPU 端执行
+//      C→F 时间+空间插值，无需回到 CPU 调度，避免 PCIe 同步开销。
+//    - 对应接口：mg_gpu_apply_fringe_bc_temporal<<<grid,block,0,stream>>>(...)
+//
+// 4. 异构调度（论文 "Heterogeneous" 策略）：
+//    - 粗网格在 GPU 计算，细网格在 CPU（OpenMP）并行；
+//      或反之（Top-GPU / Top-Multicore 两种模式）。
+//    - 边界数据通过 cudaMemcpyAsync + CUDA stream 与 CPU OpenMP 计算流水线重叠。
+//
+// 5. 条件编译占位（待实现时取消注释）：
+// #ifdef LBM_ENABLE_CUDA
+//   void mg_gpu_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
+//                                int fringe_width, double omega_c,
+//                                cudaStream_t stream = nullptr);
+//   void mg_gpu_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
+//                                      int fringe_width, double omega_c,
+//                                      cudaStream_t stream = nullptr);
+// #endif
 
 } // namespace lbm

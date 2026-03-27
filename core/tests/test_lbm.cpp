@@ -1815,9 +1815,132 @@ static int test_mg_couple_fine_to_coarse()
     return ok ? 0 : 1;
 }
 
+// 测试：mg_apply_fringe_bc_temporal — 时间+空间双重插值（论文 Algorithm 步骤 3）
+//
+// 场景1：t_alpha=1.0 时退化为纯 coarse（下一时刻），结果应与 mg_apply_fringe_bc 一致。
+// 场景2：t_alpha=0.0 时退化为纯 coarse_prev（上一时刻）。
+// 场景3：t_alpha=0.5 时结果为两者的中点。
+static int test_mg_apply_fringe_bc_temporal()
+{
+    // 共享树结构（与 test_mg_apply_fringe_bc 相同）
+    lbm::MgTree tree({0, 31, 0, 31, 0, 0});
+    auto* fine_node = tree.add_level(tree.root(), {4, 27, 4, 27, 0, 0}, 2);
+
+    const int cnx = 32, cny = 32;
+    lbm::LatticeGrid coarse_prev_g(cnx, cny, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid coarse_next_g(cnx, cny, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid fine_g1      (48, 48, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid fine_g2      (48, 48, 1, lbm::LatticeModel::D2Q9);
+
+    // coarse_prev：均匀流 ρ=1.0, u=0（f = f_eq）
+    // coarse_next：均匀流 ρ=1.2, u=0（f = f_eq，不同密度）
+    auto init_equil = [](lbm::LatticeGrid& g, double rho, double ux, double uy) {
+        for (int n = 0; n < g.size(); ++n) {
+            g.rho[n]       = rho;
+            g.u[n * 2]     = ux;
+            g.u[n * 2 + 1] = uy;
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                const double ca[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+                const double u[2] = {ux, uy};
+                g.f[n * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], rho, ca, u, 2);
+            }
+        }
+    };
+
+    init_equil(coarse_prev_g, 1.0, 0.0, 0.0);
+    init_equil(coarse_next_g, 1.2, 0.0, 0.0);
+
+    lbm::MgNode coarse_prev_node;
+    coarse_prev_node.extent      = tree.root()->extent;
+    coarse_prev_node.level       = 0;
+    coarse_prev_node.refine_ratio = 1;
+    coarse_prev_node.dim         = lbm::MgDim::D2;
+    coarse_prev_node.parent      = nullptr;
+    coarse_prev_node.grid        = &coarse_prev_g;
+
+    tree.root()->grid  = &coarse_next_g;
+    fine_node->grid    = &fine_g1;
+
+    const double omega_c = 1.0;
+    const int fringe_width = 2;
+
+    bool ok = true;
+
+    // 场景1：t_alpha=1.0 → 应与 mg_apply_fringe_bc(coarse_next) 完全一致
+    for (double& v : fine_g1.f) v = 99.0;
+    fine_node->grid = &fine_g1;
+    lbm::mg_apply_fringe_bc_temporal(coarse_prev_node, *tree.root(), *fine_node,
+                                      1.0, fringe_width, omega_c);
+
+    lbm::LatticeGrid fine_ref(48, 48, 1, lbm::LatticeModel::D2Q9);
+    fine_node->grid = &fine_ref;
+    for (double& v : fine_ref.f) v = 0.0;
+    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, fringe_width, omega_c);
+
+    // 比较 fringe 节点 (0,0)
+    {
+        const int n = fine_g1.idx(0, 0);
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            if (std::abs(fine_g1.f[n * lbm::d2q9::Q + a]
+                       - fine_ref.f[n * lbm::d2q9::Q + a]) > 1e-10) {
+                ok = false;
+            }
+        }
+    }
+
+    // 场景2：t_alpha=0.0 → 应与使用 coarse_prev 的 mg_apply_fringe_bc 一致
+    lbm::LatticeGrid fine_g0(48, 48, 1, lbm::LatticeModel::D2Q9);
+    for (double& v : fine_g0.f) v = 0.0;
+    lbm::MgNode coarse_prev_node2 = coarse_prev_node;  // 同上
+    fine_node->grid = &fine_g0;
+    lbm::mg_apply_fringe_bc_temporal(coarse_prev_node2, *tree.root(), *fine_node,
+                                      0.0, fringe_width, omega_c);
+
+    // 用 coarse_prev 直接作为 coarse 参数调用 mg_apply_fringe_bc 作为参考
+    lbm::LatticeGrid fine_ref0(48, 48, 1, lbm::LatticeModel::D2Q9);
+    for (double& v : fine_ref0.f) v = 0.0;
+    fine_node->grid = &fine_ref0;
+    // 临时把 root()->grid 换为 coarse_prev_g 以调用参考函数
+    tree.root()->grid = &coarse_prev_g;
+    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, fringe_width, omega_c);
+    tree.root()->grid = &coarse_next_g;  // 恢复
+
+    {
+        const int n = fine_g0.idx(0, 0);
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            if (std::abs(fine_g0.f[n * lbm::d2q9::Q + a]
+                       - fine_ref0.f[n * lbm::d2q9::Q + a]) > 1e-10) {
+                ok = false;
+            }
+        }
+    }
+
+    // 场景3：t_alpha=0.5 → fringe 节点的 rho 应等于两端点的平均 (1.0+1.2)/2 = 1.1
+    for (double& v : fine_g2.f) v = 0.0;
+    fine_node->grid = &fine_g2;
+    lbm::mg_apply_fringe_bc_temporal(coarse_prev_node, *tree.root(), *fine_node,
+                                      0.5, fringe_width, omega_c);
+    {
+        // fringe 节点 (0,0) 的 ρ 应接近 1.1（两端均匀流线性插值中点）
+        const int n = fine_g2.idx(0, 0);
+        ok &= (std::abs(fine_g2.rho[n] - 1.1) < 1e-10);
+        // f 值有限
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            if (!std::isfinite(fine_g2.f[n * lbm::d2q9::Q + a])) { ok = false; }
+        }
+    }
+    // 内部节点仍未被修改（仍为初始化值 0）
+    {
+        const int n_inner = fine_g2.idx(10, 10);
+        ok &= (fine_g2.f[n_inner * lbm::d2q9::Q] == 0.0);
+    }
+
+    std::printf("[MgTree] mg_apply_fringe_bc_temporal (time+space interp, 3 scenarios): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
 
 
-// 测试：PhysicalBounds::has_south_wall/has_north_wall=false 时
 //       South/North BC 应完全跳过（不修改内部物理行），防止 MPI 分块边界速度阶跃。
 //
 // 复现场景：4 进程 1D Y 分解中，rank 1（内部进程）的 has_south_wall=false，
@@ -1971,6 +2094,7 @@ int test_lbm_main()
     failures += test_mg_refinement_indicator();
     failures += test_mg_omega_rescale();
     failures += test_mg_couple_fine_to_coarse();
+    failures += test_mg_apply_fringe_bc_temporal();
     failures += test_bc_wall_ownership_filter();
     failures += test_bc_wall_ownership_south_applied();
     if (failures == 0)

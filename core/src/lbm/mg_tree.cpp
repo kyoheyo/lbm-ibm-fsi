@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef LBM_ENABLE_OPENMP
+#  include <omp.h>
+#endif
+
 namespace lbm {
 
 // ---------------------------------------------------------------------------
@@ -142,6 +146,9 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
     const int fn_x = fg.nx;
     const int fn_y = fg.ny;
 
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int jf = 0; jf < fn_y; ++jf) {
         for (int ix = 0; ix < fn_x; ++ix) {
             // 细节点在粗坐标系中的浮点位置（节点位于整数坐标处）
@@ -225,6 +232,9 @@ void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse)
     const int cx_hi = fine.extent.x_end   - coarse.extent.x_start;
     const int cy_hi = fine.extent.y_end   - coarse.extent.y_start;
 
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int jc = cy_lo; jc <= cy_hi; ++jc) {
         for (int ic = cx_lo; ic <= cx_hi; ++ic) {
             // 对应细格的起始本地索引
@@ -336,6 +346,9 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = omega_c / (2.0 * omega_f);
 
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int jy = 0; jy < fny; ++jy) {
         for (int ix = 0; ix < fnx; ++ix) {
             // 判断是否为 fringe 节点（外边界 fringe_width 层内）
@@ -418,8 +431,166 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
 }
 
 // ---------------------------------------------------------------------------
-// 细 → 粗分布函数耦合（F→C，论文 Eqs. 7–8）
+// 粗→细（C→F）时间+空间双重插值耦合（论文 Algorithm 步骤 3）
 //
+// 算法：
+//   1. 对 fringe 区域每个细节点 (ix, jy)：
+//      a. 确定四角粗节点 (c00, c10, c01, c11) 及双线性权重 (w00..w11)
+//      b. 对每个粗角点 cidx：线性时间插值 f_a_half = (1-t_alpha)*f_prev[cidx] + t_alpha*f_next[cidx]
+//         → 从 f_a_half 计算 ρ_half, u_half, f_neq_half = f_a_half - f_eq(ρ_half, u_half)
+//      c. 双线性空间插值 ρ_interp, u_interp, f_neq_interp（与 mg_apply_fringe_bc 相同）
+//      d. 应用 Eqs. 9–10：fi,f = f_eq(ρ_interp, u_interp) + (ωc/2ωf) * f_neq_interp
+// ---------------------------------------------------------------------------
+void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
+                                  const MgNode& coarse,
+                                  MgNode& fine,
+                                  double t_alpha,
+                                  int fringe_width,
+                                  double omega_c)
+{
+    if (!coarse_prev.grid || !coarse.grid || !fine.grid) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc_temporal: coarse_prev, coarse, and fine nodes must all have grids");
+    }
+    if (fine.grid->model != LatticeModel::D2Q9) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc_temporal: only D2Q9 is currently supported");
+    }
+    if (omega_c <= 0.0 || omega_c >= 4.0) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc_temporal: omega_c must be in (0, 4)");
+    }
+    if (t_alpha < 0.0 || t_alpha > 1.0) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc_temporal: t_alpha must be in [0, 1]");
+    }
+    if (coarse_prev.grid->nx != coarse.grid->nx ||
+        coarse_prev.grid->ny != coarse.grid->ny) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc_temporal: coarse_prev and coarse grids must have identical dimensions");
+    }
+    if (fringe_width < 1) fringe_width = 1;
+
+    const LatticeGrid& cg_prev = *coarse_prev.grid;
+    const LatticeGrid& cg      = *coarse.grid;
+    LatticeGrid&       fg      = *fine.grid;
+
+    const int r   = fine.refine_ratio;
+    const int d   = fg.dim();
+    const int Q   = d2q9::Q;
+    const int fnx = fg.nx;
+    const int fny = fg.ny;
+
+    const double alpha1 = 1.0 - t_alpha;   // weight for t (prev)
+    const double alpha2 = t_alpha;           // weight for t+δtc (next)
+
+    // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
+    const double omega_f = mg_omega_rescale(omega_c);
+    const double scale   = omega_c / (2.0 * omega_f);
+
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int jy = 0; jy < fny; ++jy) {
+        for (int ix = 0; ix < fnx; ++ix) {
+            // fringe 判断
+            const bool in_fringe = (ix < fringe_width || ix >= fnx - fringe_width ||
+                                    jy < fringe_width || jy >= fny - fringe_width);
+            if (!in_fringe) continue;
+
+            // 细节点在粗坐标系中的浮点位置
+            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
+            const double py = fine.extent.y_start + static_cast<double>(jy) / r;
+
+            const int i0 = static_cast<int>(std::floor(px));
+            const int j0 = static_cast<int>(std::floor(py));
+
+            const double bx = px - i0;
+            const double by = py - j0;
+
+            auto clamp_ci = [&](int ci) -> int {
+                return std::max(coarse.extent.x_start,
+                                std::min(coarse.extent.x_end, ci));
+            };
+            auto clamp_cj = [&](int cj) -> int {
+                return std::max(coarse.extent.y_start,
+                                std::min(coarse.extent.y_end, cj));
+            };
+
+            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
+            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
+            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
+            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+
+            const int c00 = cg.idx(ci00, cj00);
+            const int c10 = cg.idx(ci10, cj00);
+            const int c01 = cg.idx(ci00, cj10);
+            const int c11 = cg.idx(ci10, cj10);
+
+            const double w00 = (1.0 - bx) * (1.0 - by);
+            const double w10 = bx          * (1.0 - by);
+            const double w01 = (1.0 - bx)  * by;
+            const double w11 = bx           * by;
+
+            // 双线性权重数组便于统一循环
+            const double ws[4]  = {w00, w10, w01, w11};
+            const int    cs[4]  = {c00, c10, c01, c11};
+
+            // 空间插值 ρ 和 u（对每个粗角点先做时间插值，再做空间双线性插值）
+            double rho_f    = 0.0;
+            double u_f[2]   = {0.0, 0.0};
+            for (int corner = 0; corner < 4; ++corner) {
+                const int cidx = cs[corner];
+                // 时间插值 ρ
+                const double rho_c = alpha1 * cg_prev.rho[cidx] + alpha2 * cg.rho[cidx];
+                // 时间插值 u
+                const double uc[2] = {
+                    alpha1 * cg_prev.u[cidx * d + 0] + alpha2 * cg.u[cidx * d + 0],
+                    alpha1 * cg_prev.u[cidx * d + 1] + alpha2 * cg.u[cidx * d + 1]
+                };
+                rho_f    += ws[corner] * rho_c;
+                u_f[0]   += ws[corner] * uc[0];
+                u_f[1]   += ws[corner] * uc[1];
+            }
+
+            const int fi = fg.idx(ix, jy);
+            fg.rho[fi] = rho_f;
+            for (int k = 0; k < d; ++k) fg.u[fi * d + k] = u_f[k];
+
+            // 对每个方向 a：计算时间+空间插值后的 f_neq，应用 Eqs. 9–10
+            for (int a = 0; a < Q; ++a) {
+                const double ca[2] = {
+                    static_cast<double>(d2q9::C[a][0]),
+                    static_cast<double>(d2q9::C[a][1])
+                };
+
+                // 对每个粗角点：先做时间插值 f_a_half，再计算 f_neq_half
+                double f_neq_interp = 0.0;
+                for (int corner = 0; corner < 4; ++corner) {
+                    const int cidx = cs[corner];
+                    // 时间插值 f_a
+                    const double f_a_half = alpha1 * cg_prev.f[cidx * Q + a]
+                                          + alpha2 * cg.f[cidx * Q + a];
+                    // 时间插值 ρ 和 u（各角点）
+                    const double rho_c = alpha1 * cg_prev.rho[cidx] + alpha2 * cg.rho[cidx];
+                    const double uc[2] = {
+                        alpha1 * cg_prev.u[cidx * d + 0] + alpha2 * cg.u[cidx * d + 0],
+                        alpha1 * cg_prev.u[cidx * d + 1] + alpha2 * cg.u[cidx * d + 1]
+                    };
+                    // f_neq_half 在该粗角点
+                    const double f_neq_c = f_a_half - f_eq(d2q9::W[a], rho_c, ca, uc, d);
+                    f_neq_interp += ws[corner] * f_neq_c;
+                }
+
+                // Eqs. 9–10：fi,f = f_eq(ρ_interp, u_interp) + (ωc/2ωf) * f_neq_interp
+                fg.f[fi * Q + a] = f_eq(d2q9::W[a], rho_f, ca, u_f, d)
+                                 + scale * f_neq_interp;
+            }
+        }
+    }
+}
+
+
 // 算法：对细网格域边界（fringe_width 细格 ↔ coarse_fringe 粗格）内的每个粗节点 (ic, jc)：
 //   1. 映射到对应细本地索引 if = (ic − fx_s)*r, jf = (jc − fy_s)*r
 //   2. 从细网格 f 计算 ρf 和 uf
@@ -465,21 +636,25 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
     const int fy_s = fine.extent.y_start;
     const int fy_e = fine.extent.y_end;
 
-    for (int jc_g = fy_s; jc_g <= fy_e; ++jc_g) {
-        const int jc_l = jc_g - coarse.extent.y_start;  // 粗网格本地 j
+    // 循环计数（闭区间 [fx_s, fx_e] 转为 0-based 以支持 OpenMP collapse）
+    const int nx_count = fx_e - fx_s + 1;
+    const int ny_count = fy_e - fy_s + 1;
 
-        // 判断是否在 y 方向 fringe 内
-        const bool in_j_fringe = (jc_g <= fy_s + coarse_fringe - 1 ||
-                                   jc_g >= fy_e - coarse_fringe + 1);
+#ifdef LBM_ENABLE_OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int jj = 0; jj < ny_count; ++jj) {
+        for (int ii = 0; ii < nx_count; ++ii) {
+            const int jc_g = fy_s + jj;
+            const int ic_g = fx_s + ii;
+            const int jc_l = jc_g - coarse.extent.y_start;
+            const int ic_l = ic_g - coarse.extent.x_start;
 
-        for (int ic_g = fx_s; ic_g <= fx_e; ++ic_g) {
-            const int ic_l = ic_g - coarse.extent.x_start;  // 粗网格本地 i
-
-            // 判断是否在 x 方向 fringe 内
+            // 判断是否在 fringe 内
+            const bool in_j_fringe = (jc_g <= fy_s + coarse_fringe - 1 ||
+                                       jc_g >= fy_e - coarse_fringe + 1);
             const bool in_i_fringe = (ic_g <= fx_s + coarse_fringe - 1 ||
                                        ic_g >= fx_e - coarse_fringe + 1);
-
-            // 仅处理 fringe 区域（至少一个方向在 fringe 内）
             if (!in_i_fringe && !in_j_fringe) continue;
 
             // 本粗节点在细网格中的本地索引
