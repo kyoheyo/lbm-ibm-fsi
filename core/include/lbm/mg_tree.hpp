@@ -298,35 +298,96 @@ void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse);
 void mg_prolong_f(const MgNode& coarse, MgNode& fine);
 
 // ---------------------------------------------------------------------------
-// 覆盖网格（Overset/Fringe）耦合
+// ω 松弛频率缩放（粗 → 细，论文 Eq. 4）
 // ---------------------------------------------------------------------------
 
-/// @brief 在细网格 fringe 区域施加来自粗网格的边界条件（重叠网格耦合）。
+/// @brief 由粗网格松弛频率计算细网格松弛频率（论文 2015-multigrid.pdf Eq. 4）。
 ///
-/// Overset/Chimera 风格的多重网格耦合中，细网格的外边界（fringe 区域）
-/// 从粗网格插值获得 Dirichlet 型边界条件，实现物理一致的接口。
+/// 在对流缩放（convective scaling）下，细网格与粗网格具有相同的运动粘度，
+/// 而细网格空间步长 δxf = δxc/2（加密比 r=2）。此时：
+///   ωf = 2ωc / (4 − ωc)
 ///
-/// 算法：
-///   对细网格外边界（宽度 fringe_width 格的环形区域，以细网格本地坐标计）：
-///     - 用粗网格 ρ/u 对该 fringe 节点进行双线性插值
-///     - 用插值后的 (ρ, u) 重建平衡分布 f_eq，替换该节点的 f
-///     - 等价于：在 fringe 区域强制施加由粗网格主导的 Dirichlet BC
+/// 推导：ν = cs² * (1/ω − 0.5)，对流缩放要求 νf/νc = (δxf/δxc)²：
+///   (1/ωf − 0.5) = (δxf/δxc)² * (1/ωc − 0.5)
+///   当 δxf = δxc/2 时解出 ωf = 2ωc/(4−ωc)。
 ///
-/// 耦合时机（推荐）：
-///   在每个粗网格时间步的开始（粗网格碰撞前）调用一次，以更新细网格 fringe BC。
-///   对时间步细化（r 细步 / 1 粗步）：
-///     粗步 t₀  → 调用 mg_apply_fringe_bc → 细网格 BC 更新
-///     细步 t₁..t₁₊ᵣ（细网格 r 步）
-///     → 调用 mg_restrict_rho_u → 粗网格更新
+/// @param omega_c  粗网格松弛频率，需在 (0, 2) 内以保证 LBM 稳定性
+/// @return         细网格松弛频率 ωf
+/// @throws std::invalid_argument 若 omega_c ∉ (0, 4)（4 为公式奇点）
+inline double mg_omega_rescale(double omega_c)
+{
+    if (omega_c <= 0.0 || omega_c >= 4.0) {
+        throw std::invalid_argument(
+            "mg_omega_rescale: omega_c must be in (0, 4); "
+            "for LBM stability use omega_c in (0, 2)");
+    }
+    return 2.0 * omega_c / (4.0 - omega_c);
+}
+
+// ---------------------------------------------------------------------------
+// 覆盖网格（Overset/Fringe）耦合 — 粗 → 细（C→F, 论文 Eqs. 9–10）
+// ---------------------------------------------------------------------------
+
+/// @brief 粗→细（C→F）耦合：在细网格 fringe 区域施加粗网格边界条件。
 ///
-/// @param coarse        粗网格节点（提供 fringe BC 的插值源）
+/// 实现论文 2015-multigrid.pdf（Lagrava 2012）Eqs. (9)–(10)：
+///   对与粗节点重合的细 fringe 节点（xc_c→f）——(Eq. 9)：
+///     fi,f = f_eq_i(ρc, uc) + (ωc / 2ωf) × f_neq_i,c(xc)
+///   对非重合的细 fringe 节点（xf_c→f）——(Eq. 10)：
+///     fi,f = f_eq_i(ρc_interp, uc_interp) + (ωc / 2ωf) × f_neq_i,c_interp
+///
+/// 两种情形统一由双线性插值处理（重合时 alpha=β=0，退化为精确取值）：
+///   f_neq_i,c = fi,c − f_eq_i(ρc, uc) 在四角粗节点计算后做双线性插值。
+///   ωf 由 mg_omega_rescale(omega_c) 计算（Eq. 4）。
+///
+/// 与旧版（纯平衡态重建）的区别：
+///   加入了粗网格非平衡项 f_neq 的缩放贡献，使应力信息透过耦合界面传递，
+///   避免在粗-细界面出现虚假速度梯度跳跃。
+///
+/// 耦合时机（推荐，参考论文 Algorithm 步骤 3）：
+///   粗步 t₀ collide+stream → 调用 mg_apply_fringe_bc（t+δt/2 时刻 C→F）
+///   细步 × r → 调用 mg_couple_fine_to_coarse（F→C 更新粗网格）
+///
+/// @param coarse        粗网格节点（含有效 f、ρ、u；提供 C→F 数据）
 /// @param fine          细网格节点（fringe BC 施加目标）
 /// @param fringe_width  fringe 区域宽度（细网格格子数，默认 2；建议 ≥ 1）
+/// @param omega_c       粗网格松弛频率（默认 1.0；用于 Eq. 4 和缩放比 ωc/2ωf）
 ///
 /// @pre coarse.has_grid() && fine.has_grid()
-/// @pre fine.grid->model == D2Q9
-/// @throws std::invalid_argument 若 grid 指针为 nullptr
-void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine, int fringe_width = 2);
+/// @pre fine.grid->model == D2Q9（仅支持 D2Q9）
+/// @throws std::invalid_argument 若 grid 为 nullptr 或 omega_c ∉ (0,4)
+void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
+                        int fringe_width = 2, double omega_c = 1.0);
+
+// ---------------------------------------------------------------------------
+// 细 → 粗分布函数耦合（F→C coupling，论文 Eqs. 7–8）
+// ---------------------------------------------------------------------------
+
+/// @brief 细→粗（F→C）耦合：用细网格 f 更新粗网格耦合区域的分布函数。
+///
+/// 实现论文 2015-multigrid.pdf（Lagrava 2012）Eqs. (7)–(8)：
+///   fi,c(xc_f→c, t) = f_eq_i(ρf, uf) + (2ωf/ωc) × f_neq_filtered_i    (Eq. 7)
+///   f_neq_filtered_i = (1/Q) × Σ_{j=0}^{Q−1} f_neq_i,f(xc + ej, t)   (Eq. 8)
+///
+/// 算法步骤（对细网格域边界处的每个粗网格节点）：
+///   1. 将粗节点 (ic, jc) 映射到对应的细本地索引 if = (ic − fx_s)×r, jf = (jc − fy_s)×r
+///   2. 从细网格 f 计算 ρf = Σ_a fi,f 和 uf = Σ_a ei·fi,f / ρf
+///   3. 对每个方向 a：按 Eq. 8 对 Q 个邻格（细坐标 ej-偏移处）的 f_neq_a 求平均
+///   4. 按 Eq. 7 更新粗网格 fi,c，并同步 ρc、uc
+///
+/// 用于论文 Algorithm 步骤 5（每个粗步的末尾）：
+///   细步 × r 完成 → 调用 mg_couple_fine_to_coarse → 粗网格 fringe 区域更新
+///
+/// @param fine          细网格节点（F→C 的信息源，需含有效 f）
+/// @param coarse        粗网格节点（待更新目标）
+/// @param fringe_width  fringe 宽度（细网格格子数，默认 2；转换为粗格宽度 max(1,w/r)）
+/// @param omega_c       粗网格松弛频率（默认 1.0）
+///
+/// @pre fine.has_grid() && coarse.has_grid()
+/// @pre fine.grid->model == D2Q9（仅支持 D2Q9）
+/// @throws std::invalid_argument 若 grid 为 nullptr 或 omega_c ∉ (0,4)
+void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
+                               int fringe_width = 2, double omega_c = 1.0);
 
 // ---------------------------------------------------------------------------
 // 时间步细化辅助

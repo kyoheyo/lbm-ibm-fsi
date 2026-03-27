@@ -1580,7 +1580,7 @@ static int test_mg_prolong_f()
     return ok ? 0 : 1;
 }
 
-// 测试：mg_apply_fringe_bc — fringe 区域 f 从粗网格更新，内部区域不变
+// 测试：mg_apply_fringe_bc — fringe 区域 f 从粗网格更新（含 f_neq 缩放），内部区域不变
 static int test_mg_apply_fringe_bc()
 {
     lbm::MgTree tree({0, 31, 0, 31, 0, 0});
@@ -1589,13 +1589,18 @@ static int test_mg_apply_fringe_bc()
     lbm::LatticeGrid coarse_g(32, 32, 1, lbm::LatticeModel::D2Q9);
     lbm::LatticeGrid fine_g  (48, 48, 1, lbm::LatticeModel::D2Q9);
 
-    // 粗网格 rho 设为非均匀（便于检测是否被插值进 fringe）
+    // 粗网格：用均匀流初始化 f = f_eq(rho, u=0)（平衡态，f_neq=0）
+    // 这样 mg_apply_fringe_bc 的结果等于纯 f_eq 重建，便于回归比较
+    const double omega_c = 1.0;
     for (int n = 0; n < coarse_g.size(); ++n) {
         coarse_g.rho[n] = 1.0 + 0.01 * (n % 7);
         // u 保持 0（默认已初始化为 0）
+        double u0[2] = {0.0, 0.0};
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double c[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            coarse_g.f[n * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], coarse_g.rho[n], c, u0, 2);
+        }
     }
-    // 不调用 compute_macroscopic()——它需要有效的 f 值才能工作。
-    // mg_apply_fringe_bc 只读 rho 和 u，无需 f。
 
     // 细网格 f 设为已知值（便于检测 fringe 是否被覆盖）
     for (double& v : fine_g.f) v = 42.0;
@@ -1603,8 +1608,8 @@ static int test_mg_apply_fringe_bc()
     tree.root()->grid = &coarse_g;
     fine_node->grid   = &fine_g;
 
-    // 施加 fringe BC（宽度 2 格）
-    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, 2);
+    // 施加 fringe BC（宽度 2 格，默认 omega_c）
+    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, 2, omega_c);
 
     bool ok = true;
     const int fnx = fine_g.nx;  // = 48
@@ -1618,7 +1623,7 @@ static int test_mg_apply_fringe_bc()
     const int n_inner = fine_g.idx(10, 10);
     ok &= (fine_g.f[n_inner * lbm::d2q9::Q] == 42.0);
 
-    // fringe 区域的 f 值有限
+    // fringe 区域的 f 值有限且正
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < fnx; ++i) {
             const int n = fine_g.idx(i, j);
@@ -1628,7 +1633,23 @@ static int test_mg_apply_fringe_bc()
         }
     }
 
-    std::printf("[MgTree] mg_apply_fringe_bc (fringe updated, interior unchanged): %s\n",
+    // 当粗网格为平衡态（f_neq=0）时，结果应等于纯 f_eq 重建
+    // 检查某 fringe 节点（与粗节点重合：ix=0%2==0, jy=0%2==0）
+    {
+        // fine (0,0) 对应粗 (4,4)，即粗本地 (4,4)
+        const int c_idx = coarse_g.idx(4, 4);
+        const double rho_c = coarse_g.rho[c_idx];
+        const double u_c[2] = {0.0, 0.0};
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double ca[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            const double expected = lbm::f_eq(lbm::d2q9::W[a], rho_c, ca, u_c, 2);
+            if (std::abs(fine_g.f[n_fringe * lbm::d2q9::Q + a] - expected) > 1e-10) {
+                ok = false;
+            }
+        }
+    }
+
+    std::printf("[MgTree] mg_apply_fringe_bc (fringe updated, f_neq rescaling, interior unchanged): %s\n",
                 ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -1680,8 +1701,121 @@ static int test_mg_refinement_indicator()
 }
 
 // ===========================================================================
-// MPI BC 壁面所有权过滤测试（修复分块边界速度阶跃）
+// 新增：mg_omega_rescale 和 mg_couple_fine_to_coarse 测试
 // ===========================================================================
+
+// 测试：mg_omega_rescale — 论文 Eq. 4 松弛频率缩放
+static int test_mg_omega_rescale()
+{
+    bool ok = true;
+
+    // Eq. 4: ωf = 2ωc / (4 - ωc)
+    // ωc=1.0: ωf = 2/(4-1) = 2/3
+    ok &= (std::abs(lbm::mg_omega_rescale(1.0) - 2.0 / 3.0) < 1e-14);
+    // ωc=1.5: ωf = 3/(4-1.5) = 3/2.5 = 1.2
+    ok &= (std::abs(lbm::mg_omega_rescale(1.5) - 1.2) < 1e-14);
+    // ωc=0.5: ωf = 1/(4-0.5) = 1/3.5 ≈ 0.28571…
+    ok &= (std::abs(lbm::mg_omega_rescale(0.5) - 1.0 / 3.5) < 1e-14);
+
+    // 错误输入应抛出异常
+    bool threw_zero = false, threw_four = false;
+    try { lbm::mg_omega_rescale(0.0); } catch (const std::invalid_argument&) { threw_zero = true; }
+    try { lbm::mg_omega_rescale(4.0); } catch (const std::invalid_argument&) { threw_four = true; }
+    ok &= threw_zero && threw_four;
+
+    std::printf("[MgTree] mg_omega_rescale (Eq.4): %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// 测试：mg_couple_fine_to_coarse — F→C 耦合（论文 Eqs. 7–8）
+//
+// 场景：细网格为均匀平衡流（f = f_eq(ρf, uf)），则 f_neq = 0，
+//       按 Eq. 7 更新后粗网格 fringe 处 fi,c = f_eq(ρf, uf)。
+static int test_mg_couple_fine_to_coarse()
+{
+    // 创建树：粗 32×32，细网格覆盖粗坐标 [8,23]×[8,23]，加密比 2
+    lbm::MgTree tree({0, 31, 0, 31, 0, 0});
+    auto* fine_node = tree.add_level(tree.root(), {8, 23, 8, 23, 0, 0}, 2);
+
+    // 粗网格 32×32，细网格 32×32（覆盖 16 粗格 × 2 = 32 细格）
+    lbm::LatticeGrid coarse_g(32, 32, 1, lbm::LatticeModel::D2Q9);
+    lbm::LatticeGrid fine_g  (32, 32, 1, lbm::LatticeModel::D2Q9);
+
+    tree.root()->grid = &coarse_g;
+    fine_node->grid   = &fine_g;
+
+    // 细网格初始化：均匀流 ρ=1.1, u=(0.05, 0)，f = f_eq（平衡态，f_neq=0）
+    const double rho_f   = 1.1;
+    const double ux_f    = 0.05;
+    const double uy_f    = 0.0;
+    const double u_f[2]  = {ux_f, uy_f};
+    for (int n = 0; n < fine_g.size(); ++n) {
+        fine_g.rho[n]       = rho_f;
+        fine_g.u[n * 2 + 0] = ux_f;
+        fine_g.u[n * 2 + 1] = uy_f;
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double ca[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            fine_g.f[n * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], rho_f, ca, u_f, 2);
+        }
+    }
+
+    // 粗网格初始化：全部设为另一个流态（ρ=0.9, u=0），便于检测是否被覆盖
+    for (int n = 0; n < coarse_g.size(); ++n) {
+        const double rho0 = 0.9, u0[2] = {0.0, 0.0};
+        coarse_g.rho[n] = rho0;
+        coarse_g.u[n * 2] = coarse_g.u[n * 2 + 1] = 0.0;
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double ca[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            coarse_g.f[n * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], rho0, ca, u0, 2);
+        }
+    }
+
+    const double omega_c = 1.0;
+    const int fringe_width = 2;
+
+    // 执行 F→C 耦合
+    lbm::mg_couple_fine_to_coarse(*fine_node, *tree.root(), fringe_width, omega_c);
+
+    bool ok = true;
+
+    // 验证：细网格对应的粗 fringe 节点（例如 ic=8,jc=8，为细域左下角）
+    // 由于细网格为平衡态（f_neq=0），Eq. 7 应给出 fi,c = f_eq(ρf, uf)
+    // 粗 fringe 宽 = max(1, (2+2-1)/2) = 1，故 ic=8 在 fringe 内
+    {
+        const int ic_l = 8;  // 细域 x_start = 8，本地粗索引 = 8 - 0 = 8
+        const int jc_l = 8;
+        const int ci = coarse_g.idx(ic_l, jc_l);
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double ca[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            const double expected = lbm::f_eq(lbm::d2q9::W[a], rho_f, ca, u_f, 2);
+            if (std::abs(coarse_g.f[ci * lbm::d2q9::Q + a] - expected) > 1e-10) {
+                ok = false;
+            }
+        }
+        // 验证宏观量同步
+        ok &= (std::abs(coarse_g.rho[ci] - rho_f) < 1e-10);
+        ok &= (std::abs(coarse_g.u[ci * 2] - ux_f) < 1e-10);
+    }
+
+    // 验证：粗网格域外（不在细域内）的节点应未被修改（仍为 ρ=0.9, u=0）
+    {
+        const int ci_out = coarse_g.idx(2, 2);  // 粗 (2,2)，在细域 [8,23] 外
+        ok &= (std::abs(coarse_g.rho[ci_out] - 0.9) < 1e-10);
+    }
+
+    // 验证：粗网格细域内部（非 fringe）节点应未被修改
+    // 细域 [8,23]，fringe=1 粗格，内部: ic ∈ [9,22]
+    {
+        const int ci_int = coarse_g.idx(12, 12);  // 粗 (12,12)，在细域内部
+        ok &= (std::abs(coarse_g.rho[ci_int] - 0.9) < 1e-10);
+    }
+
+    std::printf("[MgTree] mg_couple_fine_to_coarse (F→C Eqs.7-8, equil fine→coarse): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
 
 // 测试：PhysicalBounds::has_south_wall/has_north_wall=false 时
 //       South/North BC 应完全跳过（不修改内部物理行），防止 MPI 分块边界速度阶跃。
@@ -1835,6 +1969,8 @@ int test_lbm_main()
     failures += test_mg_prolong_f();
     failures += test_mg_apply_fringe_bc();
     failures += test_mg_refinement_indicator();
+    failures += test_mg_omega_rescale();
+    failures += test_mg_couple_fine_to_coarse();
     failures += test_bc_wall_ownership_filter();
     failures += test_bc_wall_ownership_south_applied();
     if (failures == 0)

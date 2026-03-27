@@ -720,6 +720,55 @@ int lbm_mg_restrict_rho_u(const MgNodeHandle* fine, MgNodeHandle* coarse)
     }
 }
 
+/// 粗→细（C→F）耦合：在细网格 fringe 区域施加粗网格边界条件（论文 Eqs. 9–10）。
+/// fringe_width: 细网格 fringe 宽度（格子数，默认 2）。
+/// omega_c: 粗网格松弛频率（需在 (0,4) 内，典型值 (0,2)）。
+/// 返回 0 表示成功，-1 表示参数错误。
+int lbm_mg_apply_fringe_bc(const MgNodeHandle* coarse, MgNodeHandle* fine,
+                            int fringe_width, double omega_c)
+{
+    if (!coarse || !fine) return -1;
+    try {
+        lbm::mg_apply_fringe_bc(
+            *reinterpret_cast<const lbm::MgNode*>(coarse),
+            *reinterpret_cast<lbm::MgNode*>(fine),
+            fringe_width, omega_c);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+/// 细→粗（F→C）耦合：用细网格 f 更新粗网格耦合区域分布函数（论文 Eqs. 7–8）。
+/// fringe_width: 细网格 fringe 宽度（格子数，默认 2）。
+/// omega_c: 粗网格松弛频率。
+/// 返回 0 表示成功，-1 表示参数错误。
+int lbm_mg_couple_fine_to_coarse(const MgNodeHandle* fine, MgNodeHandle* coarse,
+                                  int fringe_width, double omega_c)
+{
+    if (!fine || !coarse) return -1;
+    try {
+        lbm::mg_couple_fine_to_coarse(
+            *reinterpret_cast<const lbm::MgNode*>(fine),
+            *reinterpret_cast<lbm::MgNode*>(coarse),
+            fringe_width, omega_c);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+/// 松弛频率缩放：由粗网格 omega_c 计算细网格 omega_f（论文 Eq. 4）。
+/// 返回 ωf = 2ωc/(4-ωc)；若 omega_c 超出 (0,4) 返回 -1.0。
+double lbm_mg_omega_rescale(double omega_c)
+{
+    try {
+        return lbm::mg_omega_rescale(omega_c);
+    } catch (...) {
+        return -1.0;
+    }
+}
+
 } // extern "C"
 
 // ===========================================================================

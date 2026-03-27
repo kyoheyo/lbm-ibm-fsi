@@ -298,9 +298,18 @@ void mg_prolong_f(const MgNode& coarse, MgNode& fine)
 }
 
 // ---------------------------------------------------------------------------
-// 覆盖网格（Overset/Fringe）耦合：在细网格外边界施加粗网格 Dirichlet BC
+// 覆盖网格（Overset/Fringe）耦合：C→F 耦合（论文 Eqs. 9–10）
+//
+// 算法：对细网格 fringe 区域的每个节点 (ix, jy)：
+//   1. 计算该节点在粗坐标系中的浮点位置 (px, py)
+//   2. 双线性插值粗网格 ρ、u、f_neq（在四角粗节点上计算 f_neq = f - f_eq，再插值）
+//   3. fi,f = f_eq(ρ_interp, u_interp) + (ωc/2ωf) * f_neq_interp
+//
+// 当 (ix, jy) 与粗节点重合（alpha=β=0）时，双线性插值退化为精确取值（对应 Eq. 9）；
+// 否则为空间插值（对应 Eq. 10）。
 // ---------------------------------------------------------------------------
-void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine, int fringe_width)
+void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
+                        int fringe_width, double omega_c)
 {
     if (!coarse.grid || !fine.grid) {
         throw std::invalid_argument("mg_apply_fringe_bc: both coarse and fine nodes must have grids");
@@ -308,86 +317,237 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine, int fringe_width)
     if (fine.grid->model != LatticeModel::D2Q9) {
         throw std::invalid_argument("mg_apply_fringe_bc: only D2Q9 is currently supported");
     }
+    if (omega_c <= 0.0 || omega_c >= 4.0) {
+        throw std::invalid_argument(
+            "mg_apply_fringe_bc: omega_c must be in (0, 4)");
+    }
     if (fringe_width < 1) fringe_width = 1;
 
     const LatticeGrid& cg = *coarse.grid;
     LatticeGrid&       fg = *fine.grid;
 
+    const int r   = fine.refine_ratio;
+    const int d   = fg.dim();          // 2 for D2Q9
+    const int Q   = d2q9::Q;          // 9
     const int fnx = fg.nx;
     const int fny = fg.ny;
-    const int r   = fine.refine_ratio;
-    const int d   = cg.dim();  // 2 for D2Q9
 
-    // 辅助 lambda：双线性插值粗网格宏观量到细节点 (if_local, jf_local)
-    //  — 复用与 mg_prolong_rho_u 相同的双线性插值逻辑
-    auto bilinear_rho_u = [&](int ix_fine, int jf_fine, double& rho_out, double u_out[2]) {
-        const double px = fine.extent.x_start + static_cast<double>(ix_fine) / r;
-        const double py = fine.extent.y_start + static_cast<double>(jf_fine) / r;
+    // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
+    const double omega_f = mg_omega_rescale(omega_c);
+    const double scale   = omega_c / (2.0 * omega_f);
 
-        const int i0 = static_cast<int>(std::floor(px));
-        const int j0 = static_cast<int>(std::floor(py));
-
-        const double alpha = px - i0;
-        const double beta  = py - j0;
-
-        auto clamp_ci = [&](int ci) -> int {
-            return std::max(coarse.extent.x_start,
-                            std::min(coarse.extent.x_end, ci));
-        };
-        auto clamp_cj = [&](int cj) -> int {
-            return std::max(coarse.extent.y_start,
-                            std::min(coarse.extent.y_end, cj));
-        };
-
-        const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
-        const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
-        const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
-        const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
-
-        const int c00 = cg.idx(ci00, cj00);
-        const int c10 = cg.idx(ci10, cj00);
-        const int c01 = cg.idx(ci00, cj10);
-        const int c11 = cg.idx(ci10, cj10);
-
-        const double w00 = (1.0 - alpha) * (1.0 - beta);
-        const double w10 = alpha          * (1.0 - beta);
-        const double w01 = (1.0 - alpha)  * beta;
-        const double w11 = alpha           * beta;
-
-        rho_out = w00 * cg.rho[c00] + w10 * cg.rho[c10]
-                + w01 * cg.rho[c01] + w11 * cg.rho[c11];
-        for (int k = 0; k < d; ++k) {
-            u_out[k] = w00 * cg.u[c00 * d + k] + w10 * cg.u[c10 * d + k]
-                     + w01 * cg.u[c01 * d + k] + w11 * cg.u[c11 * d + k];
-        }
-    };
-
-    // 在细网格外边界 fringe 区域（四面各 fringe_width 格）施加粗网格 Dirichlet BC
-    // 遍历细网格所有节点，判断是否位于 fringe 区域
     for (int jy = 0; jy < fny; ++jy) {
         for (int ix = 0; ix < fnx; ++ix) {
-            // 判断是否为 fringe 节点（位于外边界 fringe_width 层内）
+            // 判断是否为 fringe 节点（外边界 fringe_width 层内）
             const bool in_fringe = (ix < fringe_width || ix >= fnx - fringe_width ||
                                     jy < fringe_width || jy >= fny - fringe_width);
             if (!in_fringe) continue;
 
-            // 双线性插值粗网格宏观量
-            double rho_f;
-            double u_f[2] = {0.0, 0.0};
-            bilinear_rho_u(ix, jy, rho_f, u_f);
+            // 细节点在粗坐标系中的浮点位置
+            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
+            const double py = fine.extent.y_start + static_cast<double>(jy) / r;
+
+            const int i0 = static_cast<int>(std::floor(px));
+            const int j0 = static_cast<int>(std::floor(py));
+
+            const double alpha = px - i0;
+            const double beta  = py - j0;
+
+            auto clamp_ci = [&](int ci) -> int {
+                return std::max(coarse.extent.x_start,
+                                std::min(coarse.extent.x_end, ci));
+            };
+            auto clamp_cj = [&](int cj) -> int {
+                return std::max(coarse.extent.y_start,
+                                std::min(coarse.extent.y_end, cj));
+            };
+
+            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
+            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
+            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
+            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+
+            const int c00 = cg.idx(ci00, cj00);
+            const int c10 = cg.idx(ci10, cj00);
+            const int c01 = cg.idx(ci00, cj10);
+            const int c11 = cg.idx(ci10, cj10);
+
+            const double w00 = (1.0 - alpha) * (1.0 - beta);
+            const double w10 = alpha          * (1.0 - beta);
+            const double w01 = (1.0 - alpha)  * beta;
+            const double w11 = alpha           * beta;
+
+            // 插值粗网格 ρ 和 u
+            double rho_f = w00 * cg.rho[c00] + w10 * cg.rho[c10]
+                         + w01 * cg.rho[c01] + w11 * cg.rho[c11];
+            double u_f[2];
+            for (int k = 0; k < d; ++k) {
+                u_f[k] = w00 * cg.u[c00 * d + k] + w10 * cg.u[c10 * d + k]
+                       + w01 * cg.u[c01 * d + k] + w11 * cg.u[c11 * d + k];
+            }
 
             const int fi = fg.idx(ix, jy);
+            fg.rho[fi] = rho_f;
+            for (int k = 0; k < d; ++k) fg.u[fi * d + k] = u_f[k];
 
-            // 用插值宏观量重建平衡分布函数（Dirichlet BC in distribution function space）
-            fg.rho[fi]       = rho_f;
-            fg.u[fi * 2 + 0] = u_f[0];
-            fg.u[fi * 2 + 1] = u_f[1];
-            for (int a = 0; a < d2q9::Q; ++a) {
-                const double c[2] = {
+            // 对每个方向 a：计算插值后的 f_neq，应用 Eqs. 9–10
+            for (int a = 0; a < Q; ++a) {
+                const double ca[2] = {
                     static_cast<double>(d2q9::C[a][0]),
                     static_cast<double>(d2q9::C[a][1])
                 };
-                fg.f[fi * d2q9::Q + a] = f_eq(d2q9::W[a], rho_f, c, u_f, 2);
+
+                // 在各粗角点计算 f_neq_a = f_a - f_eq_a(ρ, u)
+                auto f_neq_corner = [&](int cidx) -> double {
+                    const double rc = cg.rho[cidx];
+                    const double uc[2] = {cg.u[cidx * d], cg.u[cidx * d + 1]};
+                    return cg.f[cidx * Q + a] - f_eq(d2q9::W[a], rc, ca, uc, d);
+                };
+
+                // 双线性插值 f_neq
+                const double f_neq_interp =
+                    w00 * f_neq_corner(c00) + w10 * f_neq_corner(c10)
+                  + w01 * f_neq_corner(c01) + w11 * f_neq_corner(c11);
+
+                // fi,f = f_eq(ρ_interp, u_interp) + (ωc/2ωf) * f_neq_interp
+                fg.f[fi * Q + a] = f_eq(d2q9::W[a], rho_f, ca, u_f, d)
+                                 + scale * f_neq_interp;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 细 → 粗分布函数耦合（F→C，论文 Eqs. 7–8）
+//
+// 算法：对细网格域边界（fringe_width 细格 ↔ coarse_fringe 粗格）内的每个粗节点 (ic, jc)：
+//   1. 映射到对应细本地索引 if = (ic − fx_s)*r, jf = (jc − fy_s)*r
+//   2. 从细网格 f 计算 ρf 和 uf
+//   3. 对每个方向 a：
+//      - 按 Eq. 8 对 Q 邻格（细坐标偏移 ej）的 f_neq_a 取平均（越界处夹取）
+//      - 按 Eq. 7 更新 fi,c = f_eq_a(ρf, uf) + (2ωf/ωc) * f_neq_filtered_a
+//   4. 同步粗网格 ρc 和 uc
+// ---------------------------------------------------------------------------
+void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
+                               int fringe_width, double omega_c)
+{
+    if (!fine.grid || !coarse.grid) {
+        throw std::invalid_argument(
+            "mg_couple_fine_to_coarse: both fine and coarse nodes must have grids");
+    }
+    if (fine.grid->model != LatticeModel::D2Q9) {
+        throw std::invalid_argument(
+            "mg_couple_fine_to_coarse: only D2Q9 is currently supported");
+    }
+    if (omega_c <= 0.0 || omega_c >= 4.0) {
+        throw std::invalid_argument(
+            "mg_couple_fine_to_coarse: omega_c must be in (0, 4)");
+    }
+    if (fringe_width < 1) fringe_width = 1;
+
+    const LatticeGrid& fg = *fine.grid;
+    LatticeGrid&       cg = *coarse.grid;
+
+    const int r  = fine.refine_ratio;
+    const int d  = fg.dim();   // 2 for D2Q9
+    const int Q  = d2q9::Q;   // 9
+
+    // 松弛频率缩放（Eq. 4），F→C 缩放比 = 2ωf / ωc
+    const double omega_f = mg_omega_rescale(omega_c);
+    const double scale   = 2.0 * omega_f / omega_c;
+
+    // 粗网格 fringe 宽度（细 fringe_width 对应的粗格数，至少 1）
+    const int coarse_fringe = std::max(1, (fringe_width + r - 1) / r);
+
+    // 细网格范围（粗坐标系）
+    const int fx_s = fine.extent.x_start;
+    const int fx_e = fine.extent.x_end;
+    const int fy_s = fine.extent.y_start;
+    const int fy_e = fine.extent.y_end;
+
+    for (int jc_g = fy_s; jc_g <= fy_e; ++jc_g) {
+        const int jc_l = jc_g - coarse.extent.y_start;  // 粗网格本地 j
+
+        // 判断是否在 y 方向 fringe 内
+        const bool in_j_fringe = (jc_g <= fy_s + coarse_fringe - 1 ||
+                                   jc_g >= fy_e - coarse_fringe + 1);
+
+        for (int ic_g = fx_s; ic_g <= fx_e; ++ic_g) {
+            const int ic_l = ic_g - coarse.extent.x_start;  // 粗网格本地 i
+
+            // 判断是否在 x 方向 fringe 内
+            const bool in_i_fringe = (ic_g <= fx_s + coarse_fringe - 1 ||
+                                       ic_g >= fx_e - coarse_fringe + 1);
+
+            // 仅处理 fringe 区域（至少一个方向在 fringe 内）
+            if (!in_i_fringe && !in_j_fringe) continue;
+
+            // 本粗节点在细网格中的本地索引
+            const int if_loc = (ic_g - fx_s) * r;
+            const int jf_loc = (jc_g - fy_s) * r;
+
+            // 越界保护（正常配置不应触发）
+            if (if_loc < 0 || if_loc >= fg.nx || jf_loc < 0 || jf_loc >= fg.ny) continue;
+
+            // 从细网格 f 计算 ρf 和 uf（直接求和，不依赖 rho/u 缓存）
+            double rho_f    = 0.0;
+            double u_f[2]   = {0.0, 0.0};
+            {
+                const int fi0 = fg.idx(if_loc, jf_loc);
+                for (int a = 0; a < Q; ++a) {
+                    const double fa = fg.f[fi0 * Q + a];
+                    rho_f  += fa;
+                    u_f[0] += fa * d2q9::C[a][0];
+                    u_f[1] += fa * d2q9::C[a][1];
+                }
+                if (rho_f > 1e-15) { u_f[0] /= rho_f; u_f[1] /= rho_f; }
+            }
+
+            const int ci = cg.idx(ic_l, jc_l);
+
+            // 对每个方向 a，计算空间滤波后的 f_neq（Eq. 8）并更新粗节点（Eq. 7）
+            for (int a = 0; a < Q; ++a) {
+                const double ca[2] = {
+                    static_cast<double>(d2q9::C[a][0]),
+                    static_cast<double>(d2q9::C[a][1])
+                };
+
+                // Eq. 8：f_neq_filtered_a = (1/Q) * Σ_j f_neq_a,f(fine_site + ej)
+                double f_neq_sum = 0.0;
+                for (int j = 0; j < Q; ++j) {
+                    // 邻格细坐标（夹持到细网格范围）
+                    const int if_nb = std::max(0, std::min(fg.nx - 1,
+                                        if_loc + d2q9::C[j][0]));
+                    const int jf_nb = std::max(0, std::min(fg.ny - 1,
+                                        jf_loc + d2q9::C[j][1]));
+                    const int fi_nb = fg.idx(if_nb, jf_nb);
+
+                    const double rho_nb   = fg.rho[fi_nb];
+                    const double u_nb[2]  = {fg.u[fi_nb * d], fg.u[fi_nb * d + 1]};
+                    const double f_neq_nb = fg.f[fi_nb * Q + a]
+                                          - f_eq(d2q9::W[a], rho_nb, ca, u_nb, d);
+                    f_neq_sum += f_neq_nb;
+                }
+                const double f_neq_filtered = f_neq_sum / Q;
+
+                // Eq. 7：fi,c = f_eq_a(ρf, uf) + (2ωf/ωc) * f_neq_filtered_a
+                cg.f[ci * Q + a] = f_eq(d2q9::W[a], rho_f, ca, u_f, d)
+                                  + scale * f_neq_filtered;
+            }
+
+            // 从更新后的 f 同步粗网格宏观量 ρ 和 u
+            cg.rho[ci]       = 0.0;
+            cg.u[ci * d]     = 0.0;
+            cg.u[ci * d + 1] = 0.0;
+            for (int a = 0; a < Q; ++a) {
+                const double fa = cg.f[ci * Q + a];
+                cg.rho[ci]       += fa;
+                cg.u[ci * d]     += fa * d2q9::C[a][0];
+                cg.u[ci * d + 1] += fa * d2q9::C[a][1];
+            }
+            if (cg.rho[ci] > 1e-15) {
+                cg.u[ci * d]     /= cg.rho[ci];
+                cg.u[ci * d + 1] /= cg.rho[ci];
             }
         }
     }
