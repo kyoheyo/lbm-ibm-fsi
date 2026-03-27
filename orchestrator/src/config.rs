@@ -3,6 +3,237 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 // ---------------------------------------------------------------------------
+// 运动体配置（BB/IBB 刚体运动 + IBM 柔性/刚性体运动通用）
+// ---------------------------------------------------------------------------
+
+/// 运动类型枚举（对应字符串配置值）
+///
+/// - `"fixed"` / `"static"`：固定不动（默认）
+/// - `"rigid_free"`：自由刚性运动（流体合力 → Newton-Euler 积分，**被动刚体**）
+/// - `"prescribed"`：预定义主动运动（由 `[ibm.bodies.prescribed]` 或 `[solid.bodies.prescribed]` 驱动，**主动刚体**）
+/// - `"flexible"`：柔性体运动（IBM 标记点由梁有限元求解器驱动，`motion_type = "flexible"` 对应**被动柔性体**；
+///   若设置 `prescribed` 参数则为**主动柔性体**行波/振荡运动）
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionType {
+    #[default]
+    Fixed,
+    RigidFree,
+    Prescribed,
+    Flexible,
+}
+
+// ---------------------------------------------------------------------------
+// 主动运动配置（prescribed motion）
+// ---------------------------------------------------------------------------
+
+/// 主动运动配置（`[ibm.bodies.prescribed]` 或 `[solid.bodies.prescribed]`）
+///
+/// 仅当 `motion_type = "prescribed"` 或 `motion_type = "flexible"` 且需要行波运动时读取。
+///
+/// ## 运动模式（`mode` 字段）
+///
+/// | `mode` 值 | 含义 | 关键参数 |
+/// |-----------|------|---------|
+/// | `"translate"` | 匀速平移（默认）| `velocity_x`, `velocity_y` |
+/// | `"oscillate_x"` | x 方向正弦振荡：`ẋ(t) = A·2πf·cos(2πft+φ)` | `amplitude`, `frequency`, `phase` |
+/// | `"oscillate_y"` | y 方向正弦振荡 | `amplitude`, `frequency`, `phase` |
+/// | `"oscillate_xy"` | x/y 正弦振荡，y 超前 90° | `amplitude`, `frequency`, `phase` |
+/// | `"rotate"` | 匀速旋转 | `omega` |
+/// | `"rotate_oscillate"` | 正弦角速度振荡：`ω(t) = A·2πf·cos(2πft+φ)` | `amplitude`, `frequency`, `phase` |
+/// | `"traveling_wave"` | 丝状体行波（柔性体主动运动）：`ẏ(s,t) = A·2πf·cos(2π(ft - s/λ)+φ)` | `amplitude`, `frequency`, `wavelength`, `phase` |
+///
+/// ## TOML 示例
+///
+/// ```toml
+/// # 主动振荡圆柱（IBM）
+/// [[ibm.bodies]]
+/// geometry  = "circle"
+/// x0 = 150.0  y0 = 50.0  size = 10.0  n_markers = 64
+/// motion_type = "prescribed"
+///
+/// [ibm.bodies.prescribed]
+/// mode      = "oscillate_y"
+/// amplitude = 5.0      # 振幅（格子单位）
+/// frequency = 0.005    # 频率（步^{-1}）
+/// phase     = 0.0
+///
+/// # 主动行波丝状柔性体（flapping foil）
+/// [[ibm.bodies]]
+/// geometry  = "filament"
+/// x0 = 100.0  y0 = 50.0  size = 40.0  n_markers = 40
+/// motion_type = "flexible"
+///
+/// [ibm.bodies.prescribed]
+/// mode       = "traveling_wave"
+/// amplitude  = 2.0
+/// frequency  = 0.01
+/// wavelength = 40.0
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PrescribedMotionConfig {
+    /// 运动模式（见文档表格；默认 `"translate"`）
+    #[serde(default = "default_prescribed_mode")]
+    pub mode: String,
+    /// 振幅（格子单位位移；`oscillate_*` 和 `traveling_wave` 模式必填）
+    #[serde(default)] pub amplitude: f64,
+    /// 振荡频率（步 ^{-1}；等价于 1/T，其中 T 为振荡周期步数）
+    #[serde(default)] pub frequency: f64,
+    /// 初始相位（rad；默认 0.0）
+    #[serde(default)] pub phase: f64,
+    /// x 方向恒定平移速度（格子单位/步；`mode="translate"` 时生效）
+    #[serde(default)] pub velocity_x: f64,
+    /// y 方向恒定平移速度（格子单位/步；`mode="translate"` 时生效）
+    #[serde(default)] pub velocity_y: f64,
+    /// 恒定角速度（rad/步；`mode="rotate"` 时生效）
+    #[serde(default)] pub omega: f64,
+    /// 行波波长（格子单位；`mode="traveling_wave"` 时必填）
+    #[serde(default)] pub wavelength: f64,
+}
+
+fn default_prescribed_mode() -> String { "translate".to_string() }
+
+// ---------------------------------------------------------------------------
+// 被动柔性体梁参数配置
+// ---------------------------------------------------------------------------
+
+/// 被动/主动柔性体 Euler-Bernoulli 梁参数配置（`[ibm.bodies.flexible_beam]`）
+///
+/// 当 `motion_type = "flexible"` 时读取。结合 IBM 力计算，使用 Newmark-β 时间积分推进
+/// 梁的有限元方程。根据是否设置锚点激励/外力字段，支持两种工作模式：
+///
+/// - **被动柔性体**：仅设置基本梁参数，梁在流体力作用下自由变形。
+/// - **主动柔性体（部分节点激励）**：设置 `anchor_amplitude` 等字段——锚点（clamped 端）
+///   做简谐横向振荡（基础激励），梁的其余部分在流体力和弹性力联合作用下变形。
+///   这是"指定部分节点运动"场景的典型实现。
+/// - **主动柔性体（力/力矩驱动）**：设置 `tip_force_amplitude` 等字段——在梁自由端
+///   施加周期性横向外力（相当于驱动执行器），梁在外力与流体力共同作用下响应。
+///
+/// ## 物理模型
+///
+/// 悬臂梁（clamped-free），clamped 端位于 `(anchor_x, anchor_y)`，方向角 `orientation`。
+/// 梁坐标：
+/// - 轴向方向：e₁ = (cos θ, sin θ)
+/// - 横向方向：e₂ = (-sin θ, cos θ)
+/// - 横向位移 w(s,t) 满足 Euler-Bernoulli 方程：
+///   ρA ẅ + c ẇ + EI w'''' = f⊥(s,t) + f_tip·δ(s−L) + f_base(t)·等效载荷
+///
+/// 其中 f⊥ 为 IBM 作用在梁上的横向流体力（每单位弧长）。
+///
+/// ## TOML 示例
+///
+/// ```toml
+/// # ── 被动柔性体 ──────────────────────────────────────────────────────
+/// [[ibm.bodies]]
+/// geometry  = "filament"
+/// x0 = 100.0  y0 = 50.0  size = 40.0  n_markers = 40
+/// motion_type = "flexible"
+///
+/// [ibm.bodies.flexible_beam]
+/// anchor_x      = 100.0
+/// anchor_y      = 50.0
+/// orientation   = 0.0       # rad（0 = 水平，π/2 = 竖直）
+/// length        = 40.0
+/// young_modulus = 5000.0    # 格子单位
+/// second_moment = 0.01      # I（截面二次矩，格子单位⁴）
+/// linear_density = 1.5      # ρA（单位弧长质量，格子单位）
+/// n_elements    = 20
+/// damping       = 0.02      # 质量比例阻尼系数 α_R（Rayleigh 阻尼 C = α_R · M）
+///
+/// # ── 主动柔性体：锚点基础激励（指定部分节点运动）────────────────────
+/// [ibm.bodies.flexible_beam]
+/// anchor_x      = 100.0    anchor_y     = 50.0
+/// orientation   = 0.0      length       = 40.0
+/// young_modulus = 5000.0   second_moment = 0.01
+/// linear_density = 1.5     n_elements   = 20    damping = 0.02
+/// # 锚点横向正弦振荡：w_0(t) = A·sin(2πft + φ)
+/// anchor_amplitude = 2.0   # 横向振幅（格子单位）
+/// anchor_frequency = 0.01  # 频率（步^{-1}）
+/// anchor_phase     = 0.0   # 初始相位（rad）
+///
+/// # ── 主动柔性体：自由端外力驱动（指定力/力矩驱动）──────────────────
+/// [ibm.bodies.flexible_beam]
+/// anchor_x      = 100.0    anchor_y     = 50.0
+/// orientation   = 0.0      length       = 40.0
+/// young_modulus = 5000.0   second_moment = 0.01
+/// linear_density = 1.5     n_elements   = 20    damping = 0.02
+/// # 自由端横向简谐力：F_tip(t) = F_amp·cos(2πf_t·t + φ_f)
+/// tip_force_amplitude = 5.0   # 力幅值（格子单位·ρ·cs²）
+/// tip_force_frequency = 0.01  # 驱动频率（步^{-1}）
+/// tip_force_phase     = 0.0   # 初始相位（rad）
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct FlexibleBodyConfig {
+    /// clamped 端 x 坐标（格子单位）
+    pub anchor_x: f64,
+    /// clamped 端 y 坐标（格子单位）
+    pub anchor_y: f64,
+    /// 梁初始方位角（rad；0 = 沿 +x，π/2 = 沿 +y）
+    #[serde(default)] pub orientation: f64,
+    /// 梁总长度（格子单位；应与 `[ibm.bodies].size` 一致）
+    pub length: f64,
+    /// 杨氏模量 E（格子单位）
+    pub young_modulus: f64,
+    /// 截面二次矩 I（格子单位⁴）
+    pub second_moment: f64,
+    /// 单位弧长质量 ρA（格子单位；等于 `density × cross_section_area`）
+    pub linear_density: f64,
+    /// 有限元单元数（默认 10；建议 ≥ n_markers / 2）
+    #[serde(default = "default_beam_n_elements")] pub n_elements: u32,
+    /// 质量比例 Rayleigh 阻尼系数 α（C = α·M；默认 0.01）
+    #[serde(default = "default_beam_damping")] pub damping: f64,
+
+    // ── 主动柔性体：锚点基础激励（指定部分节点运动）──────────────────────
+    /// 锚点横向振荡幅值（格子单位；默认 0.0 = 不激励）。
+    /// 锚点横向位移：w₀(t) = `anchor_amplitude` · sin(2π·`anchor_frequency`·t + `anchor_phase`)
+    #[serde(default)] pub anchor_amplitude: f64,
+    /// 锚点激励频率（步^{-1}；仅 `anchor_amplitude` > 0 时有效）
+    #[serde(default)] pub anchor_frequency: f64,
+    /// 锚点激励初始相位（rad）
+    #[serde(default)] pub anchor_phase: f64,
+
+    // ── 主动柔性体：自由端外力驱动（指定力/力矩驱动）──────────────────────
+    /// 自由端横向外力幅值（格子单位压强·格子²；默认 0.0 = 无外力）。
+    /// F_tip(t) = `tip_force_amplitude` · cos(2π·`tip_force_frequency`·t + `tip_force_phase`)
+    #[serde(default)] pub tip_force_amplitude: f64,
+    /// 自由端外力频率（步^{-1}）
+    #[serde(default)] pub tip_force_frequency: f64,
+    /// 自由端外力初始相位（rad）
+    #[serde(default)] pub tip_force_phase: f64,
+}
+
+fn default_beam_damping() -> f64 { 0.01 }
+fn default_beam_n_elements() -> u32 { 10 }
+
+/// 刚体运动参数（`[solid.bodies.motion]` 或 `[ibm.bodies.motion]` 子表）
+///
+/// 仅当 `motion_type = "rigid_free"` 时读取。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RigidBodyMotionConfig {
+    /// 刚体质量（格子单位）
+    #[serde(default)] pub mass: f64,
+    /// 转动惯量 Izz（格子单位）
+    #[serde(default)] pub inertia: f64,
+    /// 刚体材料密度（格子单位；当 `mass` / `inertia` 未给出时由 `body_density` + 几何推算）
+    #[serde(default)] pub body_density: f64,
+    /// 参考流体密度（格子单位，通常 = 1.0）
+    #[serde(default = "default_rho_f")] pub rho_f: f64,
+    /// 是否为封闭结构（控制内部流体伪动量修正）
+    #[serde(default)] pub is_closed: bool,
+    /// 内部质量修正方案：`"none"` / `"uhlmann"` / `"feng"` / `"lagrangian"`（默认 `"none"`）
+    #[serde(default = "default_internal_mass_scheme")] pub internal_mass_scheme: String,
+    /// 初始 x 速度（格子单位/步）
+    #[serde(default)] pub vel_x0: f64,
+    /// 初始 y 速度
+    #[serde(default)] pub vel_y0: f64,
+    /// 初始角速度（rad/步）
+    #[serde(default)] pub omega0: f64,
+}
+
+fn default_rho_f() -> f64 { 1.0 }
+fn default_internal_mass_scheme() -> String { "none".to_string() }
+
+// ---------------------------------------------------------------------------
 // 顶层仿真配置（从 TOML 文件加载）
 // ---------------------------------------------------------------------------
 
@@ -10,6 +241,8 @@ use anyhow::{Context, Result};
 pub struct Config {
     pub simulation: SimulationConfig,
     pub fluid: FluidConfig,
+    /// 可选顶层结构力学配置（`[structure]`；预留给 BB/IBB + FEM 耦合，当前暂未启用）
+    #[allow(dead_code)]
     pub structure: Option<StructureConfig>,
     pub ibm: Option<IbmConfig>,
     /// 可选固体体配置（BB / IBB 反弹方案；圆柱、矩形等几何标记）
@@ -83,6 +316,7 @@ pub struct BoundaryConditionConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct StructureConfig {
     /// 杨氏模量
     pub young_modulus: f64,
@@ -313,6 +547,24 @@ pub struct SolidBodyConfig {
     /// 未设置时继承全局 `[solid].bc_type`。
     #[serde(default)]
     pub bc_type: Option<String>,
+    /// 运动类型（`"fixed"` / `"rigid_free"` / `"prescribed"`；默认 `"fixed"`）。
+    ///
+    /// - `"fixed"`：静止体（默认）
+    /// - `"rigid_free"`：**被动刚体**——流体合力通过 Newton-Euler 积分驱动
+    /// - `"prescribed"`：**主动刚体**——由 `[solid.bodies.prescribed]` 子表指定解析运动
+    ///
+    /// BB/IBB 固体仅支持 `"fixed"` / `"rigid_free"` / `"prescribed"`（不支持柔性体）。
+    #[serde(default)]
+    pub motion_type: MotionType,
+    /// 刚体运动参数（仅 `motion_type = "rigid_free"` 时有效）。
+    #[serde(default)]
+    pub motion: RigidBodyMotionConfig,
+    /// 主动运动参数（仅 `motion_type = "prescribed"` 时有效）。
+    #[serde(default)]
+    pub prescribed: PrescribedMotionConfig,
+    /// 该固体体的受力输出配置（可选；缺省继承顶层 `[solid].force_output`）。
+    #[serde(default)]
+    pub force_output: Option<SolidForceOutputConfig>,
 }
 
 /// 单个 IBM 浸入固体几何体描述（`[[ibm.bodies]]`）
@@ -370,6 +622,25 @@ pub struct IbmBodyConfig {
     #[serde(default)] pub alpha: Option<f64>,
     /// 该体的罚函数积分增益（可选；覆盖顶层 `[ibm].beta`）
     #[serde(default)] pub beta: Option<f64>,
+    /// 运动类型（`"fixed"` / `"rigid_free"` / `"prescribed"` / `"flexible"`；默认 `"fixed"`）。
+    ///
+    /// - `"fixed"`：静止体（默认）
+    /// - `"rigid_free"`：**被动刚体**——流体合力通过 Newton-Euler 积分驱动
+    /// - `"prescribed"`：**主动刚体**——由 `[ibm.bodies.prescribed]` 子表指定解析运动
+    /// - `"flexible"`：**被动/主动柔性体**——
+    ///     - 配置 `[ibm.bodies.flexible_beam]` → 被动柔性体（Euler-Bernoulli 梁 FEM + Newmark-β）
+    ///     - 配置 `[ibm.bodies.prescribed]` → 主动柔性体（行波/振荡驱动丝状体）
+    #[serde(default)]
+    pub motion_type: MotionType,
+    /// 被动刚体运动参数（仅 `motion_type = "rigid_free"` 时有效）。
+    #[serde(default)]
+    pub motion: RigidBodyMotionConfig,
+    /// 主动运动参数（`motion_type = "prescribed"` 或 `"flexible"` 行波模式时有效）。
+    #[serde(default)]
+    pub prescribed: PrescribedMotionConfig,
+    /// 被动柔性体梁参数（仅 `motion_type = "flexible"` 且无 `prescribed` 时有效）。
+    #[serde(default)]
+    pub flexible_beam: Option<FlexibleBodyConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -491,6 +762,7 @@ pub struct OutputConfig {
     /// 若未以 `--features python-ffi` 编译，本字段被忽略，
     /// 不会报错，只是不生成 FFI 云图。
     #[serde(default)]
+    #[cfg_attr(not(feature = "python-ffi"), allow(dead_code))]
     pub plot_interval: Option<u64>,
     /// 为 `true` 时每步向 CSV 文件追加一行监控量数据。
     /// 提供**逐步轻量级**时间序列输出。

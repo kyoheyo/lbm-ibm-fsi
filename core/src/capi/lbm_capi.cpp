@@ -90,6 +90,14 @@ double lbm_grid_rho(const lbm::LatticeGrid* g, int idx)
     return g->rho[idx];
 }
 
+/// 将所有节点的初始密度设为 rho0（在 Solver 构造前调用，使平衡初始化使用非单位密度）。
+/// Rust 封装: LbmGrid::fill_rho()
+void lbm_grid_fill_rho(lbm::LatticeGrid* g, double rho0)
+{
+    if (!g) return;
+    std::fill(g->rho.begin(), g->rho.end(), rho0);
+}
+
 /// 返回节点 idx 处的 x 方向速度；越界时返回 0。
 /// Rust 封装: LbmGrid::ux()
 double lbm_grid_ux(const lbm::LatticeGrid* g, int idx)
@@ -945,8 +953,55 @@ void lbm_grid_assign_solid_bc_unmarked(lbm::LatticeGrid* g, int bc_mode)
 } // extern "C" (solid)
 
 // ===========================================================================
-// GPU（CUDA）接口
+// 固体运动 C-API：移动 BB/IBB + 固体重置
 // ===========================================================================
+extern "C" {
+
+/// 清除所有固体节点标记（solid、q_ibb、solid_bc_node）。
+/// 在运动固体每步重新标记前调用，防止遗留上步的固体节点。
+void lbm_clear_solid(lbm::LatticeGrid* g)
+{
+    if (!g) return;
+    lbm::clear_solid(*g);
+}
+
+/// 运动刚体半步长反弹（Ladd 1994 移动壁面修正）。
+///
+/// 在每步的 stream() + halo_exchange() 之后、下一步 collide() 之前调用（与静止 BB 时机相同）。
+/// 固体节点须在本步开始时已通过 lbm_mark_solid_cylinder() 等函数重新标记。
+///
+/// @param g           LatticeGrid 指针（须已完成固体标记）
+/// @param cx, cy      质心当前坐标（格子单位，本地坐标系）
+/// @param ux_cm, uy_cm 质心速度（格子单位/时间步）
+/// @param omega       刚体角速度（rad/时间步）
+/// @param phys_i0/j0/i1/j1  物理区域（非 MPI 传 0/0/nx-1/ny-1）
+void lbm_apply_solid_bb_moving_rigid(lbm::LatticeGrid* g,
+                                      double cx, double cy,
+                                      double ux_cm, double uy_cm, double omega,
+                                      int phys_i0, int phys_j0,
+                                      int phys_i1, int phys_j1)
+{
+    if (!g) return;
+    lbm::apply_solid_bounce_back_moving_rigid(*g, cx, cy, ux_cm, uy_cm, omega,
+                                               phys_i0, phys_j0, phys_i1, phys_j1);
+}
+
+/// 运动刚体 IBB（Bouzidi + Ladd 移动壁面修正）。
+///
+/// 调用时机与 lbm_apply_solid_bb_moving_rigid 相同。
+void lbm_apply_solid_ibb_moving_rigid(lbm::LatticeGrid* g,
+                                       double cx, double cy,
+                                       double ux_cm, double uy_cm, double omega,
+                                       int phys_i0, int phys_j0,
+                                       int phys_i1, int phys_j1)
+{
+    if (!g) return;
+    lbm::apply_solid_ibb_moving_rigid(*g, cx, cy, ux_cm, uy_cm, omega,
+                                       phys_i0, phys_j0, phys_i1, phys_j1);
+}
+
+} // extern "C" (moving solid)
+
 extern "C" {
 
 /// 指向堆上 lbm::GpuSolver 的不透明句柄
@@ -1176,6 +1231,7 @@ int lbm_mpi_enabled()
 // ===========================================================================
 #include "ibm/marker.hpp"
 #include "ibm/interpolation.hpp"
+#include "fsi/structure.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -1391,8 +1447,7 @@ void lbm_ibm_compute_mls_implicit(lbm::LatticeGrid* g,
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
                                     IbmMarkerSetHandle* ms,
-                                    double dx, double dt,
-                                    double u_target_x, double u_target_y)
+                                    double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1400,8 +1455,7 @@ void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
     std::vector<double> pre_force = g->force;
 
     ibm::compute_ibm_forces_mls_original(*g, *marker_set, dx, dt,
-                                          ibm::DeltaKernel::FourPoint,
-                                          u_target_x, u_target_y);
+                                          ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1421,16 +1475,14 @@ void lbm_ibm_compute_mls_original(lbm::LatticeGrid* g,
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_mls_explicit(lbm::LatticeGrid* g,
                                     IbmMarkerSetHandle* ms,
-                                    double dx, double dt,
-                                    double u_target_x, double u_target_y)
+                                    double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
 
     std::vector<double> pre_force = g->force;
 
-    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt,
-                                          u_target_x, u_target_y);
+    ibm::compute_ibm_forces_mls_explicit(*g, *marker_set, dx, dt);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1510,8 +1562,7 @@ void lbm_ibm_mls_stationary_cache_free(void** cache_handle)
 /// @param u_target_y 目标 y 速度
 void lbm_ibm_compute_ivc(lbm::LatticeGrid* g,
                            IbmMarkerSetHandle* ms,
-                           double dx, double dt,
-                           double u_target_x, double u_target_y)
+                           double dx, double dt)
 {
     if (!g || !ms) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1520,8 +1571,7 @@ void lbm_ibm_compute_ivc(lbm::LatticeGrid* g,
     std::vector<double> pre_force = g->force;
 
     ibm::compute_ibm_forces_ivc(*g, *marker_set, dx, dt,
-                                  ibm::DeltaKernel::FourPoint,
-                                  u_target_x, u_target_y);
+                                  ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1551,8 +1601,7 @@ struct IvcStationaryCache {
 void lbm_ibm_compute_ivc_stationary(lbm::LatticeGrid* g,
                                       IbmMarkerSetHandle* ms,
                                       double dx, double dt,
-                                      void** cache_handle,
-                                      double u_target_x, double u_target_y)
+                                      void** cache_handle)
 {
     if (!g || !ms || !cache_handle) return;
     auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
@@ -1567,8 +1616,7 @@ void lbm_ibm_compute_ivc_stationary(lbm::LatticeGrid* g,
     ibm::compute_ibm_forces_ivc_stationary(
         *g, *marker_set, dx, dt,
         cache->A_lu, cache->piv,
-        ibm::DeltaKernel::FourPoint,
-        u_target_x, u_target_y);
+        ibm::DeltaKernel::FourPoint);
 
     for (std::size_t i = 0; i < g->force.size(); ++i)
         g->force[i] += pre_force[i];
@@ -1591,6 +1639,84 @@ void lbm_ibm_get_forces(const IbmMarkerSetHandle* ms, double* out_fx, double* ou
     for (int i = 0; i < marker_set->size(); ++i) {
         out_fx[i] = marker_set->markers[i].fx;
         out_fy[i] = marker_set->markers[i].fy;
+    }
+}
+
+/// 从 MarkerSet 读取所有标记点的当前位置（x, y）。
+/// out_x/out_y 长度须 ≥ lbm_ibm_marker_set_size()。
+void lbm_ibm_get_positions(const IbmMarkerSetHandle* ms, double* out_x, double* out_y)
+{
+    if (!ms || !out_x || !out_y) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    for (int i = 0; i < marker_set->size(); ++i) {
+        out_x[i] = marker_set->markers[i].x;
+        out_y[i] = marker_set->markers[i].y;
+    }
+}
+
+// ===========================================================================
+// IBM 柔性体辅助 C-API：逐标记点目标速度设置
+// ===========================================================================
+
+/// 设置所有标记点的目标速度（统一值）。
+/// 等价于将所有 mk.ux_target = ux, mk.uy_target = uy。
+/// 静止固体调用 lbm_ibm_set_uniform_target(ms, 0, 0)；
+/// 运动刚体用 lbm_ibm_set_marker_targets() 设置逐点速度。
+void lbm_ibm_set_uniform_target(IbmMarkerSetHandle* ms, double ux, double uy)
+{
+    if (!ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    for (auto& mk : marker_set->markers) {
+        mk.ux_target = ux;
+        mk.uy_target = uy;
+    }
+}
+
+/// 设置各标记点的目标速度（逐点，柔性体 / 旋转刚体使用）。
+/// @param ux   长度 ≥ ms.size() 的 x 速度数组
+/// @param uy   长度 ≥ ms.size() 的 y 速度数组
+/// @param n    实际写入的标记点数（取 min(n, ms.size())）
+void lbm_ibm_set_marker_targets(IbmMarkerSetHandle* ms,
+                                  const double* ux, const double* uy, int n)
+{
+    if (!ms || !ux || !uy) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    const int nm = std::min(n, marker_set->size());
+    for (int m = 0; m < nm; ++m) {
+        marker_set->markers[m].ux_target = ux[m];
+        marker_set->markers[m].uy_target = uy[m];
+    }
+}
+
+/// 读取各标记点当前目标速度。
+void lbm_ibm_get_marker_targets(const IbmMarkerSetHandle* ms,
+                                  double* out_ux, double* out_uy)
+{
+    if (!ms || !out_ux || !out_uy) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    for (int m = 0; m < marker_set->size(); ++m) {
+        out_ux[m] = marker_set->markers[m].ux_target;
+        out_uy[m] = marker_set->markers[m].uy_target;
+    }
+}
+
+/// 根据刚体运动状态（质心速度 + 角速度）为圆形标记点集设置逐点目标速度。
+///
+/// 目标速度（刚体旋转公式）：
+///   Uk = (ux_cm - omega*(mk.y - cy), uy_cm + omega*(mk.x - cx))
+///
+/// 适用于圆形 IBM 标记点集，不要求标记点按顺序排列。
+void lbm_ibm_set_rigid_body_targets(IbmMarkerSetHandle* ms,
+                                     double cx, double cy,
+                                     double ux_cm, double uy_cm, double omega)
+{
+    if (!ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    for (auto& mk : marker_set->markers) {
+        const double rx = mk.x - cx;
+        const double ry = mk.y - cy;
+        mk.ux_target = ux_cm - omega * ry;
+        mk.uy_target = uy_cm + omega * rx;
     }
 }
 
@@ -1725,3 +1851,357 @@ void lbm_ibm_halo_reduce_force_2d(lbm::LatticeGrid* g, MpiDecomp2DHandle* h)
 }
 
 } // extern "C" (IBM)
+
+// =============================================================================
+// 刚体求解器 C-API（RigidBodySolver2D）
+// 参考：Suzuki & Inamuro (2011) Computers & Fluids 49:173-187
+// =============================================================================
+extern "C" {
+
+/// 不透明句柄：对应 fsi::RigidBodySolver2D
+struct RigidBody2DHandle;
+
+/// 创建 2D 刚体求解器。
+///
+/// @param mass        刚体质量（格子单位）
+/// @param inertia     转动惯量 Izz（格子单位）
+/// @param rho_b       刚体密度 ρ_b
+/// @param rho_f       流体密度 ρ_f（通常 1.0）
+/// @param cx0         初始质心 x
+/// @param cy0         初始质心 y
+/// @param scheme      内部质量方案：0=None, 1=Uhlmann, 2=Feng, 3=LagrangianPoints
+/// @param is_closed   是否为封闭结构（非零为封闭）
+/// @param ref_x       边界标记点参考 x（体固坐标，长度 n_bnd）
+/// @param ref_y       边界标记点参考 y（体固坐标，长度 n_bnd）
+/// @param n_bnd       边界标记点数量
+/// @param int_ref_x   内部点参考 x（方案 C；可为 nullptr）
+/// @param int_ref_y   内部点参考 y（方案 C；可为 nullptr）
+/// @param n_int       内部点数量（方案 C；其他方案传 0）
+RigidBody2DHandle* lbm_rigid2d_create(
+        double mass, double inertia,
+        double rho_b, double rho_f,
+        double cx0, double cy0,
+        int scheme, int is_closed,
+        const double* ref_x, const double* ref_y, int n_bnd,
+        const double* int_ref_x, const double* int_ref_y, int n_int)
+{
+    fsi::RigidBodyParams2D params;
+    params.mass     = mass;
+    params.inertia  = inertia;
+    params.rho_b    = rho_b;
+    params.rho_f    = rho_f;
+    params.cx0      = cx0;
+    params.cy0      = cy0;
+    params.is_closed = (is_closed != 0);
+    params.scheme   = static_cast<fsi::InternalMassScheme>(scheme);
+
+    std::vector<double> rx, ry, irx, iry;
+    if (ref_x && ref_y && n_bnd > 0) {
+        rx.assign(ref_x, ref_x + n_bnd);
+        ry.assign(ref_y, ref_y + n_bnd);
+    }
+    if (int_ref_x && int_ref_y && n_int > 0) {
+        irx.assign(int_ref_x, int_ref_x + n_int);
+        iry.assign(int_ref_y, int_ref_y + n_int);
+    }
+
+    auto* rb = new fsi::RigidBodySolver2D(params, rx, ry, irx, iry);
+    return reinterpret_cast<RigidBody2DHandle*>(rb);
+}
+
+/// 释放刚体求解器句柄。
+void lbm_rigid2d_free(RigidBody2DHandle* h)
+{
+    delete reinterpret_cast<fsi::RigidBodySolver2D*>(h);
+}
+
+/// 获取刚体当前运动状态（质心位置、速度、角度、角速度）。
+void lbm_rigid2d_get_state(const RigidBody2DHandle* h,
+                            double* cx, double* cy,
+                            double* ux, double* uy,
+                            double* theta, double* omega)
+{
+    if (!h) return;
+    const auto& st = reinterpret_cast<const fsi::RigidBodySolver2D*>(h)->state();
+    if (cx)    *cx    = st.cx;
+    if (cy)    *cy    = st.cy;
+    if (ux)    *ux    = st.ux;
+    if (uy)    *uy    = st.uy;
+    if (theta) *theta = st.theta;
+    if (omega) *omega = st.omega;
+}
+
+/// 设置刚体初始速度（用于指定初始条件）。
+void lbm_rigid2d_set_velocity(RigidBody2DHandle* h,
+                               double ux, double uy, double omega)
+{
+    if (!h) return;
+    auto& st = reinterpret_cast<fsi::RigidBodySolver2D*>(h)->state();
+    st.ux    = ux;
+    st.uy    = uy;
+    st.omega = omega;
+    // 同步 prev 值，防止第一步 Feng/Lagrangian 方案产生虚假冲量
+    st.prev_ux    = ux;
+    st.prev_uy    = uy;
+    st.prev_omega = omega;
+}
+
+/// 返回边界标记点数量。
+int lbm_rigid2d_n_boundary(const RigidBody2DHandle* h)
+{
+    if (!h) return 0;
+    return reinterpret_cast<const fsi::RigidBodySolver2D*>(h)->n_boundary();
+}
+
+/// 获取边界标记点当前绝对坐标。
+void lbm_rigid2d_get_boundary_positions(const RigidBody2DHandle* h,
+                                         double* out_x, double* out_y)
+{
+    if (!h || !out_x || !out_y) return;
+    const auto* rb = reinterpret_cast<const fsi::RigidBodySolver2D*>(h);
+    const auto& bx = rb->boundary_x();
+    const auto& by = rb->boundary_y();
+    for (int k = 0; k < rb->n_boundary(); ++k) {
+        out_x[k] = bx[k];
+        out_y[k] = by[k];
+    }
+}
+
+/// 获取边界标记点当前速度（体边界速度 Uk）。
+void lbm_rigid2d_get_boundary_velocities(const RigidBody2DHandle* h,
+                                          double* out_ux, double* out_uy)
+{
+    if (!h || !out_ux || !out_uy) return;
+    const auto* rb = reinterpret_cast<const fsi::RigidBodySolver2D*>(h);
+    const auto& bux = rb->boundary_ux();
+    const auto& buy = rb->boundary_uy();
+    for (int k = 0; k < rb->n_boundary(); ++k) {
+        out_ux[k] = bux[k];
+        out_uy[k] = buy[k];
+    }
+}
+
+/// 返回内部拉格朗日点数量（方案 C）。
+int lbm_rigid2d_n_internal(const RigidBody2DHandle* h)
+{
+    if (!h) return 0;
+    return static_cast<int>(
+        reinterpret_cast<const fsi::RigidBodySolver2D*>(h)->internal_pts().size());
+}
+
+/// 获取内部拉格朗日点当前绝对坐标。
+void lbm_rigid2d_get_internal_positions(const RigidBody2DHandle* h,
+                                         double* out_x, double* out_y)
+{
+    if (!h || !out_x || !out_y) return;
+    const auto& pts = reinterpret_cast<const fsi::RigidBodySolver2D*>(h)->internal_pts();
+    for (int k = 0; k < (int)pts.size(); ++k) {
+        out_x[k] = pts[k].x;
+        out_y[k] = pts[k].y;
+    }
+}
+
+/// 设置内部拉格朗日点的插值流体速度（方案 C 使用）。
+void lbm_rigid2d_set_internal_velocities(RigidBody2DHandle* h,
+                                          const double* ux, const double* uy)
+{
+    if (!h || !ux || !uy) return;
+    auto& pts = reinterpret_cast<fsi::RigidBodySolver2D*>(h)->internal_pts();
+    for (int k = 0; k < (int)pts.size(); ++k) {
+        pts[k].ux = ux[k];
+        pts[k].uy = uy[k];
+    }
+}
+
+/// 计算内部动量 Pin, Lin（方案 C）。
+/// 调用前须先设置内部点速度（lbm_rigid2d_set_internal_velocities）。
+void lbm_rigid2d_compute_internal_momentum(RigidBody2DHandle* h)
+{
+    if (!h) return;
+    reinterpret_cast<fsi::RigidBodySolver2D*>(h)->compute_internal_momentum();
+}
+
+/// 推进刚体一个时间步。
+/// @param total_fx     IBM 总力 x（Ftot_x，已含符号）
+/// @param total_fy     IBM 总力 y（Ftot_y，已含符号）
+/// @param total_torque IBM 总力矩（Ttot，已含符号）
+/// @param dt           时间步长
+void lbm_rigid2d_advance(RigidBody2DHandle* h,
+                          double total_fx, double total_fy,
+                          double total_torque, double dt)
+{
+    if (!h) return;
+    auto* rb = reinterpret_cast<fsi::RigidBodySolver2D*>(h);
+    rb->set_ibm_forces(total_fx, total_fy, total_torque);
+    rb->advance(dt);
+}
+
+// ---------------------------------------------------------------------------
+// IBM 辅助 C-API（支持运动体）
+// ---------------------------------------------------------------------------
+
+/// MDF-IBM（多重直接力法）——移动体版本，支持逐标记点目标速度。
+///
+/// 与 lbm_ibm_compute_mdf() 相同，但目标速度通过 target_ux/uy 数组逐点指定，
+/// 而不是统一为 0（适合自由运动的刚体）。
+///
+/// @param g           LatticeGrid 指针
+/// @param ms          IBM 标记点集
+/// @param dx          格子间距
+/// @param dt          时间步长
+/// @param n_iter      迭代次数（建议 3–5）
+/// @param target_ux   各标记点目标 x 速度（长度 ≥ marker count）
+/// @param target_uy   各标记点目标 y 速度（长度 ≥ marker count）
+void lbm_ibm_compute_mdf_moving(lbm::LatticeGrid* g,
+                                  IbmMarkerSetHandle* ms,
+                                  double dx, double dt, int n_iter,
+                                  const double* target_ux,
+                                  const double* target_uy)
+{
+    if (!g || !ms) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    const int nm = marker_set->size();
+
+    // 与 compute_ibm_forces_mdf 相同逻辑，但使用 per-marker target_ux/uy
+    const int n = g->size();
+    const int d = g->dim();
+    auto kernel = ibm::DeltaKernel::FourPoint;   // 默认 4-point 核
+
+    std::vector<double> u_work = g->u;
+    std::vector<double> F_total(n * d, 0.0);
+    std::vector<double> total_lag_fx(nm, 0.0);
+    std::vector<double> total_lag_fy(nm, 0.0);
+    std::vector<double> dF_euler(n * d, 0.0);
+
+    std::vector<double> pre_force = g->force;   // 保留前序体力
+
+    for (int iter = 0; iter < n_iter; ++iter) {
+        std::swap(g->u, u_work);
+        ibm::interpolate_velocity(*g, *marker_set, dx, kernel);
+        std::swap(g->u, u_work);
+
+        for (int m = 0; m < nm; ++m) {
+            auto& mk = marker_set->markers[m];
+            const double tx = target_ux ? target_ux[m] : 0.0;
+            const double ty = target_uy ? target_uy[m] : 0.0;
+            const double dFx = (tx - mk.ux) / dt;
+            const double dFy = (ty - mk.uy) / dt;
+            mk.fx = dFx;
+            mk.fy = dFy;
+            total_lag_fx[m] += dFx;
+            total_lag_fy[m] += dFy;
+        }
+
+        std::fill(dF_euler.begin(), dF_euler.end(), 0.0);
+        ibm::spread_force(*g, *marker_set, dx, kernel);
+        std::swap(g->force, dF_euler);
+
+        for (int i = 0; i < n; ++i) {
+            u_work[i * d + 0] += dt * dF_euler[i * d + 0];
+            u_work[i * d + 1] += dt * dF_euler[i * d + 1];
+        }
+        for (int i = 0; i < n * d; ++i) F_total[i] += dF_euler[i];
+    }
+
+    // 将累积力叠加到已有体力上（多体支持）
+    for (int i = 0; i < n * d; ++i) g->force[i] = pre_force[i] + F_total[i];
+
+    for (int m = 0; m < nm; ++m) {
+        marker_set->markers[m].fx = total_lag_fx[m];
+        marker_set->markers[m].fy = total_lag_fy[m];
+    }
+}
+
+/// 计算 IBM 总力 AND 总力矩（绕质心 cx, cy）。
+///
+///   Ftot = Σ_m mk.fx * mk.ds  (注：这是流体所受体力的合力；
+///          固体受力 = -Ftot，调用方自行取负)
+///   Ttot = Σ_m [(Xm - Xc) × mk.fx] * mk.ds   (2D 标量叉积)
+///
+/// 调用时机：任一 IBM 力计算函数（compute_mdf / compute_mdf_moving 等）之后。
+void lbm_ibm_compute_body_force_torque(const IbmMarkerSetHandle* ms,
+                                        double cx, double cy,
+                                        double* out_fx, double* out_fy,
+                                        double* out_torque)
+{
+    if (!ms) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    double fx = 0.0, fy = 0.0, torque = 0.0;
+    for (int m = 0; m < marker_set->size(); ++m) {
+        const auto& mk = marker_set->markers[m];
+        fx     += mk.fx * mk.ds;
+        fy     += mk.fy * mk.ds;
+        const double rx = mk.x - cx;
+        const double ry = mk.y - cy;
+        torque += (rx * mk.fy - ry * mk.fx) * mk.ds;
+    }
+    if (out_fx)     *out_fx     = fx;
+    if (out_fy)     *out_fy     = fy;
+    if (out_torque) *out_torque = torque;
+}
+
+/// 仅插值流体速度到所有标记点（不计算体力，不展布）。
+/// 用于对内部拉格朗日点做速度采样（方案 C）。
+void lbm_ibm_interpolate_only(const lbm::LatticeGrid* g,
+                               IbmMarkerSetHandle* ms, double dx)
+{
+    if (!g || !ms) return;
+    ibm::interpolate_velocity(
+        *g,
+        *reinterpret_cast<ibm::MarkerSet*>(ms),
+        dx,
+        ibm::DeltaKernel::FourPoint);
+}
+
+/// 在任意位置插值流体速度（供内部拉格朗日点使用）。
+///
+/// 将欧拉流体速度场 u 插值到给定的 n 个点 (x[], y[]) 处，
+/// 结果写入 out_ux[], out_uy[]（调用方须保证长度 ≥ n）。
+/// 使用 TwoPoint（双线性）δ 核，适用于均匀分布的内部点。
+///
+/// @param g       LatticeGrid 指针
+/// @param x       点的 x 坐标数组（格子单位），长度 n
+/// @param y       点的 y 坐标数组（格子单位），长度 n
+/// @param n       点的数量
+/// @param dx      格子间距（通常 = 1.0）
+/// @param out_ux  输出 x 速度，长度 ≥ n
+/// @param out_uy  输出 y 速度，长度 ≥ n
+void lbm_ibm_interpolate_at_points(const lbm::LatticeGrid* g,
+                                    const double* x, const double* y, int n,
+                                    double dx,
+                                    double* out_ux, double* out_uy)
+{
+    if (!g || n <= 0 || !x || !y || !out_ux || !out_uy) return;
+    ibm::interpolate_velocity_at_points(
+        *g, x, y, n, dx, out_ux, out_uy,
+        ibm::DeltaKernel::TwoPoint);
+}
+
+/// 获取所有标记点的插值速度（插值后调用）。
+void lbm_ibm_get_marker_velocities(const IbmMarkerSetHandle* ms,
+                                    double* out_ux, double* out_uy)
+{
+    if (!ms || !out_ux || !out_uy) return;
+    const auto* marker_set = reinterpret_cast<const ibm::MarkerSet*>(ms);
+    for (int m = 0; m < marker_set->size(); ++m) {
+        out_ux[m] = marker_set->markers[m].ux;
+        out_uy[m] = marker_set->markers[m].uy;
+    }
+}
+
+/// 更新标记点绝对坐标（用于每步同步刚体运动后的位置）。
+/// ds 保持不变（若 n 与当前 markers 数量不同则忽略）。
+void lbm_ibm_update_marker_positions(IbmMarkerSetHandle* ms,
+                                      const double* x, const double* y, int n)
+{
+    if (!ms || !x || !y) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    const int nm = std::min(n, marker_set->size());
+    for (int m = 0; m < nm; ++m) {
+        marker_set->markers[m].x = x[m];
+        marker_set->markers[m].y = y[m];
+    }
+}
+
+} // extern "C" (RigidBody2D + IBM moving helpers)
+

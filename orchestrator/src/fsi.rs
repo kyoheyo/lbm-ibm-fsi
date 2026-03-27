@@ -3,16 +3,18 @@
 //! 本模块将 FSI 流固耦合逻辑从 `main.rs` 中独立出来，提供：
 //!
 //! - [`FsiCouplingMode`]：三种耦合模式的类型安全枚举
-//! - [`IbmEntry`]：IBM 体的运行时状态（标记点集 + 受力输出配置）
+//! - [`IbmEntry`]：IBM 体的运行时状态（标记点集 + 受力输出配置 + 可选运动体）
+//! - [`SolidEntry`]：BB/IBB 固体体运行时状态（含可选刚体运动）
 //! - [`resolve_coupling_mode`]：根据配置（显式或自动推断）确定耦合模式
 //! - [`validate_coupling_mode`]：校验耦合模式与配置段是否一致
 //! - [`setup_solid_bodies`]：设置 BB/IBB 固体体（标记 + 反弹方案）
 //! - [`setup_ibm_bodies`]：创建 IBM 体（标记点集 + 日志）
 
 use anyhow::{Result, bail};
-use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet};
+use lbm_bindings::{LbmGrid, LbmSolver, LbmIbmMarkerSet, LbmRigidBody2D, RigidBodyScheme};
 
-use crate::config::{Config, FsiConfig, IbmBodyConfig, SolidForceOutputConfig};
+use crate::config::{Config, FsiConfig, IbmBodyConfig, SolidForceOutputConfig, MotionType};
+use crate::motion::{PrescribedMotion, BeamSolver, uniform_arc_s};
 
 // ---------------------------------------------------------------------------
 // 耦合模式枚举
@@ -71,19 +73,90 @@ pub struct IbmEntry {
     pub label: String,
     /// 受力输出配置
     pub force_cfg: SolidForceOutputConfig,
-    /// IBM 力计算方法（`"mdf"` / `"mls"` / `"penalty"` / `"ivc"` / `"ivc_stationary"`）；来自体级覆盖或全局默认
+    /// IBM 力计算方法
     pub method: String,
-    /// MDF 子迭代次数（`method="mdf"` 时有效）
+    /// MDF 子迭代次数
     pub n_iter: i32,
-    /// 罚函数比例增益（`method="penalty"` 时有效）
+    /// 罚函数比例增益
     pub alpha: f64,
-    /// 罚函数积分增益（`method="penalty"` 时有效）
+    /// 罚函数积分增益
     pub beta: f64,
+    /// 运动类型
+    pub motion_type: MotionType,
+    /// 被动刚体求解器（仅 `RigidFree` 时非 None）
+    pub rigid_body: Option<LbmRigidBody2D>,
+    /// 主动运动求解器（`Prescribed` 或柔性体行波时非 None）
+    pub prescribed: Option<PrescribedMotion>,
+    /// 被动柔性体梁求解器（`Flexible` + `flexible_beam` 时非 None）
+    pub beam_solver: Option<BeamSolver>,
+    /// 标记点弧坐标（柔性体时使用）
+    pub beam_s: Vec<f64>,
+    /// 质心坐标（`rigid_free` / `prescribed` 时跟踪）
+    pub cx: f64,
+    pub cy: f64,
+    /// 标记点初始 x 坐标（prescribed 刚体旋转位置更新用）
+    pub init_bx: Vec<f64>,
+    /// 标记点初始 y 坐标
+    pub init_by: Vec<f64>,
+    /// 当前累计旋转角（prescribed rotate 模式）
+    pub theta: f64,
 }
 
 // ---------------------------------------------------------------------------
-// 耦合模式解析与校验
+// 固体体运行时状态
 // ---------------------------------------------------------------------------
+
+/// 单个 BB/IBB 固体体的运行时状态（每步固体更新所需数据）
+pub struct SolidEntry {
+    /// 体形状（"cylinder" / "rectangle" / "mesh"；小写）
+    pub shape: String,
+    /// 圆柱：质心 x 坐标（全局格子单位，运动时逐步更新）
+    pub cx: f64,
+    /// 圆柱：质心 y 坐标（全局格子单位）
+    pub cy: f64,
+    /// 圆柱半径（格子单位）
+    pub radius: f64,
+    /// 矩形：西南角（全局格子坐标）
+    pub i0: i32, pub j0: i32,
+    /// 矩形：东北角
+    pub i1: i32, pub j1: i32,
+    /// 网格文件路径（仅 mesh 形状；保留用于输出/重启）
+    #[allow(dead_code)]
+    pub mesh_file: String,
+    /// 反弹方案：1 = BB，2 = IBB
+    pub bc_mode: i32,
+    /// 运动类型（`Fixed` / `RigidFree` / `Prescribed`）
+    pub motion_type: MotionType,
+    /// 刚体求解器（仅 `motion_type == RigidFree` 时非 None）
+    pub rigid_body: Option<LbmRigidBody2D>,
+    /// 主动运动求解器（仅 `motion_type == Prescribed` 时非 None）
+    pub prescribed: Option<crate::motion::PrescribedMotion>,
+    /// 体标签
+    pub label: String,
+    /// 受力输出配置
+    pub force_cfg: crate::config::SolidForceOutputConfig,
+}
+
+impl SolidEntry {
+    /// 该体是否为运动刚体（需要 Ladd 移动壁面修正）。
+    pub fn is_moving(&self) -> bool {
+        matches!(self.motion_type, MotionType::RigidFree | MotionType::Prescribed)
+    }
+
+    /// 质心当前速度（含 RigidFree 被动刚体和 Prescribed 主动刚体）。
+    ///
+    /// `t`：当前格子时刻（= (step+1) * dt，施加 Ladd 移动壁面修正时使用）。
+    pub fn wall_velocity_at(&self, t: f64) -> (f64, f64, f64) {
+        if let Some(rb) = &self.rigid_body {
+            let (_, _, ux, uy, _, omega) = rb.state();
+            return (ux, uy, omega);
+        }
+        if let Some(pm) = &self.prescribed {
+            return pm.eval_rigid(t);
+        }
+        (0.0, 0.0, 0.0)
+    }
+}
 
 /// 根据 TOML 配置确定最终使用的耦合模式。
 ///
@@ -163,7 +236,14 @@ pub fn validate_coupling_mode(
 /// 设置 BB / IBB 固体体：依次标记几何体并配置反弹方案。
 ///
 /// 遍历 `cfg.solid.bodies`，对每个体调用对应的几何标记函数，
-/// 最后根据 `cfg.solid.bc_type` 设置求解器的反弹方案。
+/// 根据 `cfg.solid.bc_type` 设置求解器的反弹方案。
+///
+/// - 若任一固体体 `motion_type = "rigid_free"`，求解器的自动 BB/IBB 被禁用
+///   （设为 None），由调用方在每步手动调用 [`step_solid_moving`] 施加移动壁面 BC。
+/// - 若所有固体体均为静止（`motion_type = "fixed"` 或缺省），则求解器自动处理 BC，
+///   与旧行为完全兼容。
+///
+/// 返回 `(Vec<SolidEntry>, has_moving)` 其中 `has_moving` 标识是否有运动刚体。
 ///
 /// MPI 坐标转换参数 `(x_start, y_start, phys_x0, phys_y0)` 用于将全局坐标
 /// 映射到本进程的本地网格坐标；单进程模式下均传 `(0, 0, 0, 0)`。
@@ -174,15 +254,21 @@ pub fn setup_solid_bodies(
     x_start: i32, y_start: i32,
     phys_x0: i32, phys_y0: i32,
     rank: i32,
-) {
+) -> (Vec<SolidEntry>, bool) {
     if cfg.solid.bodies.is_empty() {
-        return;
+        return (Vec::new(), false);
     }
 
     let to_local_i = |gi: i32| gi - x_start + phys_x0;
     let to_local_j = |gj: i32| gj - y_start + phys_y0;
 
-    for body in &cfg.solid.bodies {
+    // Pre-scan: check if any body requires moving wall correction (rigid_free or prescribed)
+    let has_moving = cfg.solid.bodies.iter()
+        .any(|b| matches!(b.motion_type, MotionType::RigidFree | MotionType::Prescribed));
+
+    let mut entries: Vec<SolidEntry> = Vec::with_capacity(cfg.solid.bodies.len());
+
+    for (body_idx, body) in cfg.solid.bodies.iter().enumerate() {
         match body.shape.to_lowercase().as_str() {
             "cylinder" => {
                 let local_cx = body.cx - x_start as f64 + phys_x0 as f64;
@@ -190,8 +276,9 @@ pub fn setup_solid_bodies(
                 lbm_bindings::mark_solid_cylinder(grid, local_cx, local_cy, body.radius);
                 if rank == 0 {
                     println!(
-                        "  [solid] cylinder: center=({:.2}, {:.2}), radius={:.2}",
-                        body.cx, body.cy, body.radius
+                        "  [solid] cylinder[{}]: center=({:.2}, {:.2}), radius={:.2}{}",
+                        body_idx, body.cx, body.cy, body.radius,
+                        if body.motion_type == MotionType::RigidFree { " [rigid_free]" } else { "" }
                     );
                 }
             }
@@ -203,23 +290,20 @@ pub fn setup_solid_bodies(
                 );
                 if rank == 0 {
                     println!(
-                        "  [solid] rectangle: [{}, {}] x [{}, {}]",
-                        body.i0, body.i1, body.j0, body.j1
+                        "  [solid] rectangle[{}]: [{}, {}] x [{}, {}]",
+                        body_idx, body.i0, body.i1, body.j0, body.j1
                     );
                 }
             }
             "mesh" => {
                 if body.mesh_file.is_empty() {
                     if rank == 0 {
-                        eprintln!("  [warn] solid.bodies shape=\"mesh\" but mesh_file is empty, skipping");
+                        eprintln!("  [warn] solid.bodies[{}] shape=\"mesh\" but mesh_file is empty, skipping", body_idx);
                     }
                 } else {
                     lbm_bindings::mark_solid_from_mesh_file(grid, &body.mesh_file);
                     if rank == 0 {
-                        println!(
-                            "  [solid] mesh file: file={:?}",
-                            body.mesh_file
-                        );
+                        println!("  [solid] mesh[{}] file={:?}", body_idx, body.mesh_file);
                     }
                 }
             }
@@ -239,23 +323,114 @@ pub fn setup_solid_bodies(
             _                                                => 0_i32,
         };
         lbm_bindings::assign_solid_bc_unmarked(grid, body_bc_mode);
+
+        // --- 构建刚体求解器（rigid_free）或主动运动（prescribed）---
+        let (motion_type, rigid_body, prescribed) = if body.motion_type == MotionType::RigidFree
+            && body.shape.to_lowercase() == "cylinder"
+        {
+            let mc = &body.motion;
+            let scheme = parse_rigid_scheme(&mc.internal_mass_scheme);
+            let mass = if mc.mass > 0.0 { mc.mass }
+                else { mc.body_density * std::f64::consts::PI * body.radius * body.radius };
+            let inertia = if mc.inertia > 0.0 { mc.inertia }
+                else { 0.5 * mass * body.radius * body.radius };
+            // BB/IBB 刚体不需要边界/内部标记点参考坐标（不使用 IBM 力计算）
+            let mut rb = LbmRigidBody2D::new(
+                mass, inertia,
+                mc.body_density.max(1.0), mc.rho_f,
+                body.cx, body.cy,
+                scheme, mc.is_closed,
+                &[], &[], &[], &[],
+            );
+            if mc.vel_x0 != 0.0 || mc.vel_y0 != 0.0 || mc.omega0 != 0.0 {
+                rb.set_velocity(mc.vel_x0, mc.vel_y0, mc.omega0);
+            }
+            if rank == 0 {
+                println!(
+                    "  [solid] body[{}] motion=rigid_free  mass={:.4}  inertia={:.4}  scheme={}",
+                    body_idx, mass, inertia, &mc.internal_mass_scheme
+                );
+            }
+            (MotionType::RigidFree, Some(rb), None)
+        } else if body.motion_type == MotionType::Prescribed {
+            // 主动刚体：由解析运动公式驱动（适用于圆柱、矩形等）
+            let pm = crate::motion::PrescribedMotion::new(&body.prescribed);
+            if rank == 0 {
+                println!(
+                    "  [solid] body[{}] motion=prescribed  mode={}  amplitude={:.4}  frequency={:.6}",
+                    body_idx, body.prescribed.mode, body.prescribed.amplitude, body.prescribed.frequency
+                );
+            }
+            (MotionType::Prescribed, None, Some(pm))
+        } else {
+            (body.motion_type.clone(), None, None)
+        };
+
+        let label = if body.label.is_empty() {
+            format!("solid_body_{}", body_idx)
+        } else {
+            body.label.clone()
+        };
+
+        // 逐体受力输出：优先使用体级配置，缺省继承全局（但不 enabled，避免重复计入）
+        let force_cfg = body.force_output.clone().unwrap_or_else(|| {
+            // 若该体没有独立 force_output 配置，默认禁用（全局 cfg.solid.force_output 已涵盖）
+            SolidForceOutputConfig {
+                enabled:  false,
+                interval: cfg.solid.force_output.interval,
+                filename: format!("{label}"),
+            }
+        });
+
+        if rank == 0 && force_cfg.enabled {
+            println!(
+                "  [solid] body[{}] label={:?} per-body force output: every {} steps -> {}/{}.csv",
+                body_idx, label, force_cfg.interval, cfg.output.directory, force_cfg.filename
+            );
+        }
+
+        entries.push(SolidEntry {
+            shape:      body.shape.to_lowercase(),
+            cx:         body.cx,
+            cy:         body.cy,
+            radius:     body.radius,
+            i0: body.i0, j0: body.j0, i1: body.i1, j1: body.j1,
+            mesh_file:  body.mesh_file.clone(),
+            bc_mode:    body_bc_mode,
+            motion_type,
+            rigid_body,
+            prescribed,
+            label,
+            force_cfg,
+        });
     }
 
-    // 全局方案：供所有 solid_bc_node==0 的节点（即未被逐体覆盖的节点）使用。
-    let bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
+    // --- 全局方案：若无运动体，注册到求解器（solver.step 自动施加 BC）---
+    let global_bc_mode = match cfg.solid.bc_type.to_lowercase().as_str() {
         "bounce_back"                                    => 1_i32,
         "interpolated_bounce_back" | "ibb" | "bouzidi"  => 2_i32,
         _                                                => 0_i32,
     };
-    lbm_bindings::mark_solid_bc(solver, bc_mode);
+
+    if has_moving {
+        // 运动刚体：禁用 solver 内的自动 BB/IBB；每步由 step_solid_moving 手动施加
+        lbm_bindings::mark_solid_bc(solver, 0);
+        if rank == 0 {
+            println!("  [solid] BC mode: MANUAL (rigid_free body detected — Ladd moving wall correction enabled)");
+        }
+    } else {
+        lbm_bindings::mark_solid_bc(solver, global_bc_mode);
+        if rank == 0 {
+            let scheme_name = match global_bc_mode {
+                1 => "BounceBack (half-way, Ladd 1994, 1st-order)",
+                2 => "InterpolatedBounceBack (Bouzidi 2001, 2nd-order)",
+                _ => "None (solid nodes marked, no bounce-back applied; debug only)",
+            };
+            println!("  [solid] BC scheme: {}", scheme_name);
+        }
+    }
 
     if rank == 0 {
-        let scheme_name = match bc_mode {
-            1 => "BounceBack (half-way, Ladd 1994, 1st-order)",
-            2 => "InterpolatedBounceBack (Bouzidi 2001, 2nd-order)",
-            _ => "None (solid nodes marked, no bounce-back applied; debug only)",
-        };
-        println!("  [solid] BC scheme: {}", scheme_name);
         if cfg.solid.force_output.enabled {
             let nprocs = lbm_bindings::mpi_size();
             println!(
@@ -269,6 +444,8 @@ pub fn setup_solid_bodies(
             }
         }
     }
+
+    (entries, has_moving)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,18 +471,22 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
     let effective_bodies: &[IbmBodyConfig] = if ibm_cfg.bodies.is_empty() {
         if !ibm_cfg.geometry.is_empty() {
             single_body_list = vec![IbmBodyConfig {
-                geometry:     ibm_cfg.geometry.clone(),
-                x0:           ibm_cfg.x0,
-                y0:           ibm_cfg.y0,
-                size:         ibm_cfg.size,
-                n_markers:    ibm_cfg.n_markers,
-                mesh_file:    ibm_cfg.mesh_file.clone(),
-                label:        String::new(),
-                force_output: None,
-                method:       None,
-                n_iter:       None,
-                alpha:        None,
-                beta:         None,
+                geometry:      ibm_cfg.geometry.clone(),
+                x0:            ibm_cfg.x0,
+                y0:            ibm_cfg.y0,
+                size:          ibm_cfg.size,
+                n_markers:     ibm_cfg.n_markers,
+                mesh_file:     ibm_cfg.mesh_file.clone(),
+                label:         String::new(),
+                force_output:  None,
+                method:        None,
+                n_iter:        None,
+                alpha:         None,
+                beta:          None,
+                motion_type:   MotionType::Fixed,
+                motion:        Default::default(),
+                prescribed:    Default::default(),
+                flexible_beam: None,
             }];
             &single_body_list
         } else {
@@ -400,8 +581,115 @@ pub fn setup_ibm_bodies(cfg: &Config, rank: i32) -> Result<Vec<IbmEntry>> {
             }
         }
 
-        entries.push(IbmEntry { ms, label, force_cfg, method, n_iter, alpha, beta });
+        // 构建可选刚体求解器 / 主动运动 / 柔性体求解器
+        let dt = 1.0_f64; // 格子单位时间步长（初始化时使用，advance时由step_ibm传入）
+        let n_markers = ms.len();
+
+        // 记录初始标记点位置（prescribed 旋转模式需要）
+        let (init_bx, init_by): (Vec<f64>, Vec<f64>) = {
+            let (xs, ys) = ms.get_positions();
+            (xs, ys)
+        };
+
+        let (motion_type, rigid_body, prescribed_motion, beam_solver, beam_s, cx, cy)
+            = match &body.motion_type
+        {
+            MotionType::RigidFree => {
+                let mc = &body.motion;
+                let scheme = parse_rigid_scheme(&mc.internal_mass_scheme);
+                let ref_x: Vec<f64> = (0..n_markers).map(|k| {
+                    let (x, _) = ms.get_marker_position(k);
+                    x - body.x0
+                }).collect();
+                let ref_y: Vec<f64> = (0..n_markers).map(|k| {
+                    let (_, y) = ms.get_marker_position(k);
+                    y - body.y0
+                }).collect();
+                let mass = if mc.mass > 0.0 { mc.mass }
+                    else { mc.body_density * std::f64::consts::PI * body.size * body.size };
+                let inertia = if mc.inertia > 0.0 { mc.inertia }
+                    else { 0.5 * mass * body.size * body.size };
+                let mut rb = LbmRigidBody2D::new(
+                    mass, inertia, mc.body_density.max(1.0), mc.rho_f,
+                    body.x0, body.y0, scheme, mc.is_closed,
+                    &ref_x, &ref_y, &[], &[],
+                );
+                if mc.vel_x0 != 0.0 || mc.vel_y0 != 0.0 || mc.omega0 != 0.0 {
+                    rb.set_velocity(mc.vel_x0, mc.vel_y0, mc.omega0);
+                }
+                if rank == 0 {
+                    println!(
+                        "  [IBM] body[{}] motion=rigid_free  mass={:.4}  inertia={:.4}  is_closed={}  scheme={}",
+                        body_idx, mass, inertia, mc.is_closed, &mc.internal_mass_scheme
+                    );
+                }
+                (MotionType::RigidFree, Some(rb), None, None, vec![], body.x0, body.y0)
+            }
+
+            MotionType::Prescribed => {
+                // 主动刚体：解析运动公式驱动
+                let pm = PrescribedMotion::new(&body.prescribed);
+                if rank == 0 {
+                    println!(
+                        "  [IBM] body[{}] motion=prescribed  mode={}  amplitude={:.4}  frequency={:.6}",
+                        body_idx, body.prescribed.mode, body.prescribed.amplitude, body.prescribed.frequency
+                    );
+                }
+                (MotionType::Prescribed, None, Some(pm), None, vec![], body.x0, body.y0)
+            }
+
+            MotionType::Flexible => {
+                // 柔性体：被动（梁求解器）或主动（行波）
+                let arc_s = uniform_arc_s(n_markers, body.size);
+
+                if let Some(ref beam_cfg) = body.flexible_beam {
+                    // 被动柔性体：Euler-Bernoulli 梁 FEM
+                    let bs = BeamSolver::new(beam_cfg, dt);
+                    if rank == 0 {
+                        println!(
+                            "  [IBM] body[{}] motion=flexible(passive beam)  L={:.2}  EI={:.4}  n_elem={}",
+                            body_idx, beam_cfg.length, beam_cfg.young_modulus * beam_cfg.second_moment, beam_cfg.n_elements
+                        );
+                    }
+                    (MotionType::Flexible, None, None, Some(bs), arc_s, body.x0, body.y0)
+                } else {
+                    // 主动柔性体：行波/振荡驱动（prescribed 参数）
+                    let pm = PrescribedMotion::new(&body.prescribed);
+                    if rank == 0 {
+                        println!(
+                            "  [IBM] body[{}] motion=flexible(active prescribed)  mode={}  amplitude={:.4}  frequency={:.6}",
+                            body_idx, body.prescribed.mode, body.prescribed.amplitude, body.prescribed.frequency
+                        );
+                    }
+                    (MotionType::Flexible, None, Some(pm), None, arc_s, body.x0, body.y0)
+                }
+            }
+
+            other => (other.clone(), None, None, None, vec![], body.x0, body.y0),
+        };
+
+        entries.push(IbmEntry {
+            ms, label, force_cfg, method, n_iter, alpha, beta,
+            motion_type, rigid_body,
+            prescribed: prescribed_motion,
+            beam_solver,
+            beam_s,
+            cx, cy,
+            init_bx,
+            init_by,
+            theta: 0.0,
+        });
     }
 
     Ok(entries)
+}
+
+/// 解析内部质量方案字符串 → `RigidBodyScheme`。
+fn parse_rigid_scheme(s: &str) -> RigidBodyScheme {
+    match s.to_lowercase().as_str() {
+        "uhlmann"       => RigidBodyScheme::UhlmannRigidBody,
+        "feng"          => RigidBodyScheme::FengRigidBody,
+        "lagrangian"    => RigidBodyScheme::LagrangianPoints,
+        _               => RigidBodyScheme::None,
+    }
 }

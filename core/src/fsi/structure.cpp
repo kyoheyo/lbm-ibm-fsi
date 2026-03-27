@@ -228,4 +228,224 @@ void BeamSolver::solve_newmark(const std::vector<double>& K_eff,
     }
 }
 
+
+} // namespace fsi
+
+// =============================================================================
+// RigidBodySolver2D 实现
+// 参考：Suzuki & Inamuro (2011) Computers & Fluids 49:173-187
+// =============================================================================
+
+namespace fsi {
+
+// ---------------------------------------------------------------------------
+// 构造函数：初始化体固参考坐标系下的边界/内部标记点
+// ---------------------------------------------------------------------------
+RigidBodySolver2D::RigidBodySolver2D(
+        const RigidBodyParams2D&   params,
+        const std::vector<double>& ref_x,
+        const std::vector<double>& ref_y,
+        const std::vector<double>& int_ref_x,
+        const std::vector<double>& int_ref_y)
+    : params_(params)
+{
+    state_.cx = params_.cx0;
+    state_.cy = params_.cy0;
+
+    bnd_ref_x_ = ref_x;
+    bnd_ref_y_ = ref_y;
+    const int nb = static_cast<int>(ref_x.size());
+    bnd_x_.resize(nb);
+    bnd_y_.resize(nb);
+    bnd_ux_.resize(nb);
+    bnd_uy_.resize(nb);
+
+    // 方案 (C)：初始化内部拉格朗日点
+    const int ni = static_cast<int>(int_ref_x.size());
+    internal_pts_.resize(ni);
+    for (int k = 0; k < ni; ++k) {
+        internal_pts_[k].x0  = int_ref_x[k];
+        internal_pts_[k].y0  = int_ref_y[k];
+        internal_pts_[k].x   = params_.cx0 + int_ref_x[k];
+        internal_pts_[k].y   = params_.cy0 + int_ref_y[k];
+        internal_pts_[k].ux  = 0.0;
+        internal_pts_[k].uy  = 0.0;
+        internal_pts_[k].dv  = 1.0;   // (Δx)^d = 1 格子单位
+    }
+
+    // 初始化边界标记点位置（theta=0，平移无旋转）
+    update_boundary_markers();
+
+    // 初始化上一步动量（供 Feng/Lagrangian 方案在第一步使用）
+    state_.prev_ux    = state_.ux;
+    state_.prev_uy    = state_.uy;
+    state_.prev_omega = state_.omega;
+    pin_x_ = pin_y_ = lin_ = 0.0;
+    state_.prev_pin_x = 0.0;
+    state_.prev_pin_y = 0.0;
+    state_.prev_lin   = 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// 更新边界标记点绝对坐标与速度
+//   Xk = Xc + R(theta) * BXk        (公式 A.8)
+//   Uk = Uc + omega × BXk            (公式 A.9，2D 标量叉积)
+// ---------------------------------------------------------------------------
+void RigidBodySolver2D::update_boundary_markers()
+{
+    const double cos_t = std::cos(state_.theta);
+    const double sin_t = std::sin(state_.theta);
+
+    for (int k = 0; k < n_boundary(); ++k) {
+        const double bx = bnd_ref_x_[k];
+        const double by = bnd_ref_y_[k];
+
+        // 旋转后绝对位置
+        bnd_x_[k]  = state_.cx + cos_t * bx - sin_t * by;
+        bnd_y_[k]  = state_.cy + sin_t * bx + cos_t * by;
+
+        // 绝对速度：Uk = Uc + omega * (-rotated_y, rotated_x)
+        // = Uc + R(theta)*(-omega*by_ref, omega*bx_ref) 等价写法：
+        const double rx = cos_t * bx - sin_t * by;   // 旋转后相对位置 x
+        const double ry = sin_t * bx + cos_t * by;   // 旋转后相对位置 y
+        bnd_ux_[k] = state_.ux - state_.omega * ry;
+        bnd_uy_[k] = state_.uy + state_.omega * rx;
+    }
+
+    // 同步内部拉格朗日点位置（速度由外部插值填写）
+    const int ni = static_cast<int>(internal_pts_.size());
+    for (int k = 0; k < ni; ++k) {
+        const double bx = internal_pts_[k].x0;
+        const double by = internal_pts_[k].y0;
+        internal_pts_[k].x = state_.cx + cos_t * bx - sin_t * by;
+        internal_pts_[k].y = state_.cy + sin_t * bx + cos_t * by;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 计算内部动量（方案 C）
+//   Pin(t) = Σ_in u(Xin,t) * DVin         (公式 38)
+//   Lin(t) = Σ_in (Xin-Xc) × u(Xin,t) * DVin   (公式 39，2D 标量)
+// ---------------------------------------------------------------------------
+void RigidBodySolver2D::compute_internal_momentum()
+{
+    pin_x_ = 0.0;
+    pin_y_ = 0.0;
+    lin_   = 0.0;
+    for (const auto& pt : internal_pts_) {
+        pin_x_ += pt.ux * pt.dv;
+        pin_y_ += pt.uy * pt.dv;
+        // 2D 叉积：(x-cx)*uy - (y-cy)*ux
+        const double rx = pt.x - state_.cx;
+        const double ry = pt.y - state_.cy;
+        lin_ += (rx * pt.uy - ry * pt.ux) * pt.dv;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 设置本步 IBM 总力与总力矩（公式 28, 29）
+// ---------------------------------------------------------------------------
+void RigidBodySolver2D::set_ibm_forces(double fx, double fy, double torque)
+{
+    ibm_fx_     = fx;
+    ibm_fy_     = fy;
+    ibm_torque_ = torque;
+}
+
+// ---------------------------------------------------------------------------
+// 推进刚体一个时间步（公式 26, 27, A.6）
+//
+// 四种内部质量效应方案：
+//   (A)  Fin = 0, Tin = 0
+//   (B-1) Uhlmann 隐式：Meff = (1-qf/qb)*M, Ieff = (1-qf/qb)*Izz，Fin=Tin=0
+//   (B-2) Feng 显式：  Fin = (qf/qb)*M*(Uc(t)-Uc(t-dt))/dt，类似于 Tin
+//   (C)  拉格朗日点：  Fin = qf*(Pin(t)-Pin(t-dt))/dt，需先调用
+//                       compute_internal_momentum()
+// ---------------------------------------------------------------------------
+void RigidBodySolver2D::advance(double dt)
+{
+    const double qfqb = (params_.rho_b > 1e-30)
+                        ? params_.rho_f / params_.rho_b
+                        : 0.0;
+
+    double M_eff   = params_.mass;
+    double Izz_eff = params_.inertia;
+    double fin_x   = 0.0, fin_y  = 0.0, tin = 0.0;
+
+    // 是否应用内部质量效应（需要封闭结构且不是 None 方案）
+    const bool apply_im = params_.is_closed &&
+                          (params_.scheme != InternalMassScheme::None);
+
+    if (apply_im) {
+        switch (params_.scheme) {
+        // ---------------------------------------------------------------
+        case InternalMassScheme::UhlmannRigidBody:
+            // (B-1) 公式 33–34：用有效质量替换实际质量，Fin=Tin=0
+            M_eff   = (1.0 - qfqb) * params_.mass;
+            Izz_eff = (1.0 - qfqb) * params_.inertia;
+            fin_x   = 0.0;
+            fin_y   = 0.0;
+            tin     = 0.0;
+            break;
+
+        // ---------------------------------------------------------------
+        case InternalMassScheme::FengRigidBody:
+            // (B-2) 公式 35–36：显式向后差分
+            // Fin(t) = (qf/qb)*M*(Uc(t)-Uc(t-dt))/dt
+            // Tin(t) = (qf/qb)*Izz*(omega(t)-omega(t-dt))/dt
+            if (!first_step_) {
+                fin_x = qfqb * params_.mass    * (state_.ux    - state_.prev_ux)    / dt;
+                fin_y = qfqb * params_.mass    * (state_.uy    - state_.prev_uy)    / dt;
+                tin   = qfqb * params_.inertia * (state_.omega - state_.prev_omega) / dt;
+            }
+            break;
+
+        // ---------------------------------------------------------------
+        case InternalMassScheme::LagrangianPoints:
+            // (C) 公式 40：内部拉格朗日点动量差分
+            // Fin(t) = qf * (Pin(t) - Pin(t-dt)) / dt
+            // Tin(t) = qf * (Lin(t) - Lin(t-dt)) / dt
+            // 注意：调用方须在 advance() 前先调用 compute_internal_momentum()
+            if (!first_step_) {
+                fin_x = params_.rho_f * (pin_x_ - state_.prev_pin_x) / dt;
+                fin_y = params_.rho_f * (pin_y_ - state_.prev_pin_y) / dt;
+                tin   = params_.rho_f * (lin_   - state_.prev_lin)   / dt;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    // 保存当前速度供下步 Feng/Lagrangian 使用
+    state_.prev_ux    = state_.ux;
+    state_.prev_uy    = state_.uy;
+    state_.prev_omega = state_.omega;
+    state_.prev_pin_x = pin_x_;
+    state_.prev_pin_y = pin_y_;
+    state_.prev_lin   = lin_;
+    first_step_       = false;
+
+    // 牛顿-欧拉积分（公式 26, 27）
+    // Uc(t+dt) = Uc(t) + (dt/M_eff) * [Ftot + Fin]
+    // omega(t+dt) = omega(t) + (dt/Izz_eff) * [Ttot + Tin]
+    const double inv_M   = (M_eff   > 1e-30) ? 1.0 / M_eff   : 0.0;
+    const double inv_Izz = (Izz_eff > 1e-30) ? 1.0 / Izz_eff : 0.0;
+
+    state_.ux    += dt * inv_M   * (ibm_fx_     + fin_x);
+    state_.uy    += dt * inv_M   * (ibm_fy_     + fin_y);
+    state_.omega += dt * inv_Izz * (ibm_torque_ + tin);
+
+    // 运动学积分（梯形法，二阶精度）
+    // Xc(t+dt) = Xc(t) + dt * 0.5*(Uc(t) + Uc(t+dt))
+    // theta(t+dt) = theta(t) + dt * 0.5*(omega(t) + omega(t+dt))
+    state_.cx    += dt * 0.5 * (state_.prev_ux    + state_.ux);
+    state_.cy    += dt * 0.5 * (state_.prev_uy    + state_.uy);
+    state_.theta += dt * 0.5 * (state_.prev_omega + state_.omega);
+
+    // 用新位置/角度更新所有标记点坐标
+    update_boundary_markers();
+}
+
 } // namespace fsi

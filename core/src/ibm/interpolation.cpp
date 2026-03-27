@@ -102,6 +102,50 @@ void interpolate_velocity(const lbm::LatticeGrid& grid,
 }
 
 // ---------------------------------------------------------------------------
+// 在任意位置插值流体速度（供内部拉格朗日点等使用）
+// ---------------------------------------------------------------------------
+void interpolate_velocity_at_points(const lbm::LatticeGrid& grid,
+                                    const double* x, const double* y, int n,
+                                    double dx,
+                                    double* out_ux, double* out_uy,
+                                    DeltaKernel kernel)
+{
+    if (grid.model != lbm::LatticeModel::D2Q9) {
+        throw std::runtime_error("interpolate_velocity_at_points: only D2Q9 supported");
+    }
+    if (n <= 0 || !x || !y || !out_ux || !out_uy) return;
+
+    const int nx = grid.nx;
+    const int ny = grid.ny;
+    const int support = (kernel == DeltaKernel::TwoPoint) ? 1 : 2;
+
+    for (int m = 0; m < n; ++m) {
+        const double xm = x[m] / dx;
+        const double ym = y[m] / dx;
+        const int i0 = static_cast<int>(std::floor(xm));
+        const int j0 = static_cast<int>(std::floor(ym));
+
+        double ux_sum = 0.0, uy_sum = 0.0;
+        for (int dj = -support; dj <= support + 1; ++dj) {
+            for (int di = -support; di <= support + 1; ++di) {
+                const int ii = i0 + di;
+                const int jj = j0 + dj;
+                if (ii < 0 || ii >= nx || jj < 0 || jj >= ny) continue;
+                const int node = grid.idx(ii, jj);
+                if (!grid.solid.empty() && grid.solid[node]) continue;
+                const double phi_x = delta_phi(x[m] - ii * dx, dx, kernel);
+                const double phi_y = delta_phi(y[m] - jj * dx, dx, kernel);
+                const double phi = phi_x * phi_y * dx * dx;
+                ux_sum += grid.u[node * 2 + 0] * phi;
+                uy_sum += grid.u[node * 2 + 1] * phi;
+            }
+        }
+        out_ux[m] = ux_sum;
+        out_uy[m] = uy_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 力展布（二维，D2Q9）
 // ---------------------------------------------------------------------------
 void spread_force(lbm::LatticeGrid& grid,
@@ -218,11 +262,12 @@ void compute_ibm_forces_mdf(lbm::LatticeGrid& fluid,
         std::swap(fluid.u, u_work);
 
         // Step 0 / Step 4：计算本次迭代增量力 Δgₗ(Xₖ) = Uₖ − uₗ(Xₖ)
-        //   刚体静止目标速度 Uₖ = 0；如需移动边界，可将 0.0 替换为 mk.ux_target 等。
+        //   目标速度 Uₖ 从 mk.ux_target/uy_target 读取（运动体由外部在每步前更新；
+        //   静止体默认 0.0，与原先 u_target=0 行为完全一致）。
         for (int m = 0; m < nm; ++m) {
             auto& mk = ms.markers[m];
-            const double dFx = (0.0 - mk.ux) / dt;   // ρ=1 格子单位假设
-            const double dFy = (0.0 - mk.uy) / dt;
+            const double dFx = (mk.ux_target - mk.ux) / dt;   // ρ=1 格子单位假设
+            const double dFy = (mk.uy_target - mk.uy) / dt;
             // 暂存增量到 mk.fx/fy 供 spread_force() 使用（展布增量力，而非累积总力）
             mk.fx = dFx;
             mk.fy = dFy;
@@ -925,8 +970,8 @@ void compute_ibm_forces_mls_implicit(lbm::LatticeGrid& fluid,
         const int j0 = static_cast<int>(std::round(mk.y / dx));
         if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
         if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
-        Bx[k] = (u_target_x - mk.ux) / dt;
-        By[k] = (u_target_y - mk.uy) / dt;
+        Bx[k] = (mk.ux_target - mk.ux) / dt;
+        By[k] = (mk.uy_target - mk.uy) / dt;
     }
 
     // C1/C2: 构建相关矩阵 A（Eq.28）并用 GMRES 求解（Scheme II）
@@ -1031,8 +1076,8 @@ void compute_ibm_forces_mls_implicit_stationary(lbm::LatticeGrid& fluid,
         const int j0 = static_cast<int>(std::round(mk.y / dx));
         if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
         if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
-        Bx[k] = (u_target_x - mk.ux) / dt;
-        By[k] = (u_target_y - mk.uy) / dt;
+        Bx[k] = (mk.ux_target - mk.ux) / dt;
+        By[k] = (mk.uy_target - mk.uy) / dt;
     }
 
 #ifdef LBM_ENABLE_MPI
@@ -1076,9 +1121,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
                                       double dt,
-                                      DeltaKernel /*kernel*/,
-                                      double u_target_x,
-                                      double u_target_y)
+                                      DeltaKernel /*kernel*/)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("Original MLS-IBM: only D2Q9 supported currently");
@@ -1087,10 +1130,10 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
     // 1. MLS 速度插值：U_m = J · u（更新 mk.ux/uy）
     mls_interpolate_velocity(fluid, ms, dx);
 
-    // 2. 直接力：F_m = (u_target − U_m) / dt
+    // 2. 直接力：F_m = (mk.ux_target − U_m) / dt（逐点目标速度，支持柔性体）
     for (auto& mk : ms.markers) {
-        mk.fx = (u_target_x - mk.ux) / dt;
-        mk.fy = (u_target_y - mk.uy) / dt;
+        mk.fx = (mk.ux_target - mk.ux) / dt;
+        mk.fy = (mk.uy_target - mk.uy) / dt;
     }
 
     // 3. MLS 形状函数展布（Eq.16；mls_spread_force 含 ds_m 守恒因子）
@@ -1118,9 +1161,7 @@ void compute_ibm_forces_mls_original(lbm::LatticeGrid& fluid,
 void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
                                       MarkerSet& ms,
                                       double dx,
-                                      double dt,
-                                      double u_target_x,
-                                      double u_target_y)
+                                      double dt)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("Explicit MLS-IBM: only D2Q9 supported currently");
@@ -1129,10 +1170,10 @@ void compute_ibm_forces_mls_explicit(lbm::LatticeGrid& fluid,
     // 1. MLS 速度插值：U_m = J · u（更新 mk.ux/uy）
     mls_interpolate_velocity(fluid, ms, dx);
 
-    // 2. 直接力：F_m = (u_target − U_m) / dt
+    // 2. 直接力：F_m = (mk.ux_target − U_m) / dt（逐点目标速度，支持柔性体）
     for (auto& mk : ms.markers) {
-        mk.fx = (u_target_x - mk.ux) / dt;
-        mk.fy = (u_target_y - mk.uy) / dt;
+        mk.fx = (mk.ux_target - mk.ux) / dt;
+        mk.fy = (mk.uy_target - mk.uy) / dt;
     }
 
     // 3. 第一次 MLS 展布：f = J^T · F（写入 fluid.force）
@@ -1218,8 +1259,9 @@ void compute_ibm_forces_penalty(lbm::LatticeGrid& fluid,
     for (int m = 0; m < nm; ++m) {
         auto& mk = ms.markers[m];
 
-        const double ex = u_target_x - mk.ux;
-        const double ey = u_target_y - mk.uy;
+        // 逐点目标速度（支持柔性体；静止体 mk.ux_target=0）
+        const double ex = mk.ux_target - mk.ux;
+        const double ey = mk.uy_target - mk.uy;
 
         // 3. 更新积分（简单 Euler 积分）+ 抗饱和限幅
         integral_x[m] += dt * ex;
@@ -1322,9 +1364,7 @@ void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
                               MarkerSet& ms,
                               double dx,
                               double dt,
-                              DeltaKernel kernel,
-                              double u_target_x,
-                              double u_target_y)
+                              DeltaKernel kernel)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("IVC-IBM: only D2Q9 supported currently");
@@ -1346,8 +1386,8 @@ void compute_ibm_forces_ivc(lbm::LatticeGrid& fluid,
         const int j0 = static_cast<int>(std::floor(mk.y / dx));
         if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
         if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
-        Bx[l] = u_target_x - mk.ux;
-        By[l] = u_target_y - mk.uy;
+        Bx[l] = mk.ux_target - mk.ux;
+        By[l] = mk.uy_target - mk.uy;
     }
 
     // 步骤 3：构建相关矩阵 A（Eq.27–28）
@@ -1403,9 +1443,7 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
                                         double dt,
                                         std::vector<double>& A_lu_cache,
                                         std::vector<int>&    piv_cache,
-                                        DeltaKernel kernel,
-                                        double u_target_x,
-                                        double u_target_y)
+                                        DeltaKernel kernel)
 {
     if (fluid.model != lbm::LatticeModel::D2Q9) {
         throw std::runtime_error("IVC-IBM stationary: only D2Q9 supported currently");
@@ -1425,8 +1463,7 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
             // 奇异矩阵：清空缓存，退化为逐步重建
             A_lu_cache.clear();
             piv_cache.clear();
-            compute_ibm_forces_ivc(fluid, ms, dx, dt, kernel,
-                                    u_target_x, u_target_y);
+            compute_ibm_forces_ivc(fluid, ms, dx, dt, kernel);
             return;
         }
     }
@@ -1442,8 +1479,8 @@ void compute_ibm_forces_ivc_stationary(lbm::LatticeGrid& fluid,
         const int j0 = static_cast<int>(std::floor(mk.y / dx));
         if (i0 < ms.owner_i_lo || i0 >= ms.owner_i_hi) continue;
         if (j0 < ms.owner_j_lo || j0 >= ms.owner_j_hi) continue;
-        Bx[l] = u_target_x - mk.ux;
-        By[l] = u_target_y - mk.uy;
+        Bx[l] = mk.ux_target - mk.ux;
+        By[l] = mk.uy_target - mk.uy;
     }
 #ifdef LBM_ENABLE_MPI
     MPI_Allreduce(MPI_IN_PLACE, Bx.data(), Nl, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);

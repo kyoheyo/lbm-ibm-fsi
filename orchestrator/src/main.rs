@@ -1,6 +1,7 @@
 mod async_output;
 mod config;
 mod fsi;
+mod motion;
 mod output;
 mod python_bridge;
 mod sim;
@@ -12,6 +13,7 @@ use clap::Parser;
 
 use config::Config;
 use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmSolver};
+use crate::config::MotionType;
 use output::PartitionInfo;
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,10 @@ fn run() -> Result<()> {
 
     // 初始化格子网格与求解器
     let mut grid   = LbmGrid::new(grid_nx, grid_ny, grid_nz, model);
+    // 若用户配置了非单位初始密度，在求解器构造前写入（求解器构造时将 f 初始化为平衡态）
+    if (cfg.fluid.rho0 - 1.0).abs() > 1e-15 {
+        grid.fill_rho(cfg.fluid.rho0);
+    }
     let mut solver = LbmSolver::new(&mut grid, cfg.omega(), cm);
     mpi.attach_to_solver(&mut solver);
 
@@ -145,13 +151,15 @@ fn run() -> Result<()> {
         coupling_mode, has_solid, has_ibm, cfg.fsi.normalized_coupling())?;
 
     // 固体标记与反弹方案（BB / IBB）
-    if coupling_mode.needs_solid() {
+    let (mut solid_entries, has_moving_solid) = if coupling_mode.needs_solid() {
         let (x_start, y_start, phys_x0, phys_y0) = mpi.global_coords();
         fsi::setup_solid_bodies(
             &cfg, &mut grid, &mut solver,
             x_start, y_start, phys_x0, phys_y0, rank,
-        );
-    }
+        )
+    } else {
+        (Vec::new(), false)
+    };
 
     // 注册流体边界条件
     sim::register_boundary_conditions(&cfg, &mut solver, &mpi, nprocs, rank);
@@ -228,7 +236,9 @@ fn run() -> Result<()> {
     // 时间循环
     let csv_path = format!("{}/monitor.csv", output_dir);
     run_time_loop(
-        &cfg, &mut grid, &mut solver, &mut ibm_entries,
+        &cfg, &mut grid, &mut solver,
+        &mut solid_entries, has_moving_solid,
+        &mut ibm_entries,
         &mut mpi, partition, &output_dir, &csv_path, combine_blocks, rank,
     )?;
 
@@ -284,6 +294,8 @@ fn run_time_loop(
     cfg: &Config,
     grid: &mut LbmGrid,
     solver: &mut LbmSolver,
+    solid_entries: &mut Vec<fsi::SolidEntry>,
+    has_moving_solid: bool,
     ibm_entries: &mut Vec<fsi::IbmEntry>,
     mpi: &mut sim::MpiDecomp,
     partition: Option<PartitionInfo>,
@@ -304,9 +316,21 @@ fn run_time_loop(
         // solver.step() → stream() 在 compute_macroscopic() 之后自动完成幽灵层 u 交换，
         // 无需在此显式调用 ibm_halo_exchange_u_2d()。
 
+        // 运动刚体 BB/IBB：手动施加 Ladd 移动壁面修正（在 solver.step 内已禁用自动 BC）
+        if has_moving_solid && !solid_entries.is_empty() {
+            let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                (p.phys_x0 as i32, p.phys_y0 as i32,
+                 (p.phys_x0 + p.local_nx - 1) as i32,
+                 (p.phys_y0 + p.local_ny - 1) as i32)
+            } else {
+                (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+            };
+            step_solid_moving(cfg, grid, solid_entries, step, pi0, pj0, pi1, pj1);
+        }
+
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
         if !ibm_entries.is_empty() {
-            step_ibm(cfg, grid, ibm_entries);
+            step_ibm(cfg, grid, ibm_entries, step);
 
             // MPI 修正：spread_force() 可能向幽灵行写入力贡献；将这些贡献归还邻居并累加。
             if let Some(ref mut d2) = mpi.decomp2d {
@@ -415,6 +439,46 @@ fn run_time_loop(
             }
         }
 
+        // 逐体受力输出（BB/IBB 多固体体，各体独立 CSV）
+        for entry in solid_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
+                    || step == cfg.simulation.n_steps - 1)
+            {
+                let (pi0, pj0, pi1, pj1) = if let Some(p) = partition {
+                    (p.phys_x0 as i32, p.phys_y0 as i32,
+                     (p.phys_x0 + p.local_nx - 1) as i32,
+                     (p.phys_y0 + p.local_ny - 1) as i32)
+                } else {
+                    (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
+                };
+                let (local_fx, local_fy) = lbm_bindings::compute_solid_force(grid, pi0, pj0, pi1, pj1);
+                let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+                let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
+                    let label = entry.label.clone();
+                    if let Some(ref w) = writer {
+                        w.submit(move || {
+                            output::append_monitor_csv(
+                                &force_csv, step + 1, time,
+                                &[("fx", global_fx), ("fy", global_fy)],
+                            ).with_context(|| format!(
+                                "Failed to write solid force CSV ({}) at step {}", label, step + 1
+                            ))
+                        });
+                    } else {
+                        output::append_monitor_csv(
+                            &force_csv, step + 1, time,
+                            &[("fx", global_fx), ("fy", global_fy)],
+                        ).with_context(|| format!(
+                            "Failed to write solid force CSV ({}) at step {}", entry.label, step + 1
+                        ))?;
+                    }
+                }
+            }
+        }
+
         // IBM 固体受力输出（Lagrangian 力密度积分，多体逐体写出）
         for entry in ibm_entries.iter() {
             if entry.force_cfg.enabled
@@ -485,26 +549,220 @@ fn run_time_loop(
 /// 每个体的方法参数优先使用体级覆盖（`[[ibm.bodies]]` 中的 `method`/`n_iter`/
 /// `alpha`/`beta` 字段），未设置时继承全局 `[ibm]` 设置。这允许同一仿真中
 /// 不同 IBM 体使用不同的力计算方案，以便直接对比各方法的效果。
-fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry]) {
+fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry], step: u64) {
     let dx = 1.0_f64;
     let dt = cfg.simulation.dt;
+    let t  = step as f64 * dt;  // 当前物理时刻（格子步）
     // 每个 IBM 时间步开始前清零体力场，防止上一步的力场残留被 pre_force 机制
     // 意外累积到当前步（会导致 MLS/MDF 直接力方法逐步发散）。
     grid.zero_force();
     for entry in ibm_entries.iter_mut() {
+        // --- Step A：更新标记点目标速度 ---
+        match entry.motion_type {
+            MotionType::RigidFree => {
+                if let Some(rb) = &entry.rigid_body {
+                    let (cx, cy, ux_cm, uy_cm, _theta, omega) = rb.state();
+                    entry.cx = cx;
+                    entry.cy = cy;
+                    entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+                }
+            }
+            MotionType::Prescribed => {
+                // 主动刚体：解析公式给出质心速度，再用刚体运动学分配到各标记点
+                if let Some(ref pm) = entry.prescribed {
+                    let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                    let cx = entry.cx;
+                    let cy = entry.cy;
+                    if omega != 0.0 {
+                        // 旋转模式：更新累计转角，重新计算标记点位置（从初始位置旋转）
+                        entry.theta += omega * dt;
+                        let cos_th = entry.theta.cos();
+                        let sin_th = entry.theta.sin();
+                        let n = entry.init_bx.len();
+                        let bx: Vec<f64> = (0..n).map(|k| {
+                            let rx = entry.init_bx[k] - entry.cx;
+                            let ry = entry.init_by[k] - entry.cy;
+                            entry.cx + rx * cos_th - ry * sin_th
+                        }).collect();
+                        let by: Vec<f64> = (0..n).map(|k| {
+                            let rx = entry.init_bx[k] - entry.cx;
+                            let ry = entry.init_by[k] - entry.cy;
+                            entry.cy + rx * sin_th + ry * cos_th
+                        }).collect();
+                        entry.ms.update_positions(&bx, &by);
+                    }
+                    entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+                }
+            }
+            MotionType::Flexible => {
+                if let Some(ref bs) = entry.beam_solver {
+                    // 被动柔性体：将当前梁速度写入标记点目标速度
+                    let (vx, vy) = bs.marker_velocities(&entry.beam_s);
+                    entry.ms.set_marker_targets(&vx, &vy);
+                } else if let Some(ref pm) = entry.prescribed {
+                    // 主动柔性体（行波/振荡）：解析速度写入各标记点
+                    let (vx, vy) = pm.eval_markers(t, &entry.beam_s);
+                    entry.ms.set_marker_targets(&vx, &vy);
+                }
+            }
+            _ => {}  // Fixed：不更新目标速度（保持零）
+        }
+
+        // --- Step B：IBM 力计算（所有方法均从 mk.ux_target/uy_target 读取目标速度）---
         match entry.method.to_lowercase().as_str() {
             "penalty"          => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
             "mls"              => entry.ms.step_mls(grid, dx, dt),
-            "mls_original"     => entry.ms.step_mls_original(grid, dx, dt, 0.0, 0.0),
-            "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt, 0.0, 0.0),
-            "ivc"              => entry.ms.step_ivc(grid, dx, dt, 0.0, 0.0),
-            "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt, 0.0, 0.0),
+            "mls_original"     => entry.ms.step_mls_original(grid, dx, dt),
+            "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt),
+            "ivc"              => entry.ms.step_ivc(grid, dx, dt),
+            "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt),
             _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+        }
+
+        // --- Step C：根据运动类型推进结构状态 ---
+        match entry.motion_type {
+            MotionType::RigidFree => {
+                if let Some(rb) = &mut entry.rigid_body {
+                    // 方案 C（Lagrangian 内部点）：在 advance() 前插值内部点速度
+                    if rb.n_internal() > 0 {
+                        let (ix, iy) = rb.internal_positions();
+                        let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
+                        rb.set_internal_velocities(&iux, &iuy);
+                        rb.compute_internal_momentum();
+                    }
+                    let cx = entry.cx;
+                    let cy = entry.cy;
+                    let (ftot_x, ftot_y, ttot) = entry.ms.compute_body_force_and_torque(cx, cy);
+                    rb.advance(-ftot_x, -ftot_y, -ttot, dt);
+                    let (bx, by) = rb.boundary_positions();
+                    entry.ms.update_positions(&bx, &by);
+                }
+            }
+            MotionType::Prescribed => {
+                // translate/oscillate 模式：按质心速度平移所有标记点
+                if let Some(ref pm) = entry.prescribed {
+                    let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                    // 仅平移模式（无旋转）才平移标记点；旋转模式已在 Step A 处理
+                    if omega == 0.0 && (ux_cm != 0.0 || uy_cm != 0.0) {
+                        let n = entry.ms.len();
+                        let (cur_bx, cur_by) = entry.ms.get_positions();
+                        let new_bx: Vec<f64> = cur_bx.iter().map(|&x| x + ux_cm * dt).collect();
+                        let new_by: Vec<f64> = cur_by.iter().map(|&y| y + uy_cm * dt).collect();
+                        entry.ms.update_positions(&new_bx, &new_by);
+                        // 同步质心位置
+                        entry.cx += ux_cm * dt;
+                        entry.cy += uy_cm * dt;
+                        let _ = n; // used via new_bx/by
+                    }
+                }
+            }
+            MotionType::Flexible => {
+                if let Some(ref mut bs) = entry.beam_solver {
+                    // 被动柔性体：推进梁方程，然后更新标记点位置和速度
+                    let (ibm_fx, ibm_fy) = entry.ms.get_forces();
+                    let arc_s = entry.beam_s.clone();
+                    bs.advance(&ibm_fx, &ibm_fy, &arc_s);
+                    let (bx, by) = bs.marker_positions(&arc_s);
+                    entry.ms.update_positions(&bx, &by);
+                }
+                // 主动柔性体：位置由外部解析公式给定，无需更新（标记点目标速度已在 Step A 设置）
+            }
+            _ => {}
         }
     }
 }
 
-/// 将当前欧拉场写出为本进程分区快照（格式由 `cfg.output.format` 决定）。
+/// 运动刚体 BB/IBB 每步更新：施加 Ladd 移动壁面修正，推进 Newton-Euler 刚体积分，
+/// 并在步末清除旧标记、重新标记圆柱于新位置。
+///
+/// ## 时序（步 N 内）
+/// 1. 按当前位置/速度对每个体调用 `apply_solid_bb_moving_rigid` 或
+///    `apply_solid_ibb_moving_rigid`（Ladd 1994 移动壁面修正）。
+/// 2. 通过动量交换法（MEA）计算各刚体受力。
+/// 3. 用 Newton-Euler 方程推进刚体状态到步 N+1。
+/// 4. `clear_solid()` + `mark_solid_cylinder()` → 重新标记步 N+1 位置。
+///
+/// 对静止体（`motion_type != RigidFree`）调用移动版本但传零速度，
+/// 结果等价于标准半步长反弹（Ladd correction 为 0）。
+fn step_solid_moving(
+    cfg: &Config,
+    grid: &mut LbmGrid,
+    solid_entries: &mut [fsi::SolidEntry],
+    step: u64,
+    phys_i0: i32, phys_j0: i32,
+    phys_i1: i32, phys_j1: i32,
+) {
+    let dt = cfg.simulation.dt;
+    // 当前格子时刻（step 已完成流体推进；t = (step+1)*dt 为施加 Ladd 修正的时刻）
+    let t = (step + 1) as f64 * dt;
+
+    // --- Step A：对每个固体施加移动壁面 BB/IBB ---
+    for entry in solid_entries.iter() {
+        let (ux_cm, uy_cm, omega) = entry.wall_velocity_at(t);
+        let cx = entry.cx;
+        let cy = entry.cy;
+        match entry.bc_mode {
+            2 => lbm_bindings::apply_solid_ibb_moving_rigid(
+                grid, cx, cy, ux_cm, uy_cm, omega,
+                phys_i0, phys_j0, phys_i1, phys_j1),
+            _ => lbm_bindings::apply_solid_bb_moving_rigid(
+                grid, cx, cy, ux_cm, uy_cm, omega,
+                phys_i0, phys_j0, phys_i1, phys_j1),
+        }
+    }
+
+    // --- Step B + C：对运动刚体求力并推进状态 ---
+    let any_rigid_free = solid_entries.iter().any(|e| e.motion_type == MotionType::RigidFree);
+
+    if any_rigid_free {
+        // 计算全局 MEA 合力（所有固体的总受力，通过 MPI_Allreduce 求和）
+        let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
+            grid, phys_i0, phys_j0, phys_i1, phys_j1);
+        // Note: 若多个刚体共存，目前简化为所有体共用总力；单体情形正确。
+        // 多体场景的精确 MEA 需要逐体 mask，此处不作区分。
+        let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+        let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+
+        for entry in solid_entries.iter_mut() {
+            if entry.motion_type != MotionType::RigidFree { continue; }
+            if let Some(rb) = &mut entry.rigid_body {
+                // 固体所受流体合力 = MEA 合力（MEA 返回的是固体给流体的力，取负）
+                rb.advance(-global_fx, -global_fy, 0.0, dt);
+                let (cx, cy, _, _, _, _) = rb.state();
+                entry.cx = cx;
+                entry.cy = cy;
+            }
+        }
+    }
+
+    // --- Step B'：对主动 Prescribed 圆柱积分位置 ---
+    for entry in solid_entries.iter_mut() {
+        if entry.motion_type != MotionType::Prescribed { continue; }
+        if entry.shape == "cylinder" {
+            let (ux, uy, _omega) = entry.wall_velocity_at(t);
+            entry.cx += ux * dt;
+            entry.cy += uy * dt;
+        }
+    }
+
+    // --- Step D：清除标记并在新位置重新标记 ---
+    let any_moving = solid_entries.iter().any(|e| e.is_moving());
+    if any_moving {
+        lbm_bindings::clear_solid(grid);
+        for entry in solid_entries.iter() {
+            if entry.shape == "cylinder" {
+                lbm_bindings::mark_solid_cylinder(grid, entry.cx, entry.cy, entry.radius);
+                lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+            }
+            // 矩形/mesh 不支持运动，但如果有标记也重新写入（静止位置）
+            if entry.shape == "rectangle" {
+                lbm_bindings::mark_solid_rectangle(grid, entry.i0, entry.j0, entry.i1, entry.j1);
+                lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
+            }
+        }
+    }
+}
+
 fn write_step_snapshot(
     cfg: &Config,
     grid: &LbmGrid,
