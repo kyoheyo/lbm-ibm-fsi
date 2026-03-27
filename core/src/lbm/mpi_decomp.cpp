@@ -161,6 +161,58 @@ MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py, int in_n
 }
 
 // ---------------------------------------------------------------------------
+// 由全局尺寸和自定义 Y 方向分区行数创建二维域分解描述符
+//
+// y_counts[r]（r = 0..py-1）指定第 r 个 row-rank 持有的物理行数。
+// X 方向仍使用均匀分配。所有进程传入的 y_counts 数组必须完全一致。
+// 用于多重网格感知的负载均衡分区：令细化层完整地落入单个 MPI 分块，
+// 避免细化层跨分区边界导致幽灵行缺失与负载不均衡。
+// ---------------------------------------------------------------------------
+MpiDecomp2D MpiDecomp2D::create_with_y_counts(int gnx, int gny,
+                                               int in_px, int in_py,
+                                               const int* y_counts,
+                                               int in_n_ghost)
+{
+    MpiDecomp2D d;
+    d.global_nx = gnx;
+    d.global_ny = gny;
+    d.px        = in_px;
+    d.py        = in_py;
+    d.n_ghost   = (in_n_ghost >= 1) ? in_n_ghost : 1;
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &d.rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &d.nprocs);
+
+    if (d.px * d.py != d.nprocs) {
+        throw std::invalid_argument(
+            "MpiDecomp2D::create_with_y_counts: px*py must equal MPI process count");
+    }
+
+    d.col_rank = d.rank % d.px;
+    d.row_rank = d.rank / d.px;
+
+    // X 方向均匀分配
+    uniform_partition(gnx, d.px, d.col_rank, d.local_nx, d.x_start);
+    d.x_end = d.x_start + d.local_nx - 1;
+
+    // Y 方向使用调用者提供的自定义行数
+    d.local_ny = y_counts[d.row_rank];
+    d.y_start  = 0;
+    for (int r = 0; r < d.row_rank; ++r) {
+        d.y_start += y_counts[r];
+    }
+    d.y_end = d.y_start + d.local_ny - 1;
+
+    // 计算四邻进程 rank
+    d.rank_south = (d.row_rank > 0)        ? (d.row_rank - 1) * d.px + d.col_rank : MPI_PROC_NULL;
+    d.rank_north = (d.row_rank < d.py - 1) ? (d.row_rank + 1) * d.px + d.col_rank : MPI_PROC_NULL;
+    d.rank_west  = (d.col_rank > 0)        ? d.row_rank * d.px + d.col_rank - 1   : MPI_PROC_NULL;
+    d.rank_east  = (d.col_rank < d.px - 1) ? d.row_rank * d.px + d.col_rank + 1   : MPI_PROC_NULL;
+
+    return d;
+}
+
+// ---------------------------------------------------------------------------
 // 二维模式：D2Q9 幽灵层交换
 //
 // 本地网格布局（phys_x0 = 0 或 n_ghost，phys_y0 = 0 或 n_ghost）：
@@ -643,6 +695,15 @@ MpiDecomp2D MpiDecomp2D::create(int gnx, int gny, int in_px, int in_py, int in_n
         throw std::invalid_argument("MpiDecomp2D: MPI not enabled, px*py must be 1");
     }
     return d;
+}
+
+MpiDecomp2D MpiDecomp2D::create_with_y_counts(int gnx, int gny,
+                                               int in_px, int in_py,
+                                               const int* /*y_counts*/,
+                                               int in_n_ghost)
+{
+    // 非 MPI 构建：等同于单进程 create()
+    return MpiDecomp2D::create(gnx, gny, in_px, in_py, in_n_ghost);
 }
 
 // ---------------------------------------------------------------------------

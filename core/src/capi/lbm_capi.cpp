@@ -413,6 +413,37 @@ void lbm_mpi_decomp2d_free(MpiDecomp2DHandle* h)
 #endif
 }
 
+/// 与 lbm_mpi_decomp2d_new_n 相同，但 Y 方向使用调用者指定的自定义分区行数。
+///
+/// y_counts 是长度为 py 的整数数组，y_counts[r] 为第 r 个 row-rank 持有的物理行数。
+/// 所有进程必须传入完全相同的 y_counts（每个进程独立计算但结果一致）。
+/// 用于多重网格感知的负载均衡分区：令细化层完整地落入单个 MPI 分块。
+///
+/// Rust 封装: LbmMpiDecomp2D::new_y_counts() — bindings/src/lib.rs
+MpiDecomp2DHandle* lbm_mpi_decomp2d_new_y_counts(int global_nx, int global_ny,
+                                                   int px, int py,
+                                                   const int* y_counts,
+                                                   int n_ghost)
+{
+#ifdef LBM_ENABLE_MPI
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized) return nullptr;
+    try {
+        auto* d = new lbm::MpiDecomp2D(
+            lbm::MpiDecomp2D::create_with_y_counts(
+                global_nx, global_ny, px, py, y_counts, n_ghost));
+        return reinterpret_cast<MpiDecomp2DHandle*>(d);
+    } catch (...) {
+        return nullptr;
+    }
+#else
+    (void)global_nx; (void)global_ny; (void)px; (void)py;
+    (void)y_counts; (void)n_ghost;
+    return nullptr;
+#endif
+}
+
 /// 将 MpiDecomp2D 绑定到求解器；之后每次 step() 自动执行二维幽灵层交换。
 /// Rust 封装: LbmSolver::attach_mpi2d() — bindings/src/lib.rs
 void lbm_solver_attach_mpi2d(lbm::Solver* s, MpiDecomp2DHandle* h)

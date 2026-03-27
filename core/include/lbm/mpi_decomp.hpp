@@ -199,6 +199,21 @@ struct MpiDecomp2D {
     /// n_ghost 指定每侧幽灵层数（默认 1；ibm_halo_width=2 时传入 2）。
     static MpiDecomp2D create(int global_nx, int global_ny, int px, int py,
                                int n_ghost = 1);
+
+    /// 由全局尺寸和自定义 Y 方向分区行数创建 MpiDecomp2D（需先调用 MPI_Init）。
+    ///
+    /// 与 create() 相同，但 Y 方向分区由调用者显式指定：
+    ///   y_counts[r] = row-rank r（0..py-1）所持有的物理行数。
+    ///
+    /// 所有进程必须传入完全相同的 y_counts 数组（所有进程独立计算但结果一致）。
+    /// 数组长度必须为 py，每个元素必须 ≥ 1，总和必须等于 global_ny。
+    ///
+    /// 用于多重网格感知的负载均衡分区：将细化层完整地分配给单个 MPI 分块，
+    /// 以避免细化层跨 MPI 边界导致的边界数据缺失与负载不均问题。
+    static MpiDecomp2D create_with_y_counts(int global_nx, int global_ny,
+                                             int px, int py,
+                                             const int* y_counts,
+                                             int n_ghost = 1);
 };
 
 // ---------------------------------------------------------------------------
