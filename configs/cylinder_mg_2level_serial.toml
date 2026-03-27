@@ -1,0 +1,94 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 两层网格 · 单核
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 两层嵌套（L0 粗网格 600×100 + L1 细网格 361×121，加密比 r=2）
+# 并行  : 单核（omp_num_threads = 1）
+#
+# 网格层级说明：
+#   L0（粗，根节点）: 600×100 格点
+#                     ω₀ = 1/(3·0.01 + 0.5) ≈ 1.8868
+#   L1（细，level-1）: 覆盖 L0 坐标 [100,280]×[20,80]，加密比 r=2
+#                     细网格尺寸 = (280-100)·2+1 × (80-20)·2+1 = 361×121
+#                     ω₁ = 2·ω₀/(4-ω₀) ≈ 1.9512（Yu 2002 Eq.4 递推）
+#
+# 圆柱在各层位置：
+#   L0 : (150, 50)   — IBM MDF 力施加于此层
+#   L1 本地坐标 : (100, 60)  ← (150-100)·2, (50-20)·2
+#
+# fringe 耦合（mg_apply_fringe_bc_temporal）：
+#   fringe_width = 2 细格（建议值，使用四点δ核时足够）
+#
+# 运行：
+#   ./lbm-fsi configs/cylinder_mg_2level_serial.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_2level_serial"
+format         = "npz"
+
+[parallel]
+omp_num_threads = 1
+
+# -----------------------------------------------------------------------------
+# 多重网格配置
+# -----------------------------------------------------------------------------
+[multigrid]
+enabled      = true
+fringe_width = 2    # fringe 层宽度（细格数），与 mg_apply_fringe_bc_temporal 对应
+
+# 细化层 1（L1）：覆盖圆柱及近尾迹区域
+# 坐标系：L0（粗网格）格子坐标，含端点
+# 细网格尺寸：(280-100)·2+1 × (80-20)·2+1 = 361×121
+[[multigrid.levels]]
+x_start      = 100
+x_end        = 280
+y_start      = 20
+y_end        = 80
+refine_ratio = 2
+parent_level = 0    # 父节点 = L0（粗网格根节点）

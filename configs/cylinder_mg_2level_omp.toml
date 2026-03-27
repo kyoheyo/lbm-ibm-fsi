@@ -1,0 +1,81 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 两层网格 · OpenMP 多核
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 两层嵌套（L0 600×100 + L1 361×121，r=2）
+# 并行  : OpenMP 4线程（omp_num_threads = 4）
+#
+# 与单核版本（cylinder_mg_2level_serial.toml）物理参数完全相同；
+# 仅 [parallel] 不同，用于测试 OpenMP 多线程加速比。
+#
+# 网格层级：
+#   L0 : 600×100，  ω₀ ≈ 1.8868
+#   L1 : 361×121，  ω₁ ≈ 1.9512（覆盖 L0 [100,280]×[20,80]，r=2）
+#
+# 运行：
+#   ./lbm-fsi configs/cylinder_mg_2level_omp.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_2level_omp"
+format         = "npz"
+
+[parallel]
+omp_num_threads = 4
+
+[multigrid]
+enabled      = true
+fringe_width = 2
+
+[[multigrid.levels]]
+x_start      = 100
+x_end        = 280
+y_start      = 20
+y_end        = 80
+refine_ratio = 2
+parent_level = 0

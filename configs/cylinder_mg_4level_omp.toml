@@ -1,0 +1,102 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 四层网格 · OpenMP 多核
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 四层线性嵌套（L0→L1→L2→L3），各层加密比 r=2
+# 并行  : OpenMP 4线程（omp_num_threads = 4）
+#
+# 与单核版本（cylinder_mg_4level_serial.toml）物理参数完全相同，
+# 仅 [parallel] 不同。用于测试四层多重网格的 OpenMP 加速比。
+#
+# 各层尺寸与 omega（同单核版）：
+#   L0 : 600×100，  ω₀ ≈ 1.8868
+#   L1 : 361×121，  ω₁ ≈ 1.9512  （覆盖 L0 [100,280]×[20,80]）
+#   L2 : 161×81，   ω₂ ≈ 1.9749  （覆盖 L1 [80,160]×[40,80]）
+#   L3 : 41×41，    ω₃ ≈ 1.9875  （覆盖 L2 [30,50]×[30,50]）
+#
+# 运行：
+#   ./lbm-fsi configs/cylinder_mg_4level_omp.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_4level_omp"
+format         = "npz"
+
+[parallel]
+omp_num_threads = 4
+
+[multigrid]
+enabled      = true
+fringe_width = 2
+
+# L1：覆盖圆柱及近尾迹，父=L0，细网格尺寸 361×121
+[[multigrid.levels]]
+x_start      = 100
+x_end        = 280
+y_start      = 20
+y_end        = 80
+refine_ratio = 2
+parent_level = 0
+
+# L2：聚焦圆柱周围，父=L1，细网格尺寸 161×81
+[[multigrid.levels]]
+x_start      = 80
+x_end        = 160
+y_start      = 40
+y_end        = 80
+refine_ratio = 2
+parent_level = 1
+
+# L3：最细层，紧贴圆柱表面，父=L2，细网格尺寸 41×41
+[[multigrid.levels]]
+x_start      = 30
+x_end        = 50
+y_start      = 30
+y_end        = 50
+refine_ratio = 2
+parent_level = 2

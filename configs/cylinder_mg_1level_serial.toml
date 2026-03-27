@@ -1,0 +1,71 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 单层网格 · 单核（基准参考）
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 单层粗网格，600×100（无细化层）
+# 并行  : 单核（omp_num_threads = 1）
+#
+# 用途  : 多重网格测试基准，与 2层/4层 结果对比
+#
+# 物理参数：
+#   通道尺寸 : 600 × 100 格点
+#   圆柱位置 : 中心 (150, 50)，半径 R = 10
+#   入口速度 : U = 0.05
+#   运动粘度 : ν = 0.01
+#   雷诺数   : Re = U·D/ν = 0.05×20/0.01 = 100
+#
+# 运行：
+#   ./lbm-fsi configs/cylinder_mg_1level_serial.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_1level_serial"
+format         = "npz"
+
+[parallel]
+omp_num_threads = 1

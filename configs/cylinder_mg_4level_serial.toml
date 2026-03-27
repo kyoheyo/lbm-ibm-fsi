@@ -1,0 +1,125 @@
+# =============================================================================
+# 多重网格测试 — 圆柱绕流 · 四层网格 · 单核
+# =============================================================================
+#
+# 场景  : 圆柱绕流，IBM-MDF，Re = 100
+# 网格  : 四层线性嵌套（L0→L1→L2→L3），各层加密比 r=2
+# 并行  : 单核（omp_num_threads = 1）
+#
+# 网格层级说明（L0 为最粗，L3 为最细）：
+#
+#   L0（粗，根节点）: 600×100
+#       ω₀ = 1/(3·0.01+0.5) ≈ 1.8868
+#
+#   L1（r=2，父=L0）: 覆盖 L0 坐标 [100,280]×[20,80]
+#       细网格尺寸 = (280-100)·2+1 × (80-20)·2+1 = 361×121
+#       ω₁ = 2·ω₀/(4-ω₀) ≈ 1.9512
+#       L1 本地坐标中圆柱：x₁=(150-100)·2=100, y₁=(50-20)·2=60
+#
+#   L2（r=2，父=L1）: 覆盖 L1 本地坐标 [80,160]×[40,80]
+#       细网格尺寸 = (160-80)·2+1 × (80-40)·2+1 = 161×81
+#       ω₂ = 2·ω₁/(4-ω₁) ≈ 1.9749
+#       L2 本地坐标中圆柱：x₂=(100-80)·2=40, y₂=(60-40)·2=40
+#
+#   L3（r=2，父=L2）: 覆盖 L2 本地坐标 [30,50]×[30,50]
+#       细网格尺寸 = (50-30)·2+1 × (50-30)·2+1 = 41×41
+#       ω₃ = 2·ω₂/(4-ω₂) ≈ 1.9875
+#       L3 本地坐标中圆柱：x₃=(40-30)·2=20, y₃=(40-30)·2=20
+#
+# 物理加密倍率：L3 细格间距 = L0 格间距 / (2³) = 1/8
+# IBM 力施加于 L0（粗网格），通过 fringe 耦合传播至细层。
+#
+# 运行：
+#   ./lbm-fsi configs/cylinder_mg_4level_serial.toml
+# =============================================================================
+
+[simulation]
+n_steps         = 2000
+dt              = 1.0
+lattice_model   = "D2Q9"
+collision_model = "MRT"
+
+[fluid]
+nx   = 600
+ny   = 100
+nu   = 0.01
+rho0 = 1.0
+
+[[fluid.boundary_conditions]]
+bc_type = "zou_he_velocity"
+face    = "west"
+ux      = 0.05
+uy      = 0.0
+
+[[fluid.boundary_conditions]]
+bc_type = "fully_developed"
+face    = "east"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "south"
+
+[[fluid.boundary_conditions]]
+bc_type = "bounce_back"
+face    = "north"
+
+[fsi]
+coupling = "ibm"
+
+[ibm]
+geometry     = "circle"
+x0           = 150.0
+y0           = 50.0
+size         = 10.0
+n_markers    = 64
+delta_kernel = "four_point"
+method       = "mdf"
+n_iter       = 3
+
+[output]
+write_interval = 200
+directory      = "output/cylinder_mg_4level_serial"
+format         = "npz"
+
+[parallel]
+omp_num_threads = 1
+
+# -----------------------------------------------------------------------------
+# 多重网格配置（4层，线性链）
+# parent_level = -1 表示自动取上一层为父（线性链默认行为）
+# -----------------------------------------------------------------------------
+[multigrid]
+enabled      = true
+fringe_width = 2
+
+# L1：覆盖圆柱及近尾迹，父=L0
+# 细网格尺寸 361×121
+[[multigrid.levels]]
+x_start      = 100
+x_end        = 280
+y_start      = 20
+y_end        = 80
+refine_ratio = 2
+parent_level = 0    # 父 = L0 根节点
+
+# L2：聚焦圆柱周围，父=L1（L1本地坐标）
+# L1中圆柱位于 (100,60)；覆盖 L1 坐标 [80,160]×[40,80]
+# 细网格尺寸 161×81
+[[multigrid.levels]]
+x_start      = 80
+x_end        = 160
+y_start      = 40
+y_end        = 80
+refine_ratio = 2
+parent_level = 1    # 父 = L1（nodes[1]）
+
+# L3：最细层，紧贴圆柱表面，父=L2（L2本地坐标）
+# L2中圆柱位于 (40,40)；覆盖 L2 坐标 [30,50]×[30,50]
+# 细网格尺寸 41×41
+[[multigrid.levels]]
+x_start      = 30
+x_end        = 50
+y_start      = 30
+y_end        = 50
+refine_ratio = 2
+parent_level = 2    # 父 = L2（nodes[2]）

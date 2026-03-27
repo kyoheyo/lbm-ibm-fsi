@@ -802,6 +802,150 @@ fn write_step_snapshot(
     }
 }
 
+        _ => output::write_snapshot_npz(grid, step, time, output_dir, partition)
+            .with_context(|| format!("failed to write NPZ snapshot (step {})", step)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 多重网格时间步主循环
+// ---------------------------------------------------------------------------
+
+/// 多重网格时间步主循环。
+///
+/// - `root_grid` / `root_solver`：最粗层（L0）网格与求解器，已完成 MPI 附加和 BC 注册。
+/// - `ibm_entries`：IBM 体集合，力展布在每步 mg_step_recursive **之前**施加于根网格。
+/// - 细化层的 LatticeGrid + Solver 在本函数内按 `mg_cfg.levels` 自动创建并绑定到树节点。
+///
+/// ## Omega 递推公式（Yu 2002 Eq.4）
+///
+/// `ω_f = 2·ω_c / (4 − ω_c)`（线性稳定性约束，每细化一层递推一次）。
+///
+/// ## IBM 策略
+///
+/// IBM 力当前施加于根（粗）网格；mg_step_recursive 内部通过 fringe 耦合将力效应
+/// 传播到各细化层。如需在最细层施加 IBM，可扩展为选取覆盖圆柱的最细节点。
+fn run_multigrid_loop(
+    cfg: &Config,
+    mg_cfg: &crate::config::MultigridConfig,
+    model: LatticeModel,
+    cm: CollisionModel,
+    root_grid: &mut LbmGrid,
+    root_solver: &mut LbmSolver,
+    ibm_entries: &mut Vec<fsi::IbmEntry>,
+    output_dir: &str,
+    rank: i32,
+) -> Result<()> {
+    use anyhow::anyhow;
+
+    let nx = cfg.fluid.nx as i32;
+    let ny = cfg.fluid.ny as i32;
+
+    // 1. 创建多重网格树（根节点 = 全局粗网格空间范围）
+    let mut tree = LbmMgTree::new(0, nx - 1, 0, ny - 1, 0, 0, false)
+        .ok_or_else(|| anyhow!("Failed to create MgTree for {}×{} root grid", nx, ny))?;
+
+    // 2. 为每个细化层创建独立的 LatticeGrid + Solver
+    //    必须先将所有 LbmGrid 收集到 Vec（确保地址稳定），再创建 Solver，
+    //    因为 LbmSolver::new() 只借用 *mut 指针，不维持 Rust 借用。
+    //    omega 每细化一层递推：ω_f = 2·ω_c / (4 − ω_c)
+    let mut fine_grids:   Vec<LbmGrid>   = Vec::with_capacity(mg_cfg.levels.len());
+    let mut fine_solvers: Vec<LbmSolver> = Vec::with_capacity(mg_cfg.levels.len());
+
+    let mut omega_parent = cfg.omega();
+    for (i, level) in mg_cfg.levels.iter().enumerate() {
+        let r = level.refine_ratio;
+        if r < 1 { return Err(anyhow!("level[{}]: refine_ratio must be >= 1 (got {})", i, r)); }
+        let fine_nx = (level.x_end - level.x_start) * r + 1;
+        let fine_ny = (level.y_end - level.y_start) * r + 1;
+        if fine_nx <= 0 || fine_ny <= 0 {
+            return Err(anyhow!(
+                "level[{}]: computed fine grid size {}×{} is invalid \
+                 (x=[{},{}], y=[{},{}], r={})",
+                i, fine_nx, fine_ny,
+                level.x_start, level.x_end, level.y_start, level.y_end, r
+            ));
+        }
+        let omega_fine = 2.0 * omega_parent / (4.0 - omega_parent);
+        fine_grids.push(LbmGrid::new(fine_nx, fine_ny, 1, model));
+        // Solver 暂时从已入 Vec 的最后一个 grid 借用（内部只存 C++ 指针，借用立即结束）
+        let fs = LbmSolver::new(fine_grids.last_mut().unwrap(), omega_fine, cm);
+        fine_solvers.push(fs);
+        if rank == 0 {
+            println!(
+                "  [MG] level {} : {}×{} (parent coords [{},{}]×[{},{}], r={}, ω={:.4})",
+                i + 1, fine_nx, fine_ny,
+                level.x_start, level.x_end, level.y_start, level.y_end, r, omega_fine
+            );
+        }
+        omega_parent = omega_fine;
+    }
+
+    // 3. 绑定根节点的 grid + solver
+    tree.set_grid_by_idx(0, root_grid);
+    tree.set_solver_by_idx(0, root_solver);
+
+    // 4. 向树中添加细化层节点，绑定 grid + solver
+    //    nodes[0]=root, nodes[1]=levels[0], nodes[2]=levels[1], ...
+    //    parent_level: -1 → 线性链（level i 的父 = node i，即上一层）
+    //                  ≥0 → 显式指定父节点索引
+    for (i, level) in mg_cfg.levels.iter().enumerate() {
+        let parent_idx = if level.parent_level < 0 {
+            i   // 线性链：levels[i] 的父 = 节点索引 i（root=0 时 levels[0] 父为 0，等于根）
+        } else {
+            level.parent_level as usize
+        };
+        let node_idx = tree.add_child_level(
+            parent_idx,
+            level.x_start, level.x_end,
+            level.y_start, level.y_end,
+            0, 0,
+            level.refine_ratio,
+        ).ok_or_else(|| anyhow!(
+            "Failed to add MgTree level {} (parent_idx={}, extent=[{},{}]×[{},{}])",
+            i + 1, parent_idx, level.x_start, level.x_end, level.y_start, level.y_end
+        ))?;
+        tree.set_grid_by_idx(node_idx, &mut fine_grids[i]);
+        tree.set_solver_by_idx(node_idx, &mut fine_solvers[i]);
+    }
+
+    if rank == 0 {
+        println!(
+            "  [MG] tree ready: depth={}, nodes={}, fringe_width={}",
+            tree.max_level(), tree.node_count(), mg_cfg.fringe_width
+        );
+    }
+
+    // 5. 主时间循环
+    for step in 0..cfg.simulation.n_steps {
+        // IBM：每步先向粗网格展布浸入边界力
+        if !ibm_entries.is_empty() {
+            step_ibm(cfg, root_grid, ibm_entries, step);
+        }
+
+        // 多重网格递归推进（内部完成 collide-stream + C↔F 耦合）
+        let rc = tree.mg_step_recursive(mg_cfg.fringe_width);
+        if rc != 0 && rank == 0 {
+            eprintln!("[MG] mg_step_recursive failed (rc={}) at step {}", rc, step);
+        }
+
+        let time = (step + 1) as f64 * cfg.simulation.dt;
+        let is_snap = step % cfg.output.write_interval == 0
+            || step + 1 == cfg.simulation.n_steps;
+
+        if is_snap && rank == 0 {
+            write_step_snapshot(cfg, root_grid, step + 1, time, output_dir, None)?;
+        }
+
+        if rank == 0 && (step == 0 || (step + 1) % cfg.output.write_interval == 0
+                         || step + 1 == cfg.simulation.n_steps) {
+            println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
+        }
+    }
+
+    Ok(())
+}
+
 /// combine_blocks 模式：将各进程物理场 gather 到 rank-0 并写出全局快照。
 ///
 /// 非 root 进程已在 [`output::gather_field_to_root`] 内参与 `MPI_Gatherv`，

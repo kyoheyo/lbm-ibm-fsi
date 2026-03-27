@@ -1072,6 +1072,9 @@ unsafe impl Send for LbmMpiDecomp3D {}
 /// ```
 pub struct LbmMgTree {
     ptr: *mut ffi::MgTreeHandle,
+    /// 按添加顺序存储所有节点句柄：`nodes[0]` = 根节点，`nodes[1..]` = 各细化层节点。
+    /// 索引直接用于 `set_grid_by_idx` / `set_solver_by_idx` / `add_child_level`。
+    nodes: Vec<*mut ffi::MgNodeHandle>,
 }
 
 impl LbmMgTree {
@@ -1085,37 +1088,44 @@ impl LbmMgTree {
         let ptr = unsafe {
             ffi::lbm_mg_tree_new(x0, x1, y0, y1, z0, z1, if is_3d { 1 } else { 0 })
         };
-        if ptr.is_null() { None } else { Some(LbmMgTree { ptr }) }
+        if ptr.is_null() { return None; }
+        let root = unsafe { ffi::lbm_mg_tree_root(ptr) };
+        Some(LbmMgTree { ptr, nodes: vec![root] })
     }
 
-    /// 在**根节点**内添加一个细化子区域（第一层细网格）。
-    /// 等价于 `add_level(root, child_extent, refine_ratio)`。
-    /// 返回新节点的裸指针（由树管理，调用方不得释放）。
-    pub fn add_level_from_root(&mut self,
-                               x0: i32, x1: i32, y0: i32, y1: i32,
-                               z0: i32, z1: i32,
-                               refine_ratio: i32) -> Option<*mut ffi::MgNodeHandle> {
-        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
-        let node = unsafe {
-            ffi::lbm_mg_tree_add_level(self.ptr, root, x0, x1, y0, y1, z0, z1, refine_ratio)
-        };
-        if node.is_null() { None } else { Some(node) }
-    }
-
-    /// 在指定父节点内添加细化子区域（支持任意深度嵌套）。
-    pub fn add_level(&mut self, parent: *mut ffi::MgNodeHandle,
-                     x0: i32, x1: i32, y0: i32, y1: i32,
-                     z0: i32, z1: i32,
-                     refine_ratio: i32) -> Option<*mut ffi::MgNodeHandle> {
+    /// 在指定父节点（`parent_idx`）下添加一个细化子区域，返回新节点的索引。
+    ///
+    /// - `parent_idx = 0` 表示根节点；`parent_idx = k` 表示第 k 个已添加的节点。
+    /// - 坐标 `x0..x1 × y0..y1` 为**父节点坐标系**中的格子范围（含端点）。
+    /// - 返回新节点索引（可直接传给 [`set_grid_by_idx`] / [`set_solver_by_idx`]）；
+    ///   若父索引越界或 C++ 侧返回 null 则返回 `None`。
+    pub fn add_child_level(&mut self, parent_idx: usize,
+                           x0: i32, x1: i32, y0: i32, y1: i32,
+                           z0: i32, z1: i32,
+                           refine_ratio: i32) -> Option<usize> {
+        let parent = *self.nodes.get(parent_idx)?;
         let node = unsafe {
             ffi::lbm_mg_tree_add_level(self.ptr, parent, x0, x1, y0, y1, z0, z1, refine_ratio)
         };
-        if node.is_null() { None } else { Some(node) }
+        if node.is_null() { return None; }
+        let idx = self.nodes.len();
+        self.nodes.push(node);
+        Some(idx)
     }
 
-    /// 获取根节点（最粗网格）句柄
-    pub fn root(&mut self) -> *mut ffi::MgNodeHandle {
-        unsafe { ffi::lbm_mg_tree_root(self.ptr) }
+    /// 将 LatticeGrid 绑定到指定节点（0 = 根节点）。
+    pub fn set_grid_by_idx(&mut self, idx: usize, grid: &mut LbmGrid) {
+        if let Some(&node) = self.nodes.get(idx) {
+            unsafe { ffi::lbm_mg_node_set_grid(node, grid.as_mut_ptr()) };
+        }
+    }
+
+    /// 将 Solver 绑定到指定节点（0 = 根节点）。
+    /// mg_step_recursive 要求所有节点均已绑定 Solver。
+    pub fn set_solver_by_idx(&mut self, idx: usize, solver: &mut LbmSolver) {
+        if let Some(&node) = self.nodes.get(idx) {
+            unsafe { ffi::lbm_mg_node_set_solver(node, solver.ptr) };
+        }
     }
 
     /// 返回树中最深的层级（根节点为 0）
@@ -1128,35 +1138,12 @@ impl LbmMgTree {
         unsafe { ffi::lbm_mg_tree_node_count(self.ptr) }
     }
 
-    /// 将 LatticeGrid 绑定到根节点（最粗网格）。
-    pub fn set_grid_on_root(&mut self, grid: &mut LbmGrid) {
-        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
-        unsafe { ffi::lbm_mg_node_set_grid(root, grid.as_mut_ptr()) };
-    }
-
-    /// 将 LatticeGrid 绑定到指定树节点。
-    pub fn set_grid_on_node(&mut self, node: *mut ffi::MgNodeHandle, grid: &mut LbmGrid) {
-        unsafe { ffi::lbm_mg_node_set_grid(node, grid.as_mut_ptr()) };
-    }
-
-    /// 将 Solver 绑定到根节点（mg_step_recursive 需要每层均设置 solver）。
-    pub fn set_solver_on_root(&mut self, solver: &mut LbmSolver) {
-        let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
-        unsafe { ffi::lbm_mg_node_set_solver(root, solver.ptr) };
-    }
-
-    /// 将 Solver 绑定到指定树节点（mg_step_recursive 需要每层均设置 solver）。
-    pub fn set_solver_on_node(&mut self, node: *mut ffi::MgNodeHandle, solver: &mut LbmSolver) {
-        unsafe { ffi::lbm_mg_node_set_solver(node, solver.ptr) };
-    }
-
     /// 执行一次递归多重网格时间步推进（从根节点开始，Lagrava 2012 五步算法）。
     ///
     /// - 每层 MPI 幽灵层交换由各层 `Solver::step()` 内部完成，无需额外 MPI 调用。
-    /// - 必须在所有节点上先绑定 `solver`（通过 [`set_solver_on_root`] / [`set_solver_on_node`]），
-    ///   以及 `grid`（通过 [`set_grid_on_root`] / [`set_grid_on_node`]）。
+    /// - 必须在所有节点上先调用 [`set_grid_by_idx`] 和 [`set_solver_by_idx`]。
     ///
-    /// 返回 `0` 表示成功，`-1` 表示参数错误。
+    /// 返回 `0` 表示成功，`-1` 表示参数错误（节点未绑定 grid/solver）。
     pub fn mg_step_recursive(&mut self, fringe_width: i32) -> i32 {
         let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
         unsafe { ffi::lbm_mg_step_recursive(root, fringe_width) }
