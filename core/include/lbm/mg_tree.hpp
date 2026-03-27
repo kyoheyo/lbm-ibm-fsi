@@ -64,6 +64,8 @@
 // 引入 LatticeGrid 及 MPI 域分解结构（MgNode 需要 MpiDecomp2D/3D 完整类型以使用 std::variant）
 #include "lattice.hpp"
 #include "mpi_decomp.hpp"
+// Solver 供 MgNode::solver 字段使用（Solver 拥有 attach_mpi*() + step() 接口）
+#include "solver.hpp"
 
 namespace lbm {
 
@@ -137,6 +139,8 @@ struct MgNode {
     MgDim    dim          = MgDim::D2; ///< 网格维度（D2 或 D3，影响加密体积比）
 
     LatticeGrid* grid  = nullptr;  ///< 指向该层 LatticeGrid（nullptr=仅记录结构）
+    Solver*      solver = nullptr; ///< 可选：指向该层的 LBM 求解器（用于 mg_step_recursive）
+                                   ///< MgNode 不持有 Solver 的所有权，调用方负责生命周期
     MgNode*      parent = nullptr; ///< 父节点（最粗节点的 parent==nullptr）
     std::vector<MgNode*> children; ///< 子节点（更细的嵌套网格块）
 
@@ -144,6 +148,13 @@ struct MgNode {
     /// MpiDecomp2D*：二维 XY 块分解；MpiDecomp3D*：三维 XYZ 块分解。
     /// MgNode 不持有分解对象的所有权，调用方负责管理生命周期。
     std::variant<std::monostate, MpiDecomp2D*, MpiDecomp3D*> decomp;
+
+    /// 时间步暂存缓冲区（供 mg_step_recursive 保存时刻 t 的状态以用于时间插值）
+    /// 由 mg_step_recursive 首次调用时自动分配（大小 = grid->f.size()）。
+    /// 调用方不应直接读写这些字段。
+    std::vector<double> f_scratch;
+    std::vector<double> rho_scratch;
+    std::vector<double> u_scratch;
 
     // ---- 便捷查询方法 ----
 
