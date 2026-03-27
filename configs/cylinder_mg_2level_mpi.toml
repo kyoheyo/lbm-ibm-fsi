@@ -4,13 +4,20 @@
 #
 # 场景  : 圆柱绕流，IBM-MDF，Re = 100
 # 网格  : 两层嵌套（L0 600×100 + L1 361×121，r=2）
-# 并行  : MPI 4进程，Y 方向 1D 切片（ny_blocks=4）
+# 并行  : MPI 4进程
 #
-# MPI 域分解：
-#   L0 粗网格 600×100 → 4进程，各持有 600×25 物理行（含幽灵行）
-#   切分方向：Y（ny_blocks=4），X 不切分（nx_blocks=1）
-#   L1 细网格在 run_multigrid_loop 中独立创建（当前设计为 rank-0 持有全部细层）
-#   幽灵层宽度：ibm_halo_width=2
+# ⚠  MPI + 多重网格并行策略说明（重要）
+# ---------------------------------------------------------------------------
+# 当前实现中，run_multigrid_loop 使用全局坐标范围构建 MgTree 根节点 extent，
+# 而 MPI "block" 模式下粗网格只持有局部分区，两者坐标系不兼容：
+#   - "block" + multigrid → C↔F fringe 耦合越界 → 数据错误
+#
+# 因此多重网格 MPI 配置必须使用 mode = "multigrid"，该模式下每进程各自持有
+# 完整的全局网格（退化为 independent），物理保真但 MPI 并行无加速效果。
+# 目的：验证 MPI 环境下多重网格结果与串行/OMP 版本一致性。
+#
+# 后续计划：修复 run_multigrid_loop 使其支持局部坐标下的 block 分解。
+# ---------------------------------------------------------------------------
 #
 # 网格层级：
 #   L0 : 600×100，  ω₀ ≈ 1.8868
@@ -18,10 +25,10 @@
 #
 # 运行：
 #   mpirun -n 4 ./lbm-fsi configs/cylinder_mg_2level_mpi.toml
+#   （每进程独立运行完整多重网格仿真，结果应与 serial 版本一致）
 #
 # 输出：
-#   分块快照 → output/cylinder_mg_2level_mpi/rank_{0..3}/fluid_*.npz
-#   合并快照 → output/cylinder_mg_2level_mpi/fluid_*.npz（rank-0 gather）
+#   各进程独立写出 → output/cylinder_mg_2level_mpi/（内容相同，rank-0 的为准）
 # =============================================================================
 
 [simulation]
@@ -71,13 +78,11 @@ n_iter       = 3
 write_interval = 200
 directory      = "output/cylinder_mg_2level_mpi"
 format         = "npz"
-combine_blocks = true   # rank-0 合并各块输出为全局快照
+combine_blocks = false  # multigrid/independent 模式下无效（无 block 分区）
 
 [mpi]
-mode           = "block"
-nx_blocks      = 1
-ny_blocks      = 4      # → mpirun -n 4
-ibm_halo_width = 2
+mode           = "multigrid" # 退化为 independent：每进程持有完整网格，物理正确
+                              # （"block" + multigrid 存在 extent 坐标系冲突，暂不支持）
 
 # -----------------------------------------------------------------------------
 # 多重网格配置
