@@ -241,7 +241,8 @@ fn run() -> Result<()> {
                 &cfg, mg_cfg, model, cm,
                 &mut grid, &mut solver,
                 &mut ibm_entries,
-                &output_dir, rank,
+                &mut mpi, partition, combine_blocks,
+                &output_dir, rank, nprocs,
             )?;
             if rank == 0 { println!("\nSimulation complete (multigrid mode)."); }
             if rank == 0 {
@@ -802,11 +803,6 @@ fn write_step_snapshot(
     }
 }
 
-        _ => output::write_snapshot_npz(grid, step, time, output_dir, partition)
-            .with_context(|| format!("failed to write NPZ snapshot (step {})", step)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 多重网格时间步主循环
 // ---------------------------------------------------------------------------
@@ -833,31 +829,119 @@ fn run_multigrid_loop(
     root_grid: &mut LbmGrid,
     root_solver: &mut LbmSolver,
     ibm_entries: &mut Vec<fsi::IbmEntry>,
+    mpi: &mut sim::MpiDecomp,
+    partition: Option<PartitionInfo>,
+    combine_blocks: bool,
     output_dir: &str,
     rank: i32,
+    nprocs: i32,
 ) -> Result<()> {
     use anyhow::anyhow;
 
-    let nx = cfg.fluid.nx as i32;
-    let ny = cfg.fluid.ny as i32;
+    // -----------------------------------------------------------------------
+    // Step 0: Determine root extent and coordinate conversion for MPI mode.
+    //
+    // In MPI block mode each rank holds a local partition of the global grid.
+    // The root MgTree extent uses LOCAL grid coordinates (including ghost rows)
+    // so that fringe coupling can safely read halo-exchanged neighbour data.
+    // Fine-level extents are clipped to the local physical domain and then
+    // converted from global → local grid coordinates.
+    //
+    // Coordinate convention (1D-Y block, n_ghost=1):
+    //   physical row j_glob ∈ [y_start_glob, y_start_glob + local_ny - 1]
+    //   local grid j = (j_glob - y_start_glob) + phys_y0  (1-based when phys_y0=1)
+    //   root extent:  y0 = 0 (south ghost),  y1 = grid_ny-1 (north ghost)
+    // -----------------------------------------------------------------------
+    let is_block_mpi = mpi.effective_mode == "block" && nprocs > 1;
 
-    // 1. 创建多重网格树（根节点 = 全局粗网格空间范围）
-    let mut tree = LbmMgTree::new(0, nx - 1, 0, ny - 1, 0, 0, false)
-        .ok_or_else(|| anyhow!("Failed to create MgTree for {}×{} root grid", nx, ny))?;
+    // Collect local partition geometry (all values in local grid coords).
+    let (root_x0, root_x1, root_y0, root_y1,
+         x_start_glob, y_start_glob,
+         phys_x0, phys_y0,
+         local_phys_nx, local_phys_ny) =
+        if is_block_mpi {
+            if let Some(ref d2) = mpi.decomp2d {
+                (0_i32, d2.grid_nx() - 1,
+                 0_i32, d2.grid_ny() - 1,
+                 d2.x_start(), d2.y_start(),
+                 d2.phys_x0(), d2.phys_y0(),
+                 d2.local_nx(), d2.local_ny())
+            } else {
+                (0, cfg.fluid.nx as i32 - 1, 0, cfg.fluid.ny as i32 - 1,
+                 0, 0, 0, 0,
+                 cfg.fluid.nx as i32, cfg.fluid.ny as i32)
+            }
+        } else {
+            (0, cfg.fluid.nx as i32 - 1, 0, cfg.fluid.ny as i32 - 1,
+             0, 0, 0, 0,
+             cfg.fluid.nx as i32, cfg.fluid.ny as i32)
+        };
 
-    // 2. 为每个细化层创建独立的 LatticeGrid + Solver
-    //    必须先将所有 LbmGrid 收集到 Vec（确保地址稳定），再创建 Solver，
-    //    因为 LbmSolver::new() 只借用 *mut 指针，不维持 Rust 借用。
-    //    omega 每细化一层递推：ω_f = 2·ω_c / (4 − ω_c)
+    // -----------------------------------------------------------------------
+    // Step 1: Create MgTree with the correct root extent.
+    // -----------------------------------------------------------------------
+    let mut tree = LbmMgTree::new(root_x0, root_x1, root_y0, root_y1, 0, 0, false)
+        .ok_or_else(|| anyhow!(
+            "Failed to create MgTree for root extent [{},{}]×[{},{}]",
+            root_x0, root_x1, root_y0, root_y1))?;
+
+    // -----------------------------------------------------------------------
+    // Step 2: Compute per-level local extents and create fine grids/solvers.
+    //
+    // `level_extents[i]` is `Some(x_lo, x_hi, y_lo, y_hi)` in local grid
+    // coords, or `None` when the level has no overlap with this rank's
+    // physical domain.  A placeholder 1×1 grid is allocated for skipped
+    // levels so that all three Vecs stay index-aligned.
+    // -----------------------------------------------------------------------
+    let mut level_extents: Vec<Option<(i32, i32, i32, i32)>> =
+        Vec::with_capacity(mg_cfg.levels.len());
     let mut fine_grids:   Vec<LbmGrid>   = Vec::with_capacity(mg_cfg.levels.len());
     let mut fine_solvers: Vec<LbmSolver> = Vec::with_capacity(mg_cfg.levels.len());
 
     let mut omega_parent = cfg.omega();
     for (i, level) in mg_cfg.levels.iter().enumerate() {
         let r = level.refine_ratio;
-        if r < 1 { return Err(anyhow!("level[{}]: refine_ratio must be >= 1 (got {})", i, r)); }
-        let fine_nx = (level.x_end - level.x_start) * r + 1;
-        let fine_ny = (level.y_end - level.y_start) * r + 1;
+        if r < 1 {
+            return Err(anyhow!("level[{}]: refine_ratio must be >= 1 (got {})", i, r));
+        }
+        // Advance omega chain regardless of whether this level is active on
+        // this rank, so that subsequent levels get consistent relaxation rates.
+        let omega_fine = 2.0 * omega_parent / (4.0 - omega_parent);
+        omega_parent = omega_fine;
+
+        // Compute extent in local grid coords, clipping to the local domain.
+        let (extent_local, fine_nx, fine_ny) = if is_block_mpi {
+            // Clip global level extent to local physical domain.
+            let g_x_lo = level.x_start.max(x_start_glob);
+            let g_x_hi = level.x_end  .min(x_start_glob + local_phys_nx - 1);
+            let g_y_lo = level.y_start.max(y_start_glob);
+            let g_y_hi = level.y_end  .min(y_start_glob + local_phys_ny - 1);
+
+            if g_x_lo > g_x_hi || g_y_lo > g_y_hi {
+                // No intersection: push a 1×1 placeholder and skip.
+                level_extents.push(None);
+                fine_grids.push(LbmGrid::new(1, 1, 1, model));
+                let fs = LbmSolver::new(fine_grids.last_mut().unwrap(), omega_fine, cm);
+                fine_solvers.push(fs);
+                continue;
+            }
+
+            // Convert global intersection → local grid coords.
+            let x_lo_l = (g_x_lo - x_start_glob) + phys_x0;
+            let x_hi_l = (g_x_hi - x_start_glob) + phys_x0;
+            let y_lo_l = (g_y_lo - y_start_glob) + phys_y0;
+            let y_hi_l = (g_y_hi - y_start_glob) + phys_y0;
+
+            let fnx = (g_x_hi - g_x_lo) * r + 1;
+            let fny = (g_y_hi - g_y_lo) * r + 1;
+            (Some((x_lo_l, x_hi_l, y_lo_l, y_hi_l)), fnx, fny)
+        } else {
+            // Serial / independent: use global coords directly (unchanged).
+            let fnx = (level.x_end - level.x_start) * r + 1;
+            let fny = (level.y_end - level.y_start) * r + 1;
+            (Some((level.x_start, level.x_end, level.y_start, level.y_end)), fnx, fny)
+        };
+
         if fine_nx <= 0 || fine_ny <= 0 {
             return Err(anyhow!(
                 "level[{}]: computed fine grid size {}×{} is invalid \
@@ -866,47 +950,72 @@ fn run_multigrid_loop(
                 level.x_start, level.x_end, level.y_start, level.y_end, r
             ));
         }
-        let omega_fine = 2.0 * omega_parent / (4.0 - omega_parent);
+
+        level_extents.push(extent_local);
         fine_grids.push(LbmGrid::new(fine_nx, fine_ny, 1, model));
-        // Solver 暂时从已入 Vec 的最后一个 grid 借用（内部只存 C++ 指针，借用立即结束）
         let fs = LbmSolver::new(fine_grids.last_mut().unwrap(), omega_fine, cm);
         fine_solvers.push(fs);
+
         if rank == 0 {
-            println!(
-                "  [MG] level {} : {}×{} (parent coords [{},{}]×[{},{}], r={}, ω={:.4})",
-                i + 1, fine_nx, fine_ny,
-                level.x_start, level.x_end, level.y_start, level.y_end, r, omega_fine
-            );
+            let (xl, xh, yl, yh) = extent_local.unwrap();
+            if is_block_mpi {
+                println!(
+                    "  [MG] level {} : {}×{} local \
+                     (global [{},{}]×[{},{}] → local [{},{}]×[{},{}], r={}, ω={:.4})",
+                    i + 1, fine_nx, fine_ny,
+                    level.x_start, level.x_end, level.y_start, level.y_end,
+                    xl, xh, yl, yh, r, omega_fine
+                );
+            } else {
+                println!(
+                    "  [MG] level {} : {}×{} (parent coords [{},{}]×[{},{}], r={}, ω={:.4})",
+                    i + 1, fine_nx, fine_ny,
+                    level.x_start, level.x_end, level.y_start, level.y_end, r, omega_fine
+                );
+            }
         }
-        omega_parent = omega_fine;
     }
 
-    // 3. 绑定根节点的 grid + solver
+    // -----------------------------------------------------------------------
+    // Step 3: Bind root node's grid + solver.
+    // -----------------------------------------------------------------------
     tree.set_grid_by_idx(0, root_grid);
     tree.set_solver_by_idx(0, root_solver);
 
-    // 4. 向树中添加细化层节点，绑定 grid + solver
-    //    nodes[0]=root, nodes[1]=levels[0], nodes[2]=levels[1], ...
-    //    parent_level: -1 → 线性链（level i 的父 = node i，即上一层）
-    //                  ≥0 → 显式指定父节点索引
+    // -----------------------------------------------------------------------
+    // Step 4: Add active fine levels to the tree.
+    //
+    // `node_map[i]` = actual tree node index for levels[i], or None if this
+    // rank has no overlap with that level.  When a parent level was skipped,
+    // the most recently active ancestor (or root) is used as parent.
+    // -----------------------------------------------------------------------
+    let mut node_map: Vec<Option<usize>> = vec![None; mg_cfg.levels.len()];
     for (i, level) in mg_cfg.levels.iter().enumerate() {
-        let parent_idx = if level.parent_level < 0 {
-            i   // 线性链：levels[i] 的父 = 节点索引 i（root=0 时 levels[0] 父为 0，等于根）
-        } else {
-            level.parent_level as usize
+        let Some((x_lo, x_hi, y_lo, y_hi)) = level_extents[i] else {
+            continue;
         };
+
+        // Resolve parent: -1 → linear chain (most recent active ancestor or root).
+        let parent_idx = if level.parent_level < 0 {
+            if i == 0 {
+                0 // root
+            } else {
+                (0..i).rev().find_map(|k| node_map[k]).unwrap_or(0)
+            }
+        } else {
+            let k = level.parent_level as usize;
+            node_map.get(k).and_then(|n| *n).unwrap_or(0)
+        };
+
         let node_idx = tree.add_child_level(
-            parent_idx,
-            level.x_start, level.x_end,
-            level.y_start, level.y_end,
-            0, 0,
-            level.refine_ratio,
+            parent_idx, x_lo, x_hi, y_lo, y_hi, 0, 0, level.refine_ratio,
         ).ok_or_else(|| anyhow!(
-            "Failed to add MgTree level {} (parent_idx={}, extent=[{},{}]×[{},{}])",
-            i + 1, parent_idx, level.x_start, level.x_end, level.y_start, level.y_end
+            "Failed to add MgTree level {} (parent_idx={}, local_extent=[{},{}]×[{},{}])",
+            i + 1, parent_idx, x_lo, x_hi, y_lo, y_hi
         ))?;
         tree.set_grid_by_idx(node_idx, &mut fine_grids[i]);
         tree.set_solver_by_idx(node_idx, &mut fine_solvers[i]);
+        node_map[i] = Some(node_idx);
     }
 
     if rank == 0 {
@@ -916,14 +1025,24 @@ fn run_multigrid_loop(
         );
     }
 
-    // 5. 主时间循环
+    // -----------------------------------------------------------------------
+    // Step 5: Time loop.
+    // -----------------------------------------------------------------------
     for step in 0..cfg.simulation.n_steps {
-        // IBM：每步先向粗网格展布浸入边界力
+        // IBM: spread body forces onto the coarse (root) grid.
         if !ibm_entries.is_empty() {
             step_ibm(cfg, root_grid, ibm_entries, step);
+
+            // MPI block mode: ghost-row force contributions must be reduced
+            // back to physical rows so each rank has a complete force field.
+            if is_block_mpi {
+                if let Some(ref mut d2) = mpi.decomp2d {
+                    lbm_bindings::ibm_halo_reduce_force_2d(root_grid, d2);
+                }
+            }
         }
 
-        // 多重网格递归推进（内部完成 collide-stream + C↔F 耦合）
+        // Multigrid recursive step (collide-stream + C↔F coupling at every level).
         let rc = tree.mg_step_recursive(mg_cfg.fringe_width);
         if rc != 0 && rank == 0 {
             eprintln!("[MG] mg_step_recursive failed (rc={}) at step {}", rc, step);
@@ -933,8 +1052,34 @@ fn run_multigrid_loop(
         let is_snap = step % cfg.output.write_interval == 0
             || step + 1 == cfg.simulation.n_steps;
 
-        if is_snap && rank == 0 {
-            write_step_snapshot(cfg, root_grid, step + 1, time, output_dir, None)?;
+        if is_snap {
+            if is_block_mpi {
+                // Each MPI rank writes its own physical partition.
+                write_step_snapshot(cfg, root_grid, step + 1, time, output_dir, partition)?;
+
+                // Optional: gather all partitions to rank-0 for a combined file.
+                if combine_blocks {
+                    if let Some(p) = partition {
+                        let (l_rho, l_ux, l_uy, _, _) =
+                            output::extract_physical_fields(root_grid, Some(p));
+                        let g_rho_r = output::gather_field_to_root(&l_rho, &p, 0);
+                        let g_ux_r  = output::gather_field_to_root(&l_ux,  &p, 0);
+                        let g_uy_r  = output::gather_field_to_root(&l_uy,  &p, 0);
+                        if let (Some((g_rho, gnx, gny)),
+                                Some((g_ux, _, _)),
+                                Some((g_uy, _, _))) = (g_rho_r, g_ux_r, g_uy_r)
+                        {
+                            output::write_global_snapshot_raw(
+                                &cfg.output.format, &g_rho, &g_ux, &g_uy, gnx, gny,
+                                step + 1, time, &cfg.output.directory,
+                            ).with_context(|| format!(
+                                "failed to write combined MG snapshot (step {})", step + 1))?;
+                        }
+                    }
+                }
+            } else if rank == 0 {
+                write_step_snapshot(cfg, root_grid, step + 1, time, output_dir, None)?;
+            }
         }
 
         if rank == 0 && (step == 0 || (step + 1) % cfg.output.write_interval == 0
