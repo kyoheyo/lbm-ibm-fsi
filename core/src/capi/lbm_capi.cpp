@@ -675,6 +675,15 @@ void lbm_mg_node_set_grid(MgNodeHandle* node, lbm::LatticeGrid* grid)
     reinterpret_cast<lbm::MgNode*>(node)->grid = grid;
 }
 
+/// 将 Solver 绑定到多重网格节点（mg_step_recursive 需要每层均设置 solver）。
+/// MgNode 不持有 Solver 的所有权；调用方负责 Solver 的生命周期。
+/// 若 node 为 nullptr，则为空操作。
+void lbm_mg_node_set_solver(MgNodeHandle* node, lbm::Solver* solver)
+{
+    if (!node) return;
+    reinterpret_cast<lbm::MgNode*>(node)->solver = solver;
+}
+
 /// 查询节点的空间范围
 int lbm_mg_node_x_start(const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.x_start : 0; }
 int lbm_mg_node_x_end  (const MgNodeHandle* h) { return h ? reinterpret_cast<const lbm::MgNode*>(h)->extent.x_end   : 0; }
@@ -790,6 +799,28 @@ double lbm_mg_omega_rescale(double omega_c)
         return lbm::mg_omega_rescale(omega_c);
     } catch (...) {
         return -1.0;
+    }
+}
+
+/// 递归多重网格时间步推进（Lagrava 2012 五步算法，任意嵌套深度）。
+///
+/// 从 node 节点向下递归推进整棵多重网格子树一个粗时间步：
+///   - 内部节点（有子节点）：推进自身 → 子循环（含 C→F temporal fringe BC）→ F→C 更新
+///   - 叶节点：直接调用 solver->step()
+///
+/// 每层 MPI 幽灵层交换由 Solver::step() 内部完成，无需额外 MPI 调用。
+///
+/// @param node          根节点（通常通过 lbm_mg_tree_root() 获取）
+/// @param fringe_width  fringe 宽度（细网格格子数，默认 2；向下递归传递）
+/// @return 0 表示成功，-1 表示参数错误（node 为 nullptr 或节点未绑定 solver/grid）
+int lbm_mg_step_recursive(MgNodeHandle* node, int fringe_width)
+{
+    if (!node) return -1;
+    try {
+        lbm::mg_step_recursive(*reinterpret_cast<lbm::MgNode*>(node), fringe_width);
+        return 0;
+    } catch (...) {
+        return -1;
     }
 }
 

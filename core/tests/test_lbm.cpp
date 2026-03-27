@@ -2059,6 +2059,228 @@ static int test_bc_wall_ownership_south_applied()
     return ok ? 0 : 1;
 }
 
+// ===========================================================================
+// 测试：mg_step_recursive — 递归多重网格时间步推进
+// ===========================================================================
+//
+// 验证目标：
+//   1. 叶节点：mg_step_recursive 等价于直接调用 solver.step()（步骤计数相同）
+//   2. 三层嵌套（root→lv1→lv2，加密比均为 2）：
+//      a. 每次 mg_step_recursive(root) 调用后，内部步骤计数满足
+//         root:1, lv1:2, lv2:4（lv1 做 2 次子循环，lv2 做 4 次子循环）
+//      b. 执行 N 步 mg_step_recursive(root) 后，每层累计调用次数分别为
+//         root:N, lv1:2N, lv2:4N
+//   3. 均匀流情形下质量守恒：每步后各层 Σρ 在机器精度内不变
+//   4. solver 未绑定时，调用 mg_step_recursive 应抛出 std::invalid_argument
+//
+// 注：测试中使用 Solver 的"步骤计数"替代物（每步调用 step() 后 grid 状态改变）。
+//    因为 Solver 没有内置计数器，我们在均匀流下执行多步并检查宏观量稳定性。
+// ===========================================================================
+static int test_mg_step_recursive()
+{
+    bool ok = true;
+
+    // -----------------------------------------------------------------
+    // 辅助：把 LatticeGrid 初始化为均匀流平衡态
+    // -----------------------------------------------------------------
+    auto init_equil = [](lbm::LatticeGrid& g, double rho, double ux, double uy) {
+        for (int n = 0; n < g.size(); ++n) {
+            g.rho[n]       = rho;
+            g.u[n * 2]     = ux;
+            g.u[n * 2 + 1] = uy;
+            for (int a = 0; a < lbm::d2q9::Q; ++a) {
+                const double ca[2] = {(double)lbm::d2q9::C[a][0],
+                                      (double)lbm::d2q9::C[a][1]};
+                const double uv[2] = {ux, uy};
+                g.f[n * lbm::d2q9::Q + a] =
+                    lbm::f_eq(lbm::d2q9::W[a], rho, ca, uv, 2);
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------
+    // 测试 A：叶节点 mg_step_recursive 等价于 solver.step()
+    // -----------------------------------------------------------------
+    {
+        const int nx = 16, ny = 16;
+        lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+        init_equil(g, 1.0, 0.0, 0.0);
+
+        lbm::MgTree tree({0, nx - 1, 0, ny - 1, 0, 0});
+        tree.root()->grid   = &g;
+        const double omega = 1.0;
+        lbm::Solver solver(g, omega);
+        tree.root()->solver = &solver;
+
+        // 叶节点：mg_step_recursive 应等价于 solver.step()
+        // 对均匀流，执行后 ρ 仍应为 1.0（平衡态自洽）
+        lbm::mg_step_recursive(*tree.root());
+
+        double sum_rho = 0.0;
+        for (int n = 0; n < g.size(); ++n) sum_rho += g.rho[n];
+        const double mean_rho = sum_rho / g.size();
+        ok &= (std::abs(mean_rho - 1.0) < 1e-10);
+    }
+
+    // -----------------------------------------------------------------
+    // 测试 B：三层嵌套 (root→lv1→lv2，r=2 at each level)
+    //   - 均匀流平衡态，周期流（仅碰撞），无边界条件
+    //   - 执行 mg_step_recursive(root) 3 次
+    //   - 检查每层质量守恒
+    // -----------------------------------------------------------------
+    {
+        // 网格尺寸（使用较小尺寸以保证测试速度）
+        // 粗网格：16×16，lv1 的细网格覆盖粗网格中心：r=2 → lv1 尺寸 = 2*(8) = 16×16
+        // lv2 覆盖 lv1 中心：r=2 → lv2 尺寸 = 2*(4) = 8×8
+        const int cnx = 16, cny = 16;
+
+        // lv1 的粗格范围：粗坐标 [4,11]×[4,11]，r=2 → 细网格尺寸 = (11-4+1)*2 = 16
+        const int lv1_x0 = 4, lv1_x1 = 11, lv1_y0 = 4, lv1_y1 = 11;
+        const int fnx1 = (lv1_x1 - lv1_x0 + 1) * 2;  // = 16
+        const int fny1 = (lv1_y1 - lv1_y0 + 1) * 2;  // = 16
+
+        // lv2 的 lv1 坐标范围（lv1 本地坐标 → 粗格）：
+        // 在 lv1 粗坐标 [6,9]×[6,9]，r=2 → lv2 细网格尺寸 = (9-6+1)*2 = 8
+        const int lv2_x0 = 6, lv2_x1 = 9, lv2_y0 = 6, lv2_y1 = 9;
+        const int fnx2 = (lv2_x1 - lv2_x0 + 1) * 2;  // = 8
+        const int fny2 = (lv2_y1 - lv2_y0 + 1) * 2;  // = 8
+
+        lbm::LatticeGrid g0(cnx, cny, 1, lbm::LatticeModel::D2Q9);
+        lbm::LatticeGrid g1(fnx1, fny1, 1, lbm::LatticeModel::D2Q9);
+        lbm::LatticeGrid g2(fnx2, fny2, 1, lbm::LatticeModel::D2Q9);
+
+        const double rho_c = 1.00, rho_l1 = 1.00, rho_l2 = 1.00;
+        init_equil(g0, rho_c,  0.0, 0.0);
+        init_equil(g1, rho_l1, 0.0, 0.0);
+        init_equil(g2, rho_l2, 0.0, 0.0);
+
+        // 构建树（全局粗坐标系）
+        lbm::MgTree tree({0, cnx - 1, 0, cny - 1, 0, 0});
+        auto* lv1 = tree.add_level(tree.root(),
+                                   {lv1_x0, lv1_x1, lv1_y0, lv1_y1, 0, 0}, 2);
+        auto* lv2 = tree.add_level(lv1,
+                                   {lv2_x0, lv2_x1, lv2_y0, lv2_y1, 0, 0}, 2);
+
+        // 绑定网格
+        tree.root()->grid = &g0;
+        lv1->grid = &g1;
+        lv2->grid = &g2;
+
+        // 求解器（omega_c = 1.0，lv1/lv2 omega 按 mg_omega_rescale 计算）
+        const double omega_c  = 1.0;
+        const double omega_l1 = lbm::mg_omega_rescale(omega_c);
+        const double omega_l2 = lbm::mg_omega_rescale(omega_l1);
+
+        lbm::Solver solver0(g0, omega_c);
+        lbm::Solver solver1(g1, omega_l1);
+        lbm::Solver solver2(g2, omega_l2);
+
+        tree.root()->solver = &solver0;
+        lv1->solver         = &solver1;
+        lv2->solver         = &solver2;
+
+        // 记录初始总质量（每层均匀流，均值应保持不变）
+        auto sum_rho = [](const lbm::LatticeGrid& g) {
+            double s = 0.0;
+            for (int n = 0; n < g.size(); ++n) s += g.rho[n];
+            return s;
+        };
+        const double mass0_init = sum_rho(g0);
+        const double mass1_init = sum_rho(g1);
+        const double mass2_init = sum_rho(g2);
+
+        // 执行 3 步递归多重网格推进
+        for (int step = 0; step < 3; ++step) {
+            lbm::mg_step_recursive(*tree.root());
+        }
+
+        // 检查质量守恒（均匀流无外力，且各层初始 ρ 相同，fringe 耦合不引入净质量差）
+        // 机器精度容差（双精度 eps ≈ 2.2e-16，grid.size() 个节点的累积误差）
+        const double mass_tol = g0.size() * 1e-12;
+        ok &= (std::abs(sum_rho(g0) - mass0_init) < mass_tol);
+        ok &= (std::abs(sum_rho(g1) - mass1_init) < mass_tol);
+        ok &= (std::abs(sum_rho(g2) - mass2_init) < mass_tol);
+
+        // f 值应有限（无 NaN/Inf）
+        auto all_finite = [](const lbm::LatticeGrid& g) {
+            for (auto v : g.f) if (!std::isfinite(v)) return false;
+            return true;
+        };
+        ok &= all_finite(g0);
+        ok &= all_finite(g1);
+        ok &= all_finite(g2);
+
+        // 验证层次结构：max_level = 2，node_count = 3
+        ok &= (tree.max_level() == 2);
+        ok &= (tree.node_count() == 3);
+    }
+
+    // -----------------------------------------------------------------
+    // 测试 C：solver 未绑定时应抛出 std::invalid_argument
+    // -----------------------------------------------------------------
+    {
+        const int nx = 8, ny = 8;
+        lbm::LatticeGrid g(nx, ny, 1, lbm::LatticeModel::D2Q9);
+        lbm::MgTree tree({0, nx - 1, 0, ny - 1, 0, 0});
+        tree.root()->grid = &g;
+        // solver = nullptr（未绑定）
+        bool threw = false;
+        try {
+            lbm::mg_step_recursive(*tree.root());
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        } catch (...) {
+            threw = true;  // 任何异常都说明错误检测起效
+        }
+        ok &= threw;
+    }
+
+    // -----------------------------------------------------------------
+    // 测试 D：MPI 透明性验证（单进程 MpiDecomp2D，nprocs=1）
+    //   确认绑定 MpiDecomp2D 后 mg_step_recursive 仍正常运行
+    // -----------------------------------------------------------------
+    {
+        const int nx = 16, ny = 16;
+        lbm::LatticeGrid g0(nx, ny, 1, lbm::LatticeModel::D2Q9);
+        lbm::LatticeGrid g1(8, 8, 1, lbm::LatticeModel::D2Q9);
+
+        init_equil(g0, 1.0, 0.0, 0.0);
+        init_equil(g1, 1.0, 0.0, 0.0);
+
+        lbm::MgTree tree({0, nx - 1, 0, ny - 1, 0, 0});
+        auto* lv1 = tree.add_level(tree.root(), {4, 7, 4, 7, 0, 0}, 2);
+        tree.root()->grid = &g0;
+        lv1->grid = &g1;
+
+        const double omega_c = 1.0;
+        lbm::Solver s0(g0, omega_c);
+        lbm::Solver s1(g1, lbm::mg_omega_rescale(omega_c));
+        tree.root()->solver = &s0;
+        lv1->solver = &s1;
+
+        // 单进程 MpiDecomp2D（nprocs=1，rank=0）
+        lbm::MpiDecomp2D decomp = lbm::MpiDecomp2D::create(nx, ny, 1, 1, /*n_ghost=*/1);
+        s0.attach_mpi2d(&decomp);
+        // lv1 无 MPI（单进程局部细化，直接运行）
+
+        bool threw_mpi = false;
+        try {
+            lbm::mg_step_recursive(*tree.root());
+        } catch (...) {
+            threw_mpi = true;
+        }
+        ok &= !threw_mpi;  // 绑定 MPI 后不应抛出异常
+
+        // f 有限
+        for (auto v : g0.f) ok &= std::isfinite(v);
+        for (auto v : g1.f) ok &= std::isfinite(v);
+    }
+
+    std::printf("[MgTree] mg_step_recursive (3-level recursive + MPI transparent): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int test_lbm_main()
 {
     int failures = 0;
@@ -2097,6 +2319,7 @@ int test_lbm_main()
     failures += test_mg_apply_fringe_bc_temporal();
     failures += test_bc_wall_ownership_filter();
     failures += test_bc_wall_ownership_south_applied();
+    failures += test_mg_step_recursive();
     if (failures == 0)
         std::printf("1: All tests PASSED\n");
     return failures;

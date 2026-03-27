@@ -468,6 +468,66 @@ inline int mg_subcycle_steps(const MgNode& node) {
 int mg_total_subcycle_steps(const MgNode& node);
 
 // ---------------------------------------------------------------------------
+// 递归多重网格时间步推进（Lagrava 2012 五步算法，任意嵌套深度）
+// ---------------------------------------------------------------------------
+
+/// @brief 从给定节点向下递归推进整棵多重网格子树一个粗时间步。
+///
+/// 实现 Lagrava 2012 Algorithm（5 步子循环法），支持**任意层数**的递归嵌套：
+///   - 每个内部节点（有子节点）：先推进自身一个时间步，再对每个子节点做 refine_ratio
+///     次子循环（每次子循环之间插入 C→F 时间+空间双重插值耦合），最后做 F→C 更新。
+///   - 叶节点（无子节点）：直接调用 solver->step()，不做任何耦合。
+///
+/// **算法（对加密比 r 的节点）：**
+///   1. 保存当前 f/ρ/u → 暂存缓冲区（用于时间插值的 t 时刻参考）
+///   2. node.solver->step()                    （推进 t → t + δtc；含 MPI 幽灵层交换）
+///   3. 对每个子节点 child（加密比 child.refine_ratio = r）：
+///        k = 1..r 次子步循环：
+///          if k > 1：mg_apply_fringe_bc_temporal(prev, node, child, t_alpha=(k-1)/r)
+///          mg_step_recursive(child, fringe_width)  （递归处理子节点自身的子树）
+///        mg_couple_fine_to_coarse(child, node)     （F→C 更新粗网格 fringe 区域）
+///
+/// **MPI 并行透明性：**
+///   每层的 MPI 幽灵层交换由 Solver::step() 内部自动完成（通过 attach_mpi2d /
+///   attach_mpi1d 绑定的 MpiDecomp）。调用方只需对每层的 Solver 调用 attach_mpi2d()，
+///   mg_step_recursive 即可在任意层数下并行运行，无需额外 MPI 调用。
+///
+/// **前提条件（Pre-conditions）：**
+///   - node.solver != nullptr（每层均须绑定求解器）
+///   - node.grid   != nullptr（每层均须绑定 LatticeGrid）
+///   - 所有子节点及其后代满足相同条件
+///   - node.grid->model == D2Q9（当前实现仅支持 D2Q9）
+///
+/// @param node          当前层节点（递归入口，通常为树根节点）
+/// @param fringe_width  耦合 fringe 宽度（细网格格子数，默认 2；透明地向下传递）
+///
+/// @throws std::invalid_argument 若 node.solver 或 node.grid 为 nullptr
+///
+/// ### 典型用法（三层 2D 嵌套，MPI 2 进程）：
+/// @code
+///   // 创建层次：root(256×256) → lv1(128×128, r=2) → lv2(64×64, r=2)
+///   MgTree tree({0,255,0,255,0,0});
+///   auto* lv1 = tree.add_level(tree.root(), {64,191,64,191,0,0}, 2);
+///   auto* lv2 = tree.add_level(lv1,         {96,159,96,159,0,0}, 2);
+///
+///   // 绑定网格和求解器（MPI 版本）
+///   tree.root()->grid = &coarse_grid;  tree.root()->solver = &coarse_solver;
+///   lv1->grid = &mid_grid;             lv1->solver = &mid_solver;
+///   lv2->grid = &fine_grid;            lv2->solver = &fine_solver;
+///
+///   // MPI 绑定（各层独立分解）
+///   coarse_solver.attach_mpi2d(&coarse_decomp);
+///   mid_solver.attach_mpi2d(&mid_decomp);
+///   fine_solver.attach_mpi2d(&fine_decomp);
+///
+///   // 主时间循环
+///   for (int t = 0; t < n_steps; ++t) {
+///       mg_step_recursive(*tree.root());
+///   }
+/// @endcode
+void mg_step_recursive(MgNode& node, int fringe_width = 2);
+
+// ---------------------------------------------------------------------------
 // AMR 自适应网格细化标记与判据
 // ---------------------------------------------------------------------------
 

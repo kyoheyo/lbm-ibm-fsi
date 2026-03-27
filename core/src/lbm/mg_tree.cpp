@@ -798,4 +798,101 @@ void mg_compute_refinement_indicator(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 递归多重网格时间步推进（Lagrava 2012 五步算法）
+// ---------------------------------------------------------------------------
+//
+// 算法（对加密比 r 的内部节点）：
+//   1. 保存当前 f/ρ/u 到暂存缓冲区（时间插值参考 t 时刻）
+//   2. node.solver->step()           推进 t → t+δtc（含 MPI 幽灵层交换）
+//   3. 创建 prev_node：借用暂存缓冲区表示 t 时刻状态（O(1) swap，无深拷贝）
+//   4. 对每个子节点 child（r = child.refine_ratio）：
+//        for k = 1..r:
+//          if k > 1: mg_apply_fringe_bc_temporal(prev_node, node, child, (k-1)/r)
+//          mg_step_recursive(child)     （递归处理子树）
+//        mg_couple_fine_to_coarse(child, node)   （F→C 更新粗 fringe 区域）
+//   5. 归还暂存缓冲区（swap 回）
+//
+// MPI 并行透明性：
+//   Solver::step() 内部已处理 halo_exchange，mg_step_recursive 不需要额外 MPI 调用。
+//   每层独立地绑定 MpiDecomp，通过 solver.attach_mpi2d()/attach_mpi1d() 设置。
+// ---------------------------------------------------------------------------
+void mg_step_recursive(MgNode& node, int fringe_width)
+{
+    if (!node.solver) {
+        throw std::invalid_argument("mg_step_recursive: node.solver must not be nullptr");
+    }
+    if (!node.grid) {
+        throw std::invalid_argument("mg_step_recursive: node.grid must not be nullptr");
+    }
+
+    // 叶节点：直接推进，无需耦合
+    if (node.is_leaf()) {
+        node.solver->step();
+        return;
+    }
+
+    LatticeGrid& g = *node.grid;
+
+    // 步骤 1：保存 t 时刻状态（懒分配暂存缓冲区）
+    node.f_scratch  .assign(g.f  .begin(), g.f  .end());
+    node.rho_scratch.assign(g.rho.begin(), g.rho.end());
+    node.u_scratch  .assign(g.u  .begin(), g.u  .end());
+
+    // 步骤 2：推进当前节点 t → t+δtc（MPI halo exchange 在 step() 内部完成）
+    node.solver->step();
+
+    // 步骤 3：构建 prev_node（代表 t 时刻状态），通过 swap 借用暂存缓冲区（O(1)，无拷贝）
+    // 临时 LatticeGrid 仅用于在 mg_apply_fringe_bc_temporal 中提供 t 时刻 f/ρ/u 读取
+    LatticeGrid prev_g;
+    prev_g.nx    = g.nx;
+    prev_g.ny    = g.ny;
+    prev_g.nz    = g.nz;
+    prev_g.q     = g.q;
+    prev_g.model = g.model;
+    std::swap(prev_g.f,   node.f_scratch);   // prev_g 持有 t 时刻 f
+    std::swap(prev_g.rho, node.rho_scratch);
+    std::swap(prev_g.u,   node.u_scratch);
+
+    MgNode prev_node;
+    prev_node.extent       = node.extent;
+    prev_node.level        = node.level;
+    prev_node.refine_ratio = node.refine_ratio;
+    prev_node.dim          = node.dim;
+    prev_node.grid         = &prev_g;
+
+    const double omega_c = node.solver->omega();
+
+    // 步骤 4：对每个子节点执行 refine_ratio 次子循环 + F→C 更新
+    for (MgNode* child : node.children) {
+        if (!child->solver || !child->grid) {
+            // 安全跳过未完全初始化的子节点（用户仅构建结构不运行的情况）
+            continue;
+        }
+
+        const int r = child->refine_ratio;
+
+        // k 次细步子循环
+        for (int k = 1; k <= r; ++k) {
+            // 在第 2..r 次细步之前，用时间+空间双重插值更新 fringe BC
+            // t_alpha = (k-1)/r：在 t 时刻（k=1 之前=0）和 t+δtc（k=r 之后=1）之间插值
+            if (k > 1) {
+                const double t_alpha = static_cast<double>(k - 1) / static_cast<double>(r);
+                mg_apply_fringe_bc_temporal(prev_node, node, *child,
+                                            t_alpha, fringe_width, omega_c);
+            }
+            // 递归推进子节点（若子节点也有子节点，会再次递归）
+            mg_step_recursive(*child, fringe_width);
+        }
+
+        // 步骤 5：F→C 耦合——用细网格 f 更新粗网格 fringe 区域（论文 Eqs. 7-8）
+        mg_couple_fine_to_coarse(*child, node, fringe_width, omega_c);
+    }
+
+    // 步骤 5（收尾）：归还暂存缓冲区（swap 回，保留已分配内存以供下次使用）
+    std::swap(prev_g.f,   node.f_scratch);
+    std::swap(prev_g.rho, node.rho_scratch);
+    std::swap(prev_g.u,   node.u_scratch);
+}
+
 } // namespace lbm
