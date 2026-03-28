@@ -571,6 +571,115 @@ fn run_time_loop(
 /// 每个体的方法参数优先使用体级覆盖（`[[ibm.bodies]]` 中的 `method`/`n_iter`/
 /// `alpha`/`beta` 字段），未设置时继承全局 `[ibm]` 设置。这允许同一仿真中
 /// 不同 IBM 体使用不同的力计算方案，以便直接对比各方法的效果。
+/// Apply IBM force computation for a **single** IBM body onto `grid`.
+///
+/// Unlike [`step_ibm`] this does NOT zero the force field first, so the
+/// caller is responsible for zeroing each target grid exactly once before
+/// calling this for all bodies assigned to that grid.
+fn step_ibm_single(cfg: &Config, grid: &mut LbmGrid, entry: &mut fsi::IbmEntry, step: u64) {
+    let dx = 1.0_f64;
+    let dt = cfg.simulation.dt;
+    let t  = step as f64 * dt;
+
+    match entry.motion_type {
+        MotionType::RigidFree => {
+            if let Some(rb) = &entry.rigid_body {
+                let (cx, cy, ux_cm, uy_cm, _theta, omega) = rb.state();
+                entry.cx = cx;
+                entry.cy = cy;
+                entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+            }
+        }
+        MotionType::Prescribed => {
+            if let Some(ref pm) = entry.prescribed {
+                let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                let cx = entry.cx;
+                let cy = entry.cy;
+                if omega != 0.0 {
+                    entry.theta += omega * dt;
+                    let cos_th = entry.theta.cos();
+                    let sin_th = entry.theta.sin();
+                    let n = entry.init_bx.len();
+                    let bx: Vec<f64> = (0..n).map(|k| {
+                        let rx = entry.init_bx[k] - entry.cx;
+                        let ry = entry.init_by[k] - entry.cy;
+                        entry.cx + rx * cos_th - ry * sin_th
+                    }).collect();
+                    let by: Vec<f64> = (0..n).map(|k| {
+                        let rx = entry.init_bx[k] - entry.cx;
+                        let ry = entry.init_by[k] - entry.cy;
+                        entry.cy + rx * sin_th + ry * cos_th
+                    }).collect();
+                    entry.ms.update_positions(&bx, &by);
+                }
+                entry.ms.set_rigid_body_targets(cx, cy, ux_cm, uy_cm, omega);
+            }
+        }
+        MotionType::Flexible => {
+            if let Some(ref bs) = entry.beam_solver {
+                let (vx, vy) = bs.marker_velocities(&entry.beam_s);
+                entry.ms.set_marker_targets(&vx, &vy);
+            } else if let Some(ref pm) = entry.prescribed {
+                let (vx, vy) = pm.eval_markers(t, &entry.beam_s);
+                entry.ms.set_marker_targets(&vx, &vy);
+            }
+        }
+        _ => {}
+    }
+
+    match entry.method.to_lowercase().as_str() {
+        "penalty"          => entry.ms.step_penalty(grid, dx, dt, entry.alpha, entry.beta),
+        "mls"              => entry.ms.step_mls(grid, dx, dt),
+        "mls_original"     => entry.ms.step_mls_original(grid, dx, dt),
+        "mls_explicit"     => entry.ms.step_mls_explicit(grid, dx, dt),
+        "ivc"              => entry.ms.step_ivc(grid, dx, dt),
+        "ivc_stationary"   => entry.ms.step_ivc_stationary(grid, dx, dt),
+        _                  => entry.ms.step_mdf(grid, dx, dt, entry.n_iter),
+    }
+
+    match entry.motion_type {
+        MotionType::RigidFree => {
+            if let Some(rb) = &mut entry.rigid_body {
+                if rb.n_internal() > 0 {
+                    let (ix, iy) = rb.internal_positions();
+                    let (iux, iuy) = grid.interpolate_at_points(&ix, &iy, dx);
+                    rb.set_internal_velocities(&iux, &iuy);
+                    rb.compute_internal_momentum();
+                }
+                let cx = entry.cx;
+                let cy = entry.cy;
+                let (ftot_x, ftot_y, ttot) = entry.ms.compute_body_force_and_torque(cx, cy);
+                rb.advance(-ftot_x, -ftot_y, -ttot, dt);
+                let (bx, by) = rb.boundary_positions();
+                entry.ms.update_positions(&bx, &by);
+            }
+        }
+        MotionType::Prescribed => {
+            if let Some(ref pm) = entry.prescribed {
+                let (ux_cm, uy_cm, omega) = pm.eval_rigid(t);
+                if omega == 0.0 && (ux_cm != 0.0 || uy_cm != 0.0) {
+                    let (cur_bx, cur_by) = entry.ms.get_positions();
+                    let new_bx: Vec<f64> = cur_bx.iter().map(|&x| x + ux_cm * dt).collect();
+                    let new_by: Vec<f64> = cur_by.iter().map(|&y| y + uy_cm * dt).collect();
+                    entry.ms.update_positions(&new_bx, &new_by);
+                    entry.cx += ux_cm * dt;
+                    entry.cy += uy_cm * dt;
+                }
+            }
+        }
+        MotionType::Flexible => {
+            if let Some(ref mut bs) = entry.beam_solver {
+                let (ibm_fx, ibm_fy) = entry.ms.get_forces();
+                let arc_s = entry.beam_s.clone();
+                bs.advance(&ibm_fx, &ibm_fy, &arc_s);
+                let (bx, by) = bs.marker_positions(&arc_s);
+                entry.ms.update_positions(&bx, &by);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry], step: u64) {
     let dx = 1.0_f64;
     let dt = cfg.simulation.dt;
@@ -1102,7 +1211,7 @@ fn run_multigrid_loop(
             //   fine_local = (root_coord - root_xs) * cumulative_scale
             // ----------------------------------------------------------------
             if !cfg.solid.bodies.is_empty() {
-                let (root_xs, _, root_ys, _, cum_scale) = level_root_info[i];
+                let (root_xs, root_xe, root_ys, root_ye, cum_scale) = level_root_info[i];
                 let fine_nx = fine_grids[i].nx();
                 let fine_ny = fine_grids[i].ny();
                 let sf = cum_scale as f64;
@@ -1117,6 +1226,43 @@ fn run_multigrid_loop(
                         _ => 0,
                     };
                     if body_bc_mode == 0 { continue; }
+
+                    // ----------------------------------------------------------
+                    // Cross-level detection: error if the solid body's bounding
+                    // box partially overlaps this fine level without being fully
+                    // contained inside it.  Coordinates are in root-grid units.
+                    // ----------------------------------------------------------
+                    let (bb_x0, bb_x1, bb_y0, bb_y1): (f64, f64, f64, f64) =
+                        match body.shape.to_lowercase().as_str() {
+                            "cylinder" | "circle" => (
+                                body.cx - body.radius, body.cx + body.radius,
+                                body.cy - body.radius, body.cy + body.radius,
+                            ),
+                            "rectangle" => (
+                                body.i0 as f64, body.i1 as f64,
+                                body.j0 as f64, body.j1 as f64,
+                            ),
+                            _ => continue,
+                        };
+                    let lx0 = root_xs as f64;
+                    let lx1 = root_xe as f64;
+                    let ly0 = root_ys as f64;
+                    let ly1 = root_ye as f64;
+                    let overlaps_x = bb_x0 < lx1 && bb_x1 > lx0;
+                    let overlaps_y = bb_y0 < ly1 && bb_y1 > ly0;
+                    let contained  = bb_x0 >= lx0 && bb_x1 <= lx1
+                                  && bb_y0 >= ly0 && bb_y1 <= ly1;
+                    if overlaps_x && overlaps_y && !contained {
+                        return Err(anyhow!(
+                            "[solid BB] body shape='{}' spans the boundary of MG level {} \
+                             (level root extent x=[{},{}] y=[{},{}], body bbox x=[{:.2},{:.2}] \
+                             y=[{:.2},{:.2}]). Move the body fully inside or outside the \
+                             refinement region.",
+                            body.shape, i + 1,
+                            root_xs, root_xe, root_ys, root_ye,
+                            bb_x0, bb_x1, bb_y0, bb_y1
+                        ));
+                    }
 
                     match body.shape.to_lowercase().as_str() {
                         "cylinder" | "circle" => {
@@ -1178,18 +1324,158 @@ fn run_multigrid_loop(
     }
 
     // -----------------------------------------------------------------------
+    // Step 4.5: IBM level assignment (serial / independent MG mode only).
+    //
+    // For each IBM body:
+    //   1. Compute bounding box of Lagrangian markers in ROOT grid coords.
+    //   2. Find the finest MG level whose root-coord extent fully contains it.
+    //   3. Error if the body straddles a level boundary (partial overlap).
+    //   4. Scale marker positions (and centre coords) from root to fine-grid
+    //      local coords so that step_ibm uses the correct lattice spacing.
+    //
+    // `ibm_level_assign[k]` = index into fine_grids/fine_solvers for body k,
+    // or -1 meaning "apply on root grid".
+    //
+    // Note: moving IBM bodies (RigidFree / Prescribed) are kept on the root
+    // grid; only stationary bodies are migrated to fine grids.
+    // -----------------------------------------------------------------------
+    let ibm_level_assign: Vec<i32> = if !is_block_mpi && !ibm_entries.is_empty() {
+        let mut assign: Vec<i32> = vec![-1i32; ibm_entries.len()];
+        for (body_idx, entry) in ibm_entries.iter_mut().enumerate() {
+            // Moving bodies stay on root grid for now (scaling velocity/force
+            // across grid levels for dynamic bodies is non-trivial).
+            let is_moving = !matches!(entry.motion_type, MotionType::Fixed);
+            if is_moving { continue; }
+
+            let (bx, by) = entry.ms.get_positions();
+            if bx.is_empty() { continue; }
+
+            let root_bx_lo = bx.iter().cloned().fold(f64::INFINITY,     f64::min);
+            let root_bx_hi = bx.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let root_by_lo = by.iter().cloned().fold(f64::INFINITY,     f64::min);
+            let root_by_hi = by.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            // Iterate from finest level (last) to coarsest (first).
+            let mut finest: i32 = -1;
+            let mut cross_level_err: Option<String> = None;
+
+            for li in (0..mg_cfg.levels.len()).rev() {
+                if level_extents[li].is_none() { continue; }
+                let (lx0, lx1, ly0, ly1, _) = level_root_info[li];
+                let (lx0, lx1, ly0, ly1) =
+                    (lx0 as f64, lx1 as f64, ly0 as f64, ly1 as f64);
+
+                let overlaps_x = root_bx_lo < lx1 && root_bx_hi > lx0;
+                let overlaps_y = root_by_lo < ly1 && root_by_hi > ly0;
+                let contained  = root_bx_lo >= lx0 && root_bx_hi <= lx1
+                               && root_by_lo >= ly0 && root_by_hi <= ly1;
+
+                if overlaps_x && overlaps_y && !contained {
+                    cross_level_err = Some(format!(
+                        "[IBM] body[{}] '{}' crosses the boundary of MG level {} \
+                         (level root extent x=[{},{}] y=[{},{}], marker bbox \
+                         x=[{:.2},{:.2}] y=[{:.2},{:.2}]). \
+                         Move the body fully inside or outside the refinement region.",
+                        body_idx, entry.label, li + 1,
+                        lx0 as i32, lx1 as i32, ly0 as i32, ly1 as i32,
+                        root_bx_lo, root_bx_hi, root_by_lo, root_by_hi
+                    ));
+                    break;
+                }
+
+                if contained && finest < 0 {
+                    finest = li as i32;
+                    // Don't break — check coarser levels for cross-level spans too.
+                }
+            }
+
+            if let Some(msg) = cross_level_err {
+                return Err(anyhow!("{}", msg));
+            }
+
+            if finest >= 0 {
+                let li = finest as usize;
+                let (root_xs, _, root_ys, _, cum_scale) = level_root_info[li];
+                let sf = cum_scale as f64;
+
+                // Scale all marker positions from root coords to fine-grid local coords.
+                let fine_bx: Vec<f64> = bx.iter().map(|&x| (x - root_xs as f64) * sf).collect();
+                let fine_by: Vec<f64> = by.iter().map(|&y| (y - root_ys as f64) * sf).collect();
+                entry.ms.update_positions(&fine_bx, &fine_by);
+                entry.cx = (entry.cx - root_xs as f64) * sf;
+                entry.cy = (entry.cy - root_ys as f64) * sf;
+                for x in entry.init_bx.iter_mut() { *x = (*x - root_xs as f64) * sf; }
+                for y in entry.init_by.iter_mut() { *y = (*y - root_ys as f64) * sf; }
+
+                assign[body_idx] = finest;
+
+                if rank == 0 {
+                    println!(
+                        "  [IBM-MG] body[{}] '{}' → fine level {} \
+                         (cum_scale={}, root_origin=[{},{}])",
+                        body_idx, entry.label, li + 1, cum_scale, root_xs, root_ys
+                    );
+                }
+            } else if rank == 0 {
+                println!("  [IBM-MG] body[{}] '{}' → root grid", body_idx, entry.label);
+            }
+        }
+        assign
+    } else {
+        // MPI block mode or no IBM: all bodies on root grid.
+        vec![-1i32; ibm_entries.len()]
+    };
+
+    // -----------------------------------------------------------------------
     // Step 5: Time loop.
     // -----------------------------------------------------------------------
     for step in 0..cfg.simulation.n_steps {
-        // IBM: spread body forces onto the coarse (root) grid.
+        // IBM: spread body forces onto the appropriate grid level.
         if !ibm_entries.is_empty() {
-            step_ibm(cfg, root_grid, ibm_entries, step);
+            // In non-MPI MG mode we may need to route individual IBM bodies to
+            // their assigned fine-grid levels.  In all other modes every body
+            // goes to root_grid (ibm_level_assign is all -1).
+            let any_on_fine = ibm_level_assign.iter().any(|&l| l >= 0);
 
-            // MPI block mode: ghost-row force contributions must be reduced
-            // back to physical rows so each rank has a complete force field.
-            if is_block_mpi {
-                if let Some(ref mut d2) = mpi.decomp2d {
-                    lbm_bindings::ibm_halo_reduce_force_2d(root_grid, d2);
+            if !is_block_mpi && any_on_fine {
+                // -- Zero force on every grid that will receive IBM forces. --
+                root_grid.zero_force();
+                for &lvl in ibm_level_assign.iter().filter(|&&l| l >= 0) {
+                    fine_grids[lvl as usize].zero_force();
+                }
+
+                // -- Apply each IBM body to its assigned grid. --
+                // Process root-grid bodies first (no borrow conflict).
+                let dt  = cfg.simulation.dt;
+                let _dx = 1.0_f64;
+                for (body_idx, entry) in ibm_entries.iter_mut().enumerate() {
+                    let lvl = ibm_level_assign[body_idx];
+                    if lvl < 0 {
+                        step_ibm_single(cfg, root_grid, entry, step);
+                    }
+                }
+                // Then process fine-grid bodies (one level at a time to avoid
+                // double-mutable-borrow on fine_grids).
+                let n_levels = mg_cfg.levels.len();
+                for li in 0..n_levels {
+                    let any = ibm_level_assign.iter().any(|&l| l == li as i32);
+                    if !any { continue; }
+                    for (body_idx, entry) in ibm_entries.iter_mut().enumerate() {
+                        if ibm_level_assign[body_idx] == li as i32 {
+                            step_ibm_single(cfg, &mut fine_grids[li], entry, step);
+                        }
+                    }
+                }
+                let _ = dt;
+            } else {
+                step_ibm(cfg, root_grid, ibm_entries, step);
+
+                // MPI block mode: ghost-row force contributions must be reduced
+                // back to physical rows so each rank has a complete force field.
+                if is_block_mpi {
+                    if let Some(ref mut d2) = mpi.decomp2d {
+                        lbm_bindings::ibm_halo_reduce_force_2d(root_grid, d2);
+                    }
                 }
             }
         }
