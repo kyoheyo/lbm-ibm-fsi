@@ -428,6 +428,9 @@ mod ffi {
             out_ux: *mut f64, out_uy: *mut f64);
         pub fn lbm_ibm_update_marker_positions(ms: *mut IbmMarkerSetHandle,
             x: *const f64, y: *const f64, n: c_int);
+        /// 将所有标记点的弧长元素 ds 乘以 scale_factor。
+        /// 用于将 IBM 标记点从粗网格坐标映射到细网格坐标时同步缩放 ds。
+        pub fn lbm_ibm_scale_ds(ms: *mut IbmMarkerSetHandle, scale_factor: f64);
 
         // --- IBM 柔性体逐标记点目标速度 ---
         /// 设置所有标记点的统一目标速度（静止体：0,0）。
@@ -1706,6 +1709,19 @@ impl LbmIbmMarkerSet {
     pub fn update_positions(&mut self, x: &[f64], y: &[f64]) {
         let n = x.len().min(y.len()).min(self.n_markers) as i32;
         unsafe { ffi::lbm_ibm_update_marker_positions(self.ptr, x.as_ptr(), y.as_ptr(), n) }
+    }
+
+    /// 将所有标记点的弧长元素 `ds` 乘以 `scale_factor`。
+    ///
+    /// 当 IBM 标记点从粗网格（根坐标）映射到细网格本地坐标时，
+    /// 调用 [`update_positions`] 之后还须调用本函数，以保证 `ds` 与
+    /// 细网格格间距一致：`ds_fine = ds_coarse × cumulative_scale`。
+    ///
+    /// 这对 MLS-IBM 等直接依赖 `ds` 构建线性系统的方法尤为重要；
+    /// 对 MDF-IBM（多重直接力），`ds` 值通过迭代自动补偿，
+    /// 缩放后收敛更快，展布面积也更合理。
+    pub fn scale_ds(&mut self, scale_factor: f64) {
+        unsafe { ffi::lbm_ibm_scale_ds(self.ptr, scale_factor) }
     }
 
     /// 读取所有标记点的插值流体速度（最近一次 IBM step 后的值）。

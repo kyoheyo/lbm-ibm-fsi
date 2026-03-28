@@ -1432,6 +1432,10 @@ fn run_multigrid_loop(
                 let fine_bx: Vec<f64> = bx.iter().map(|&x| (x - root_xs as f64) * sf).collect();
                 let fine_by: Vec<f64> = by.iter().map(|&y| (y - root_ys as f64) * sf).collect();
                 entry.ms.update_positions(&fine_bx, &fine_by);
+                // Scale arc-length elements (ds) to match fine-grid lattice spacing.
+                // Each ds_fine = ds_root * cum_scale, which ensures marker coverage
+                // and correct force density in MLS / penalty IBM methods.
+                entry.ms.scale_ds(sf);
                 entry.cx = (entry.cx - root_xs as f64) * sf;
                 entry.cy = (entry.cy - root_ys as f64) * sf;
                 for x in entry.init_bx.iter_mut() { *x = (*x - root_xs as f64) * sf; }

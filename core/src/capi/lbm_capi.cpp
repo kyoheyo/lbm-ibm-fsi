@@ -2338,5 +2338,22 @@ void lbm_ibm_update_marker_positions(IbmMarkerSetHandle* ms,
     }
 }
 
+/// 将所有标记点的弧长元素 ds 乘以 scale_factor。
+///
+/// 当 IBM 标记点从粗网格（根坐标）映射到细网格本地坐标时，
+/// 位置坐标乘以 cumulative_scale，ds 也应同步乘以相同因子，
+/// 以保证展布面积元素与细网格格间距一致（ds_fine = ds_coarse * cumulative_scale）。
+///
+/// @param ms           标记点集句柄
+/// @param scale_factor 缩放因子（通常 = cumulative_scale，即从粗到细的累积加密比）
+void lbm_ibm_scale_ds(IbmMarkerSetHandle* ms, double scale_factor)
+{
+    if (!ms || scale_factor <= 0.0) return;
+    auto* marker_set = reinterpret_cast<ibm::MarkerSet*>(ms);
+    for (auto& mk : marker_set->markers) {
+        mk.ds *= scale_factor;
+    }
+}
+
 } // extern "C" (RigidBody2D + IBM moving helpers)
 
