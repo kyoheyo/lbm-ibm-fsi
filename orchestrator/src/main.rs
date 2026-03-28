@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use config::Config;
-use lbm_bindings::{CollisionModel, Face, LatticeModel, LbmGrid, LbmIbmMarkerSet, LbmMgTree, LbmSolver};
+use lbm_bindings::{CollisionModel, Face, LatticeModel, LbmGrid, LbmMgTree, LbmSolver};
 use crate::config::MotionType;
 use output::PartitionInfo;
 
