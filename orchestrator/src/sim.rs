@@ -405,7 +405,7 @@ pub fn register_boundary_conditions(
 // ---------------------------------------------------------------------------
 
 /// 将边界条件类型字符串转换为 [`BcType`]。
-fn parse_bc_type(s: &str) -> BcType {
+pub(crate) fn parse_bc_type(s: &str) -> BcType {
     match s.to_lowercase().as_str() {
         "bounce_back"          => BcType::BounceBack,
         "bounce_back_full_way" => BcType::BounceBackFullWay,
@@ -423,7 +423,7 @@ fn parse_bc_type(s: &str) -> BcType {
 }
 
 /// 将面名称字符串转换为 [`Face`]。
-fn parse_face(s: &str) -> Face {
+pub(crate) fn parse_face(s: &str) -> Face {
     match s.to_lowercase().as_str() {
         "east"   => Face::East,
         "south"  => Face::South,

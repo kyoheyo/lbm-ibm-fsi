@@ -342,6 +342,12 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
     const int fnx = fg.nx;
     const int fny = fg.ny;
 
+    // 粗网格累积空间加密比：根节点到 coarse 节点所有 refine_ratio 的乘积。
+    // 例：root(r=1)→L1(r=2)→L2(r=2)，L1 as coarse → coarse_scale=2，L2 as coarse → 4。
+    // 用于将根坐标系下的整数坐标映射到 coarse 本地数组索引：
+    //   coarse_local = (root_coord − coarse.extent.x_start) * coarse_scale
+    const int coarse_scale = mg_total_subcycle_steps(coarse);
+
     // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = omega_c / (2.0 * omega_f);
@@ -356,7 +362,8 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
                                     jy < fringe_width || jy >= fny - fringe_width);
             if (!in_fringe) continue;
 
-            // 细节点在粗坐标系中的浮点位置
+            // 细节点在根坐标系中的浮点位置
+            // fine.extent.x_start 为根坐标（所有层的 extent 均以根坐标存储）
             const double px = fine.extent.x_start + static_cast<double>(ix) / r;
             const double py = fine.extent.y_start + static_cast<double>(jy) / r;
 
@@ -375,10 +382,11 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
                                 std::min(coarse.extent.y_end, cj));
             };
 
-            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
-            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
-            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
-            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+            // 将根坐标转换为粗网格本地数组索引：乘以 coarse_scale
+            const int ci00 = (clamp_ci(i0)     - coarse.extent.x_start) * coarse_scale;
+            const int ci10 = (clamp_ci(i0 + 1) - coarse.extent.x_start) * coarse_scale;
+            const int cj00 = (clamp_cj(j0)     - coarse.extent.y_start) * coarse_scale;
+            const int cj10 = (clamp_cj(j0 + 1) - coarse.extent.y_start) * coarse_scale;
 
             const int c00 = cg.idx(ci00, cj00);
             const int c10 = cg.idx(ci10, cj00);
@@ -484,6 +492,9 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
     const double alpha1 = 1.0 - t_alpha;   // weight for t (prev)
     const double alpha2 = t_alpha;           // weight for t+δtc (next)
 
+    // 粗网格累积空间加密比（同 mg_apply_fringe_bc 注释）
+    const int coarse_scale = mg_total_subcycle_steps(coarse);
+
     // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = omega_c / (2.0 * omega_f);
@@ -498,7 +509,7 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
                                     jy < fringe_width || jy >= fny - fringe_width);
             if (!in_fringe) continue;
 
-            // 细节点在粗坐标系中的浮点位置
+            // 细节点在根坐标系中的浮点位置
             const double px = fine.extent.x_start + static_cast<double>(ix) / r;
             const double py = fine.extent.y_start + static_cast<double>(jy) / r;
 
@@ -517,10 +528,11 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
                                 std::min(coarse.extent.y_end, cj));
             };
 
-            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
-            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
-            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
-            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+            // 将根坐标转换为粗网格本地数组索引（乘以 coarse_scale）
+            const int ci00 = (clamp_ci(i0)     - coarse.extent.x_start) * coarse_scale;
+            const int ci10 = (clamp_ci(i0 + 1) - coarse.extent.x_start) * coarse_scale;
+            const int cj00 = (clamp_cj(j0)     - coarse.extent.y_start) * coarse_scale;
+            const int cj10 = (clamp_cj(j0 + 1) - coarse.extent.y_start) * coarse_scale;
 
             const int c00 = cg.idx(ci00, cj00);
             const int c10 = cg.idx(ci10, cj00);
@@ -627,10 +639,13 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = 2.0 * omega_f / omega_c;
 
+    // 粗网格累积空间加密比（同 mg_apply_fringe_bc 注释）
+    const int coarse_scale = mg_total_subcycle_steps(coarse);
+
     // 粗网格 fringe 宽度（细 fringe_width 对应的粗格数，至少 1）
     const int coarse_fringe = std::max(1, (fringe_width + r - 1) / r);
 
-    // 细网格范围（粗坐标系）
+    // 细网格范围（根坐标系）
     const int fx_s = fine.extent.x_start;
     const int fx_e = fine.extent.x_end;
     const int fy_s = fine.extent.y_start;
@@ -645,10 +660,11 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
 #endif
     for (int jj = 0; jj < ny_count; ++jj) {
         for (int ii = 0; ii < nx_count; ++ii) {
-            const int jc_g = fy_s + jj;
-            const int ic_g = fx_s + ii;
-            const int jc_l = jc_g - coarse.extent.y_start;
-            const int ic_l = ic_g - coarse.extent.x_start;
+            const int jc_g = fy_s + jj;   // 根坐标
+            const int ic_g = fx_s + ii;   // 根坐标
+            // 粗网格本地数组索引：乘以 coarse_scale 以适应空间加密后的粗层
+            const int jc_l = (jc_g - coarse.extent.y_start) * coarse_scale;
+            const int ic_l = (ic_g - coarse.extent.x_start) * coarse_scale;
 
             // 判断是否在 fringe 内
             const bool in_j_fringe = (jc_g <= fy_s + coarse_fringe - 1 ||

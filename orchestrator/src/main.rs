@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use config::Config;
-use lbm_bindings::{CollisionModel, LatticeModel, LbmGrid, LbmIbmMarkerSet, LbmMgTree, LbmSolver};
+use lbm_bindings::{CollisionModel, Face, LatticeModel, LbmGrid, LbmIbmMarkerSet, LbmMgTree, LbmSolver};
 use crate::config::MotionType;
 use output::PartitionInfo;
 
@@ -898,6 +898,12 @@ fn run_multigrid_loop(
     let mut fine_grids:   Vec<LbmGrid>   = Vec::with_capacity(mg_cfg.levels.len());
     let mut fine_solvers: Vec<LbmSolver> = Vec::with_capacity(mg_cfg.levels.len());
 
+    // For non-MPI: track root-coord extents and cumulative spatial scale per level,
+    // needed to (a) convert parent-local config coords to root coords for add_child_level,
+    // and (b) mark solid bodies / register BCs on fine grids at correct positions.
+    // Each entry: (root_xs, root_xe, root_ys, root_ye, cumulative_scale).
+    let mut level_root_info: Vec<(i32, i32, i32, i32, i32)> = Vec::with_capacity(mg_cfg.levels.len());
+
     let mut omega_parent = cfg.omega();
     for (i, level) in mg_cfg.levels.iter().enumerate() {
         let r = level.refine_ratio;
@@ -911,6 +917,7 @@ fn run_multigrid_loop(
 
         // Compute extent in local grid coords, clipping to the local domain.
         let (extent_local, fine_nx, fine_ny) = if is_block_mpi {
+            // MPI block mode: config coords are already in global/root coords.
             // Clip global level extent to local physical domain.
             let g_x_lo = level.x_start.max(x_start_glob);
             let g_x_hi = level.x_end  .min(x_start_glob + local_phys_nx - 1);
@@ -920,6 +927,7 @@ fn run_multigrid_loop(
             if g_x_lo > g_x_hi || g_y_lo > g_y_hi {
                 // No intersection: push a 1×1 placeholder and skip.
                 level_extents.push(None);
+                level_root_info.push((level.x_start, level.x_end, level.y_start, level.y_end, r));
                 fine_grids.push(LbmGrid::new(1, 1, 1, model));
                 let fs = LbmSolver::new(fine_grids.last_mut().unwrap(), omega_fine, cm);
                 fine_solvers.push(fs);
@@ -934,12 +942,52 @@ fn run_multigrid_loop(
 
             let fnx = (g_x_hi - g_x_lo) * r + 1;
             let fny = (g_y_hi - g_y_lo) * r + 1;
+            level_root_info.push((level.x_start, level.x_end, level.y_start, level.y_end, r));
             (Some((x_lo_l, x_hi_l, y_lo_l, y_hi_l)), fnx, fny)
         } else {
-            // Serial / independent: use global coords directly (unchanged).
+            // Serial / independent: config coords are in PARENT'S fine-grid local
+            // coordinate system.  Convert to root coords using accumulated info.
+            //
+            // parent_level semantics (tree node index):
+            //   0         → root grid
+            //   k (k ≥ 1) → levels[k-1]  (tree node k was added as levels[k-1])
+            //   -1        → auto linear chain: most recently added level (or root)
+            let (p_xs, p_ys, p_scale) = if level.parent_level <= 0 {
+                // Parent is root: root coords start at (0,0), scale = 1.
+                (0_i32, 0_i32, 1_i32)
+            } else {
+                let pj = level.parent_level as usize - 1; // levels[] index of parent
+                if pj < level_root_info.len() {
+                    let pi = &level_root_info[pj];
+                    (pi.0, pi.2, pi.4)  // (root_xs, root_ys, cumulative_scale)
+                } else {
+                    (0_i32, 0_i32, 1_i32)
+                }
+            };
+            // For parent_level == -1 (auto), use the most recently added entry.
+            let (p_xs, p_ys, p_scale) = if level.parent_level < 0 {
+                if level_root_info.is_empty() {
+                    (0_i32, 0_i32, 1_i32)
+                } else {
+                    let pi = level_root_info.last().unwrap();
+                    (pi.0, pi.2, pi.4)
+                }
+            } else {
+                (p_xs, p_ys, p_scale)
+            };
+
+            // Convert parent-local fine-grid coords to root coords.
+            // Parent's fine-grid local ix → root coord: p_xs + ix / p_scale
+            let root_xs = p_xs + level.x_start / p_scale;
+            let root_xe = p_xs + level.x_end   / p_scale;
+            let root_ys = p_ys + level.y_start / p_scale;
+            let root_ye = p_ys + level.y_end   / p_scale;
+            let cumulative_scale = p_scale * r;
+
             let fnx = (level.x_end - level.x_start) * r + 1;
             let fny = (level.y_end - level.y_start) * r + 1;
-            (Some((level.x_start, level.x_end, level.y_start, level.y_end)), fnx, fny)
+            level_root_info.push((root_xs, root_xe, root_ys, root_ye, cumulative_scale));
+            (Some((root_xs, root_xe, root_ys, root_ye)), fnx, fny)
         };
 
         if fine_nx <= 0 || fine_ny <= 0 {
@@ -968,9 +1016,9 @@ fn run_multigrid_loop(
                 );
             } else {
                 println!(
-                    "  [MG] level {} : {}×{} (parent coords [{},{}]×[{},{}], r={}, ω={:.4})",
+                    "  [MG] level {} : {}×{} (root coords [{},{}]×[{},{}], r={}, ω={:.4})",
                     i + 1, fine_nx, fine_ny,
-                    level.x_start, level.x_end, level.y_start, level.y_end, r, omega_fine
+                    xl, xh, yl, yh, r, omega_fine
                 );
             }
         }
@@ -995,7 +1043,12 @@ fn run_multigrid_loop(
             continue;
         };
 
-        // Resolve parent: -1 → linear chain (most recent active ancestor or root).
+        // Resolve parent tree node index.
+        //
+        // parent_level is a TREE NODE index (0 = root):
+        //   0         → root
+        //   k (k ≥ 1) → tree node k  (= levels[k-1], added before this level)
+        //   -1        → auto linear chain (most recent active ancestor or root)
         let parent_idx = if level.parent_level < 0 {
             if i == 0 {
                 0 // root
@@ -1003,19 +1056,118 @@ fn run_multigrid_loop(
                 (0..i).rev().find_map(|k| node_map[k]).unwrap_or(0)
             }
         } else {
-            let k = level.parent_level as usize;
-            node_map.get(k).and_then(|n| *n).unwrap_or(0)
+            // Direct tree-node-index lookup: parent_level IS the tree node index.
+            level.parent_level as usize
         };
 
         let node_idx = tree.add_child_level(
             parent_idx, x_lo, x_hi, y_lo, y_hi, 0, 0, level.refine_ratio,
         ).ok_or_else(|| anyhow!(
-            "Failed to add MgTree level {} (parent_idx={}, local_extent=[{},{}]×[{},{}])",
+            "Failed to add MgTree level {} (parent_idx={}, root_extent=[{},{}]×[{},{}]). \
+             Ensure fine level extents are within parent extent (all in root coords).",
             i + 1, parent_idx, x_lo, x_hi, y_lo, y_hi
         ))?;
         tree.set_grid_by_idx(node_idx, &mut fine_grids[i]);
         tree.set_solver_by_idx(node_idx, &mut fine_solvers[i]);
         node_map[i] = Some(node_idx);
+
+        // ----------------------------------------------------------------
+        // Register fluid boundary conditions on fine grids that touch
+        // global domain boundaries.  Only applies to non-MPI serial mode;
+        // in MPI block mode BCs are handled by the root/partition grid.
+        // ----------------------------------------------------------------
+        if !is_block_mpi {
+            let (root_xs, root_xe, root_ys, root_ye, _) = level_root_info[i];
+            for bc_cfg in &cfg.fluid.boundary_conditions {
+                let face = sim::parse_face(&bc_cfg.face);
+                let touches = match face {
+                    Face::West  => root_xs == 0,
+                    Face::East  => root_xe >= cfg.fluid.nx as i32 - 1,
+                    Face::South => root_ys == 0,
+                    Face::North => root_ye >= cfg.fluid.ny as i32 - 1,
+                    _           => false,
+                };
+                if touches {
+                    let bc_type = sim::parse_bc_type(&bc_cfg.bc_type);
+                    fine_solvers[i].add_boundary_condition(
+                        bc_type, face, bc_cfg.ux, bc_cfg.uy, 0.0, bc_cfg.rho);
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Mark solid bounce-back / IBB bodies on fine grids.
+            //
+            // The solid body coordinates in the root grid are mapped to
+            // fine-grid local positions using the cumulative scale and origin:
+            //   fine_local = (root_coord - root_xs) * cumulative_scale
+            // ----------------------------------------------------------------
+            if !cfg.solid.bodies.is_empty() {
+                let (root_xs, _, root_ys, _, cum_scale) = level_root_info[i];
+                let fine_nx = fine_grids[i].nx();
+                let fine_ny = fine_grids[i].ny();
+                let sf = cum_scale as f64;
+
+                for body in &cfg.solid.bodies {
+                    // Per-body bc_type overrides global solid.bc_type.
+                    let bc_str = body.bc_type.as_deref()
+                        .unwrap_or(&cfg.solid.bc_type);
+                    let body_bc_mode: i32 = match bc_str.to_lowercase().as_str() {
+                        "bounce_back" | "bb"  => 1,
+                        "interpolated_bounce_back" | "ibb" | "bouzidi" => 2,
+                        _ => 0,
+                    };
+                    if body_bc_mode == 0 { continue; }
+
+                    match body.shape.to_lowercase().as_str() {
+                        "cylinder" | "circle" => {
+                            let fine_cx = (body.cx - root_xs as f64) * sf;
+                            let fine_cy = (body.cy - root_ys as f64) * sf;
+                            let fine_r  = body.radius * sf;
+                            // Only mark if the cylinder might overlap the fine grid.
+                            if fine_cx + fine_r >= 0.0 && fine_cx - fine_r < fine_nx as f64
+                                && fine_cy + fine_r >= 0.0 && fine_cy - fine_r < fine_ny as f64
+                            {
+                                lbm_bindings::mark_solid_cylinder(
+                                    &mut fine_grids[i], fine_cx, fine_cy, fine_r);
+                                lbm_bindings::assign_solid_bc_unmarked(
+                                    &mut fine_grids[i], body_bc_mode);
+                            }
+                        }
+                        "rectangle" => {
+                            let fi0 = ((body.i0 - root_xs) * cum_scale).max(0);
+                            let fj0 = ((body.j0 - root_ys) * cum_scale).max(0);
+                            let fi1 = ((body.i1 - root_xs) * cum_scale).min(fine_nx - 1);
+                            let fj1 = ((body.j1 - root_ys) * cum_scale).min(fine_ny - 1);
+                            if fi0 <= fi1 && fj0 <= fj1 {
+                                lbm_bindings::mark_solid_rectangle(
+                                    &mut fine_grids[i], fi0, fj0, fi1, fj1);
+                                lbm_bindings::assign_solid_bc_unmarked(
+                                    &mut fine_grids[i], body_bc_mode);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Activate solid BC on this fine solver.
+                // Determine the global (non-moving) BC mode for this solver.
+                let has_moving = cfg.solid.bodies.iter().any(|b| {
+                    matches!(b.motion_type, MotionType::RigidFree | MotionType::Prescribed)
+                });
+                let global_bc_mode: i32 = if has_moving {
+                    0
+                } else {
+                    match cfg.solid.bc_type.to_lowercase().as_str() {
+                        "bounce_back" | "bb" => 1,
+                        "interpolated_bounce_back" | "ibb" | "bouzidi" => 2,
+                        _ => 0,
+                    }
+                };
+                if global_bc_mode != 0 {
+                    lbm_bindings::mark_solid_bc(&mut fine_solvers[i], global_bc_mode);
+                }
+            }
+        }
     }
 
     if rank == 0 {
