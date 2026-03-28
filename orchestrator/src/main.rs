@@ -1248,23 +1248,37 @@ fn run_multigrid_loop(
                             ),
                             _ => continue,
                         };
+
+                    // Clip bounding box to root-domain [0, nx-1]×[0, ny-1].
+                    // A body at the domain wall may have bb_x0 < 0 or bb_y0 < 0
+                    // (cylinder centre on the boundary minus radius). These
+                    // out-of-domain portions are absorbed by the wall BC and must
+                    // not trigger a false cross-level error.
+                    let dom_x1 = cfg.fluid.nx as f64 - 1.0;
+                    let dom_y1 = cfg.fluid.ny as f64 - 1.0;
+                    let bb_xc0 = bb_x0.max(0.0).min(dom_x1);
+                    let bb_xc1 = bb_x1.max(0.0).min(dom_x1);
+                    let bb_yc0 = bb_y0.max(0.0).min(dom_y1);
+                    let bb_yc1 = bb_y1.max(0.0).min(dom_y1);
+
                     let lx0 = root_xs as f64;
                     let lx1 = root_xe as f64;
                     let ly0 = root_ys as f64;
                     let ly1 = root_ye as f64;
-                    let overlaps_x = bb_x0 < lx1 && bb_x1 > lx0;
-                    let overlaps_y = bb_y0 < ly1 && bb_y1 > ly0;
-                    let contained  = bb_x0 >= lx0 && bb_x1 <= lx1
-                                  && bb_y0 >= ly0 && bb_y1 <= ly1;
+                    let overlaps_x = bb_xc0 < lx1 && bb_xc1 > lx0;
+                    let overlaps_y = bb_yc0 < ly1 && bb_yc1 > ly0;
+                    let contained  = bb_xc0 >= lx0 && bb_xc1 <= lx1
+                                  && bb_yc0 >= ly0 && bb_yc1 <= ly1;
                     if overlaps_x && overlaps_y && !contained {
                         return Err(anyhow!(
                             "[solid BB] body shape='{}' spans the boundary of MG level {} \
                              (level root extent x=[{},{}] y=[{},{}], body bbox x=[{:.2},{:.2}] \
-                             y=[{:.2},{:.2}]). Move the body fully inside or outside the \
-                             refinement region.",
+                             y=[{:.2},{:.2}], clipped to domain x=[{:.2},{:.2}] y=[{:.2},{:.2}]). \
+                             Move the body fully inside or outside the refinement region.",
                             body.shape, i + 1,
                             root_xs, root_xe, root_ys, root_ye,
-                            bb_x0, bb_x1, bb_y0, bb_y1
+                            bb_x0, bb_x1, bb_y0, bb_y1,
+                            bb_xc0, bb_xc1, bb_yc0, bb_yc1,
                         ));
                     }
 
@@ -1369,20 +1383,32 @@ fn run_multigrid_loop(
                 let (lx0, lx1, ly0, ly1) =
                     (lx0 as f64, lx1 as f64, ly0 as f64, ly1 as f64);
 
-                let overlaps_x = root_bx_lo < lx1 && root_bx_hi > lx0;
-                let overlaps_y = root_by_lo < ly1 && root_by_hi > ly0;
-                let contained  = root_bx_lo >= lx0 && root_bx_hi <= lx1
-                               && root_by_lo >= ly0 && root_by_hi <= ly1;
+                // Clip marker bounding box to root-domain [0, nx-1]×[0, ny-1].
+                // IBM Lagrangian markers for bodies at the domain wall may extend
+                // slightly outside the domain; those out-of-domain portions are
+                // absorbed by the wall BC and must not trigger a false cross-level error.
+                let dom_x1 = cfg.fluid.nx as f64 - 1.0;
+                let dom_y1 = cfg.fluid.ny as f64 - 1.0;
+                let bx_lo_c = root_bx_lo.max(0.0).min(dom_x1);
+                let bx_hi_c = root_bx_hi.max(0.0).min(dom_x1);
+                let by_lo_c = root_by_lo.max(0.0).min(dom_y1);
+                let by_hi_c = root_by_hi.max(0.0).min(dom_y1);
+
+                let overlaps_x = bx_lo_c < lx1 && bx_hi_c > lx0;
+                let overlaps_y = by_lo_c < ly1 && by_hi_c > ly0;
+                let contained  = bx_lo_c >= lx0 && bx_hi_c <= lx1
+                               && by_lo_c >= ly0 && by_hi_c <= ly1;
 
                 if overlaps_x && overlaps_y && !contained {
                     cross_level_err = Some(format!(
                         "[IBM] body[{}] '{}' crosses the boundary of MG level {} \
                          (level root extent x=[{},{}] y=[{},{}], marker bbox \
-                         x=[{:.2},{:.2}] y=[{:.2},{:.2}]). \
+                         x=[{:.2},{:.2}] y=[{:.2},{:.2}], clipped x=[{:.2},{:.2}] y=[{:.2},{:.2}]). \
                          Move the body fully inside or outside the refinement region.",
                         body_idx, entry.label, li + 1,
                         lx0 as i32, lx1 as i32, ly0 as i32, ly1 as i32,
-                        root_bx_lo, root_bx_hi, root_by_lo, root_by_hi
+                        root_bx_lo, root_bx_hi, root_by_lo, root_by_hi,
+                        bx_lo_c, bx_hi_c, by_lo_c, by_hi_c,
                     ));
                     break;
                 }
@@ -1527,6 +1553,114 @@ fn run_multigrid_loop(
         if rank == 0 && (step == 0 || (step + 1) % cfg.output.write_interval == 0
                          || step + 1 == cfg.simulation.n_steps) {
             println!("  step {:>6} / {}  t = {:.3}", step + 1, cfg.simulation.n_steps, time);
+        }
+
+        // -----------------------------------------------------------------------
+        // Output: CSV KE monitor (every step, rank-0 only in non-MPI MG mode).
+        // In MPI-block MG mode the MPI partition covers root_grid, so we pass
+        // partition for correct physical-range extraction.
+        // -----------------------------------------------------------------------
+        if cfg.output.enable_csv_monitor && rank == 0 {
+            let ke = compute_monitor_ke(root_grid, if is_block_mpi { partition } else { None });
+            output::append_monitor_csv(csv_path, step + 1, time, &[("ke", ke)])
+                .with_context(|| format!("Failed to write MG monitor CSV at step {}", step + 1))?;
+        }
+
+        // -----------------------------------------------------------------------
+        // Output: global solid BB/IBB force (root grid).
+        // -----------------------------------------------------------------------
+        if !solid_entries.is_empty()
+            && cfg.solid.force_output.enabled
+            && (step % cfg.solid.force_output.interval == 0
+                || step + 1 == cfg.simulation.n_steps)
+        {
+            let (pi0, pj0, pi1, pj1) = if is_block_mpi {
+                if let Some(p) = partition {
+                    (p.phys_x0 as i32, p.phys_y0 as i32,
+                     (p.phys_x0 + p.local_nx - 1) as i32,
+                     (p.phys_y0 + p.local_ny - 1) as i32)
+                } else {
+                    (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                }
+            } else {
+                (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+            };
+            let (local_fx, local_fy) =
+                lbm_bindings::compute_solid_force(root_grid, pi0, pj0, pi1, pj1);
+            let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+            let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+            if rank == 0 {
+                let force_csv = format!("{}/{}.csv", output_dir, cfg.solid.force_output.filename);
+                output::append_monitor_csv(
+                    &force_csv, step + 1, time,
+                    &[("fx", global_fx), ("fy", global_fy)],
+                ).with_context(|| format!(
+                    "Failed to write MG global solid force CSV at step {}", step + 1))?;
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Output: per-body solid BB/IBB force.
+        // -----------------------------------------------------------------------
+        for entry in solid_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
+                    || step + 1 == cfg.simulation.n_steps)
+            {
+                let (pi0, pj0, pi1, pj1) = if is_block_mpi {
+                    if let Some(p) = partition {
+                        (p.phys_x0 as i32, p.phys_y0 as i32,
+                         (p.phys_x0 + p.local_nx - 1) as i32,
+                         (p.phys_y0 + p.local_ny - 1) as i32)
+                    } else {
+                        (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                    }
+                } else {
+                    (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                };
+                let (local_fx, local_fy) =
+                    lbm_bindings::compute_solid_force(root_grid, pi0, pj0, pi1, pj1);
+                let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+                let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
+                    output::append_monitor_csv(
+                        &force_csv, step + 1, time,
+                        &[("fx", global_fx), ("fy", global_fy)],
+                    ).with_context(|| format!(
+                        "Failed to write MG solid force CSV ({}) at step {}", entry.label, step + 1))?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Output: per-body IBM force.
+        //
+        // Force statistics come from the Lagrangian marker set: regardless of
+        // which grid level the IBM force was applied to, entry.ms.compute_body_force()
+        // returns the accumulated marker forces from the most recent step_ibm call.
+        // In MPI mode each rank contributes its local marker subset; Allreduce sums.
+        // -----------------------------------------------------------------------
+        for entry in ibm_entries.iter() {
+            if entry.force_cfg.enabled
+                && (step % entry.force_cfg.interval == 0
+                    || step + 1 == cfg.simulation.n_steps)
+            {
+                let (local_ibm_fx, local_ibm_fy) = entry.ms.compute_body_force();
+                let ibm_fx = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fx);
+                let ibm_fy = lbm_bindings::mpi_allreduce_sum_f64(local_ibm_fy);
+                // Newton 3rd law: drag on structure = -(force on fluid)
+                let drag_fx = -ibm_fx;
+                let drag_fy = -ibm_fy;
+                if rank == 0 {
+                    let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
+                    output::append_monitor_csv(
+                        &force_csv, step + 1, time,
+                        &[("ibm_fx", drag_fx), ("ibm_fy", drag_fy)],
+                    ).with_context(|| format!(
+                        "Failed to write MG IBM force CSV ({}) at step {}", entry.label, step + 1))?;
+                }
+            }
         }
     }
 
