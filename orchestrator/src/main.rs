@@ -237,12 +237,14 @@ fn run() -> Result<()> {
     if let Some(ref mg_cfg) = cfg.multigrid.clone() {
         if mg_cfg.enabled && !mg_cfg.levels.is_empty() {
             // 多重网格运行路径：以 mg_step_recursive 替代单层 solver.step()
+            let csv_path_mg = format!("{}/monitor.csv", output_dir);
             run_multigrid_loop(
                 &cfg, mg_cfg, model, cm,
                 &mut grid, &mut solver,
+                &mut solid_entries,
                 &mut ibm_entries,
                 &mut mpi, partition, combine_blocks,
-                &output_dir, rank, nprocs,
+                &output_dir, &csv_path_mg, rank, nprocs,
             )?;
             if rank == 0 { println!("\nSimulation complete (multigrid mode)."); }
             if rank == 0 {
@@ -937,11 +939,13 @@ fn run_multigrid_loop(
     cm: CollisionModel,
     root_grid: &mut LbmGrid,
     root_solver: &mut LbmSolver,
+    solid_entries: &mut Vec<fsi::SolidEntry>,
     ibm_entries: &mut Vec<fsi::IbmEntry>,
     mpi: &mut sim::MpiDecomp,
     partition: Option<PartitionInfo>,
     combine_blocks: bool,
     output_dir: &str,
+    csv_path: &str,
     rank: i32,
     nprocs: i32,
 ) -> Result<()> {
