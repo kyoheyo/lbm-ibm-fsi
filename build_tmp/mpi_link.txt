@@ -1,0 +1,2 @@
+lib:/usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so
+lib:/usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so

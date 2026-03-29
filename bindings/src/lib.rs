@@ -204,6 +204,12 @@ mod ffi {
         pub fn lbm_mg_node_level  (h: *const MgNodeHandle) -> c_int;
         pub fn lbm_mg_node_refine_ratio(h: *const MgNodeHandle) -> c_int;
         pub fn lbm_mg_node_child_count (h: *const MgNodeHandle) -> c_int;
+        /// 查询细节点的域边界标志（由 MgTree::add_level 自动设置）。
+        /// 若某侧与全局流体域边界重合，则 C→F fringe 耦合跳过该侧。
+        pub fn lbm_mg_node_west_is_domain_wall (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_east_is_domain_wall (h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_south_is_domain_wall(h: *const MgNodeHandle) -> c_int;
+        pub fn lbm_mg_node_north_is_domain_wall(h: *const MgNodeHandle) -> c_int;
         /// 将 Solver 绑定到多重网格节点（mg_step_recursive 需要每层均设置 solver）。
         pub fn lbm_mg_node_set_solver(node: *mut MgNodeHandle, solver: *mut SolverHandle);
         /// 递归多重网格时间步推进（Lagrava 2012 五步算法）。
@@ -1166,6 +1172,23 @@ impl LbmMgTree {
     /// 返回树中所有节点数（包括根节点）
     pub fn node_count(&self) -> i32 {
         unsafe { ffi::lbm_mg_tree_node_count(self.ptr) }
+    }
+
+    /// 查询指定节点（索引 `idx`）的域边界标志。
+    ///
+    /// 返回 `(west, east, south, north)` 四元组布尔值：
+    /// `true` 表示该侧与全局流体域边界重合，C→F fringe 耦合将跳过该侧。
+    /// 若 `idx` 越界则返回全 `false`。
+    pub fn node_domain_walls(&self, idx: usize) -> (bool, bool, bool, bool) {
+        if let Some(&node) = self.nodes.get(idx) {
+            let w = unsafe { ffi::lbm_mg_node_west_is_domain_wall (node) } != 0;
+            let e = unsafe { ffi::lbm_mg_node_east_is_domain_wall (node) } != 0;
+            let s = unsafe { ffi::lbm_mg_node_south_is_domain_wall(node) } != 0;
+            let n = unsafe { ffi::lbm_mg_node_north_is_domain_wall(node) } != 0;
+            (w, e, s, n)
+        } else {
+            (false, false, false, false)
+        }
     }
 
     /// 执行一次递归多重网格时间步推进（从根节点开始，Lagrava 2012 五步算法）。

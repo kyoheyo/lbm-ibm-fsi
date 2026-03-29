@@ -149,6 +149,19 @@ struct MgNode {
     /// MgNode 不持有分解对象的所有权，调用方负责管理生命周期。
     std::variant<std::monostate, MpiDecomp2D*, MpiDecomp3D*> decomp;
 
+    /// 域边界标志：该细网格的哪些边与全局流体域边界重合。
+    ///
+    /// 当某侧与域边界重合时，`mg_apply_fringe_bc` / `mg_apply_fringe_bc_temporal`
+    /// 将跳过该侧的 fringe 插值，让该侧的域边界条件（注册于 fine.solver）
+    /// 独立控制边界节点分布函数；`mg_couple_fine_to_coarse` 也跳过向粗网格
+    /// 对应 fringe 区写入，保留粗网格由域 BC 设置的值。
+    ///
+    /// 根节点四侧均为域边界（均为 true）；非根节点由 MgTree::add_level 自动设置。
+    bool west_is_domain_wall  = false;
+    bool east_is_domain_wall  = false;
+    bool south_is_domain_wall = false;
+    bool north_is_domain_wall = false;
+
     /// 时间步暂存缓冲区（供 mg_step_recursive 保存时刻 t 的状态以用于时间插值）
     /// 由 mg_step_recursive 首次调用时自动分配（大小 = grid->f.size()）。
     /// 调用方不应直接读写这些字段。

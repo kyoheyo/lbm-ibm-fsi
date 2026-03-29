@@ -728,6 +728,15 @@ int lbm_mg_node_child_count (const MgNodeHandle* h) {
     return h ? static_cast<int>(reinterpret_cast<const lbm::MgNode*>(h)->children.size()) : 0;
 }
 
+/// 查询细节点的域边界标志（由 MgTree::add_level 自动设置）。
+/// 若某侧与全局流体域边界重合，则 C→F fringe 耦合会跳过该侧，
+/// 让 fine.solver 注册的域 BC 独立控制边界节点。
+/// 返回 1=true，0=false。
+int lbm_mg_node_west_is_domain_wall (const MgNodeHandle* h) { return h ? (reinterpret_cast<const lbm::MgNode*>(h)->west_is_domain_wall  ? 1 : 0) : 0; }
+int lbm_mg_node_east_is_domain_wall (const MgNodeHandle* h) { return h ? (reinterpret_cast<const lbm::MgNode*>(h)->east_is_domain_wall  ? 1 : 0) : 0; }
+int lbm_mg_node_south_is_domain_wall(const MgNodeHandle* h) { return h ? (reinterpret_cast<const lbm::MgNode*>(h)->south_is_domain_wall ? 1 : 0) : 0; }
+int lbm_mg_node_north_is_domain_wall(const MgNodeHandle* h) { return h ? (reinterpret_cast<const lbm::MgNode*>(h)->north_is_domain_wall ? 1 : 0) : 0; }
+
 /// 延拓算子：从粗网格双线性插值 ρ/u 到细网格。
 /// 两个节点必须均已绑定 LatticeGrid（通过 lbm_mg_node_set_grid 设置）。
 /// 返回 0 表示成功，-1 表示参数错误。

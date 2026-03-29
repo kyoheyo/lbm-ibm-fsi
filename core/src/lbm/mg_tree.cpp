@@ -61,6 +61,18 @@ MgNode* MgTree::add_level(MgNode* parent, MgExtent child_extent, int refine_rati
     node->refine_ratio  = refine_ratio;
     node->dim           = parent->dim;   // 继承父节点维度
     node->parent        = parent;
+
+    // -----------------------------------------------------------------------
+    // 设置域边界标志：检查子节点的每侧是否与全局域（根节点）的边界重合。
+    // 若重合，mg_apply_fringe_bc* 会跳过该侧的 fringe 插值，
+    // 让 fine.solver 注册的域 BC 独立控制那些节点；
+    // mg_couple_fine_to_coarse 也跳过向粗网格对应 fringe 区写入。
+    // -----------------------------------------------------------------------
+    node->west_is_domain_wall  = (child_extent.x_start == root_->extent.x_start);
+    node->east_is_domain_wall  = (child_extent.x_end   == root_->extent.x_end);
+    node->south_is_domain_wall = (child_extent.y_start == root_->extent.y_start);
+    node->north_is_domain_wall = (child_extent.y_end   == root_->extent.y_end);
+
     MgNode* ptr = node.get();
     parent->children.push_back(ptr);
     all_nodes_.push_back(std::move(node));
@@ -352,6 +364,13 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = omega_c / (2.0 * omega_f);
 
+    // 域边界标志：若某侧与全局域边界重合，则跳过该侧 fringe 的 C→F 插值，
+    // 保留该侧 fine.solver 的域 BC（Zou-He/BB 等）独立控制边界节点。
+    const bool skip_west  = fine.west_is_domain_wall;
+    const bool skip_east  = fine.east_is_domain_wall;
+    const bool skip_south = fine.south_is_domain_wall;
+    const bool skip_north = fine.north_is_domain_wall;
+
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
@@ -361,6 +380,14 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
             const bool in_fringe = (ix < fringe_width || ix >= fnx - fringe_width ||
                                     jy < fringe_width || jy >= fny - fringe_width);
             if (!in_fringe) continue;
+
+            // 若该 fringe 节点位于与全局域边界重合的一侧，跳过 C→F 插值。
+            // 该侧的边界条件由 fine.solver 注册的域 BC 独立施加。
+            const bool on_dom = (skip_west  && ix < fringe_width)
+                             || (skip_east  && ix >= fnx - fringe_width)
+                             || (skip_south && jy < fringe_width)
+                             || (skip_north && jy >= fny - fringe_width);
+            if (on_dom) continue;
 
             // 细节点在根坐标系中的浮点位置
             // fine.extent.x_start 为根坐标（所有层的 extent 均以根坐标存储）
@@ -499,6 +526,12 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
     const double omega_f = mg_omega_rescale(omega_c);
     const double scale   = omega_c / (2.0 * omega_f);
 
+    // 域边界标志：与 mg_apply_fringe_bc 相同，跳过与全局域边界重合侧的 fringe 插值。
+    const bool skip_west  = fine.west_is_domain_wall;
+    const bool skip_east  = fine.east_is_domain_wall;
+    const bool skip_south = fine.south_is_domain_wall;
+    const bool skip_north = fine.north_is_domain_wall;
+
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
@@ -508,6 +541,14 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
             const bool in_fringe = (ix < fringe_width || ix >= fnx - fringe_width ||
                                     jy < fringe_width || jy >= fny - fringe_width);
             if (!in_fringe) continue;
+
+            // 若该 fringe 节点位于域边界侧，跳过 C→F 时间插值；
+            // 该侧由 fine.solver 的域 BC 控制。
+            const bool on_dom = (skip_west  && ix < fringe_width)
+                             || (skip_east  && ix >= fnx - fringe_width)
+                             || (skip_south && jy < fringe_width)
+                             || (skip_north && jy >= fny - fringe_width);
+            if (on_dom) continue;
 
             // 细节点在根坐标系中的浮点位置
             const double px = fine.extent.x_start + static_cast<double>(ix) / r;
@@ -651,6 +692,13 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
     const int fy_s = fine.extent.y_start;
     const int fy_e = fine.extent.y_end;
 
+    // 域边界标志：若细网格某侧与全局域边界重合，跳过该侧的 F→C 写回，
+    // 保留粗网格由域 BC 设置的边界值（下次 coarse.solver->step() 会重新施加域 BC）。
+    const bool skip_west  = fine.west_is_domain_wall;
+    const bool skip_east  = fine.east_is_domain_wall;
+    const bool skip_south = fine.south_is_domain_wall;
+    const bool skip_north = fine.north_is_domain_wall;
+
     // 循环计数（闭区间 [fx_s, fx_e] 转为 0-based 以支持 OpenMP collapse）
     const int nx_count = fx_e - fx_s + 1;
     const int ny_count = fy_e - fy_s + 1;
@@ -672,6 +720,14 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
             const bool in_i_fringe = (ic_g <= fx_s + coarse_fringe - 1 ||
                                        ic_g >= fx_e - coarse_fringe + 1);
             if (!in_i_fringe && !in_j_fringe) continue;
+
+            // 若该粗 fringe 节点对应细网格的域边界侧，跳过 F→C 写回。
+            // 粗网格在该侧的域 BC 在下一次 coarse.solver->step() 中重新施加。
+            const bool on_dom = (skip_west  && ic_g <= fx_s + coarse_fringe - 1)
+                             || (skip_east  && ic_g >= fx_e - coarse_fringe + 1)
+                             || (skip_south && jc_g <= fy_s + coarse_fringe - 1)
+                             || (skip_north && jc_g >= fy_e - coarse_fringe + 1);
+            if (on_dom) continue;
 
             // 本粗节点在细网格中的本地索引
             const int if_loc = (ic_g - fx_s) * r;

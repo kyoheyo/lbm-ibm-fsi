@@ -1188,9 +1188,23 @@ fn run_multigrid_loop(
         // Register fluid boundary conditions on fine grids that touch
         // global domain boundaries.  Only applies to non-MPI serial mode;
         // in MPI block mode BCs are handled by the root/partition grid.
+        //
+        // Domain wall flags (west/east/south/north_is_domain_wall) are set
+        // automatically by MgTree::add_level; C→F fringe coupling in
+        // mg_apply_fringe_bc[_temporal] and F→C in mg_couple_fine_to_coarse
+        // will skip those sides so the domain BC has exclusive control.
         // ----------------------------------------------------------------
         if !is_block_mpi {
             let (root_xs, root_xe, root_ys, root_ye, _) = level_root_info[i];
+            let (dw, de, ds, dn) = tree.node_domain_walls(node_idx);
+            if rank == 0 && (dw || de || ds || dn) {
+                println!(
+                    "  [MG] level {} touches domain boundary: \
+                     west={} east={} south={} north={} \
+                     — fringe coupling disabled on those sides",
+                    i + 1, dw, de, ds, dn
+                );
+            }
             for bc_cfg in &cfg.fluid.boundary_conditions {
                 let face = sim::parse_face(&bc_cfg.face);
                 let touches = match face {

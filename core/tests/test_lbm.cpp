@@ -1654,7 +1654,72 @@ static int test_mg_apply_fringe_bc()
     return ok ? 0 : 1;
 }
 
-// 测试：AMR 细化指标 — mg_compute_refinement_indicator（密度梯度正确性）
+// 测试：mg_apply_fringe_bc — 域边界侧的 fringe 节点应跳过 C→F 插值
+//
+// 当细网格某侧与全局域边界重合（west/east/south/north_is_domain_wall=true）时，
+// mg_apply_fringe_bc 应跳过该侧 fringe 节点（保持原值 42），
+// 而其他侧仍被正常更新（≠ 42）。
+static int test_mg_apply_fringe_bc_domain_wall()
+{
+    // 根域 [0,31]×[0,31]；细网格 [0,15]×[4,27]（西侧碰域边界）
+    lbm::MgTree tree({0, 31, 0, 31, 0, 0});
+    auto* fine_node = tree.add_level(tree.root(), {0, 15, 4, 27, 0, 0}, 2);
+
+    // 检查域边界标志自动设置
+    bool flags_ok = fine_node->west_is_domain_wall
+                 && !fine_node->east_is_domain_wall
+                 && !fine_node->south_is_domain_wall
+                 && !fine_node->north_is_domain_wall;
+
+    lbm::LatticeGrid coarse_g(32, 32, 1, lbm::LatticeModel::D2Q9);
+    // 细网格尺寸 = (15-0)*2+1 × (27-4)*2+1 = 31×47
+    lbm::LatticeGrid fine_g  (31, 47, 1, lbm::LatticeModel::D2Q9);
+
+    // 粗网格：均匀流平衡态（f_neq=0）
+    for (int n = 0; n < coarse_g.size(); ++n) {
+        coarse_g.rho[n] = 1.0 + 0.01 * (n % 5);
+        double u0[2] = {0.0, 0.0};
+        for (int a = 0; a < lbm::d2q9::Q; ++a) {
+            const double c[2] = {(double)lbm::d2q9::C[a][0], (double)lbm::d2q9::C[a][1]};
+            coarse_g.f[n * lbm::d2q9::Q + a] = lbm::f_eq(lbm::d2q9::W[a], coarse_g.rho[n], c, u0, 2);
+        }
+    }
+    // 细网格 f 全设为 42（已知初始值）
+    for (double& v : fine_g.f) v = 42.0;
+
+    tree.root()->grid = &coarse_g;
+    fine_node->grid   = &fine_g;
+
+    lbm::mg_apply_fringe_bc(*tree.root(), *fine_node, 2, 1.0);
+
+    bool ok = flags_ok;
+    // 西侧 fringe 节点（ix=0,1）：应 **保持** 42（域边界侧，跳过插值）
+    for (int j = 0; j < fine_g.ny; ++j) {
+        for (int ix = 0; ix < 2; ++ix) {
+            const int n = fine_g.idx(ix, j);
+            if (fine_g.f[n * lbm::d2q9::Q] != 42.0) { ok = false; }
+        }
+    }
+    // 东侧 fringe 节点（ix=29,30）：应 **被更新**（≠ 42）
+    {
+        const int n_east = fine_g.idx(fine_g.nx - 1, fine_g.ny / 2);
+        if (fine_g.f[n_east * lbm::d2q9::Q] == 42.0) { ok = false; }
+    }
+    // 南侧 fringe 节点（jy=0,1，非域边界）：应被更新（≠ 42）
+    {
+        const int n_south = fine_g.idx(fine_g.nx / 2, 0);
+        if (fine_g.f[n_south * lbm::d2q9::Q] == 42.0) { ok = false; }
+    }
+    // 内部节点：应仍为 42
+    {
+        const int n_inner = fine_g.idx(15, 20);
+        if (fine_g.f[n_inner * lbm::d2q9::Q] != 42.0) { ok = false; }
+    }
+
+    std::printf("[MgTree] mg_apply_fringe_bc domain-wall skip (west side preserved, east/south updated): %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
 static int test_mg_refinement_indicator()
 {
     // 创建含密度梯度的网格（右半部分 rho=1.1，左半部分 rho=1.0）
@@ -2313,6 +2378,7 @@ int test_lbm_main()
     failures += test_stretched_grid_islbm();
     failures += test_mg_prolong_f();
     failures += test_mg_apply_fringe_bc();
+    failures += test_mg_apply_fringe_bc_domain_wall();
     failures += test_mg_refinement_indicator();
     failures += test_mg_omega_rescale();
     failures += test_mg_couple_fine_to_coarse();
