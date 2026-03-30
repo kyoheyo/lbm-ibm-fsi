@@ -1058,47 +1058,38 @@ fn run_multigrid_loop(
             level_root_info.push((level.x_start, level.x_end, level.y_start, level.y_end, r));
             (Some((x_lo_l, x_hi_l, y_lo_l, y_hi_l)), fnx, fny)
         } else {
-            // Serial / independent: config coords are in PARENT'S fine-grid local
-            // coordinate system.  Convert to root coords using accumulated info.
+            // Serial / independent: config coords are in ROOT (coarsest) grid coordinates.
+            // All [[multigrid.levels]] x_start/x_end/y_start/y_end are specified in L0 units,
+            // consistent with IBM x0/y0/size and structure mesh file coordinates.
+            //
+            // Cumulative spatial scale = product of refine_ratio values from root to this level.
             //
             // parent_level semantics (tree node index):
-            //   0         → root grid
+            //   0         → root grid (cumulative_scale of root = 1)
             //   k (k ≥ 1) → levels[k-1]  (tree node k was added as levels[k-1])
             //   -1        → auto linear chain: most recently added level (or root)
-            let (p_xs, p_ys, p_scale) = if level.parent_level <= 0 {
-                // Parent is root: root coords start at (0,0), scale = 1.
-                (0_i32, 0_i32, 1_i32)
+            let parent_cum_scale: i32 = if level.parent_level == 0 {
+                1  // parent is root; root cumulative scale = 1
+            } else if level.parent_level < 0 {
+                // Auto: inherit from most recently added level, or root.
+                level_root_info.last().map(|pi| pi.4).unwrap_or(1)
             } else {
                 let pj = level.parent_level as usize - 1; // levels[] index of parent
-                if pj < level_root_info.len() {
-                    let pi = &level_root_info[pj];
-                    (pi.0, pi.2, pi.4)  // (root_xs, root_ys, cumulative_scale)
-                } else {
-                    (0_i32, 0_i32, 1_i32)
-                }
+                level_root_info.get(pj).map(|pi| pi.4).unwrap_or(1)
             };
-            // For parent_level == -1 (auto), use the most recently added entry.
-            let (p_xs, p_ys, p_scale) = if level.parent_level < 0 {
-                if level_root_info.is_empty() {
-                    (0_i32, 0_i32, 1_i32)
-                } else {
-                    let pi = level_root_info.last().unwrap();
-                    (pi.0, pi.2, pi.4)
-                }
-            } else {
-                (p_xs, p_ys, p_scale)
-            };
+            let cumulative_scale = parent_cum_scale * r;
 
-            // Convert parent-local fine-grid coords to root coords.
-            // Parent's fine-grid local ix → root coord: p_xs + ix / p_scale
-            let root_xs = p_xs + level.x_start / p_scale;
-            let root_xe = p_xs + level.x_end   / p_scale;
-            let root_ys = p_ys + level.y_start / p_scale;
-            let root_ye = p_ys + level.y_end   / p_scale;
-            let cumulative_scale = p_scale * r;
+            // Root coordinates used directly — no conversion needed.
+            let root_xs = level.x_start;
+            let root_xe = level.x_end;
+            let root_ys = level.y_start;
+            let root_ye = level.y_end;
 
-            let fnx = (level.x_end - level.x_start) * r + 1;
-            let fny = (level.y_end - level.y_start) * r + 1;
+            // Fine grid size: root span × cumulative scale + 1 node per direction.
+            // For level 1 (parent=root, cum=r): span_root × r + 1.
+            // For level 2 (parent=L1, cum=r1*r2): span_root × (r1*r2) + 1.
+            let fnx = (root_xe - root_xs) * cumulative_scale + 1;
+            let fny = (root_ye - root_ys) * cumulative_scale + 1;
             level_root_info.push((root_xs, root_xe, root_ys, root_ye, cumulative_scale));
             (Some((root_xs, root_xe, root_ys, root_ye)), fnx, fny)
         };

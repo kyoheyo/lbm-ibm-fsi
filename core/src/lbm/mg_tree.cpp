@@ -154,6 +154,14 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
     const int r  = fine.refine_ratio;
     const int d  = cg.dim();  // 2 for D2Q9
 
+    // 细/粗网格累积空间加密比（从根到各节点所有 refine_ratio 之积）。
+    // 对于多层嵌套（L0→L1→L2），L2 的 fine_cum_scale = r_L1 * r_L2，
+    // L1 的 coarse_cum_scale = r_L1。
+    // 细节点本地索引→根坐标：px = fine.extent.x_start + ix / fine_cum_scale
+    // 根坐标→粗节点本地索引：ci = (px - coarse.extent.x_start) * coarse_cum_scale
+    const int fine_cum_scale   = mg_total_subcycle_steps(fine);
+    const int coarse_cum_scale = mg_total_subcycle_steps(coarse);
+
     // 在 x/y 方向上循环细节点（fine LatticeGrid 的本地尺寸）
     const int fn_x = fg.nx;
     const int fn_y = fg.ny;
@@ -163,9 +171,11 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
 #endif
     for (int jf = 0; jf < fn_y; ++jf) {
         for (int ix = 0; ix < fn_x; ++ix) {
-            // 细节点在粗坐标系中的浮点位置（节点位于整数坐标处）
-            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
-            const double py = fine.extent.y_start + static_cast<double>(jf)  / r;
+            // 细节点在根坐标系中的浮点位置。
+            // 使用 fine_cum_scale 而非 fine.refine_ratio，确保多层嵌套时坐标正确：
+            //   px = fine.extent.x_start + ix / fine_cum_scale
+            const double px = fine.extent.x_start + static_cast<double>(ix) / fine_cum_scale;
+            const double py = fine.extent.y_start + static_cast<double>(jf)  / fine_cum_scale;
 
             // 双线性插值的左下粗节点（全局粗坐标系）
             const int i0 = static_cast<int>(std::floor(px));
@@ -175,7 +185,7 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
             const double alpha = px - i0;  // [0, 1]
             const double beta  = py - j0;
 
-            // 四角粗节点的本地索引（夹持到粗格有效范围）
+            // 四角粗节点的本地数组索引（夹持到粗格有效根坐标范围后乘以 coarse_cum_scale）
             auto clamp_ci = [&](int ci) -> int {
                 return std::max(coarse.extent.x_start,
                                 std::min(coarse.extent.x_end, ci));
@@ -185,10 +195,10 @@ void mg_prolong_rho_u(const MgNode& coarse, MgNode& fine)
                                 std::min(coarse.extent.y_end, cj));
             };
 
-            const int ci00 = clamp_ci(i0)     - coarse.extent.x_start;
-            const int ci10 = clamp_ci(i0 + 1) - coarse.extent.x_start;
-            const int cj00 = clamp_cj(j0)     - coarse.extent.y_start;
-            const int cj10 = clamp_cj(j0 + 1) - coarse.extent.y_start;
+            const int ci00 = (clamp_ci(i0)     - coarse.extent.x_start) * coarse_cum_scale;
+            const int ci10 = (clamp_ci(i0 + 1) - coarse.extent.x_start) * coarse_cum_scale;
+            const int cj00 = (clamp_cj(j0)     - coarse.extent.y_start) * coarse_cum_scale;
+            const int cj10 = (clamp_cj(j0 + 1) - coarse.extent.y_start) * coarse_cum_scale;
 
             // 粗节点索引
             const int c00 = cg.idx(ci00, cj00);
@@ -238,11 +248,19 @@ void mg_restrict_rho_u(const MgNode& fine, MgNode& coarse)
     const int r  = fine.refine_ratio;
     const int d  = fg.dim();
 
-    // 遍历细网格覆盖的粗格范围（以本地粗格索引）
-    const int cx_lo = fine.extent.x_start - coarse.extent.x_start;
-    const int cy_lo = fine.extent.y_start - coarse.extent.y_start;
-    const int cx_hi = fine.extent.x_end   - coarse.extent.x_start;
-    const int cy_hi = fine.extent.y_end   - coarse.extent.y_start;
+    // 粗网格累积空间加密比（根到 coarse 所有 refine_ratio 之积）。
+    // 用于将根坐标差转换为粗网格本地索引差：
+    //   dx_root → dx_coarse_local = dx_root * coarse_cum_scale
+    const int coarse_cum_scale = mg_total_subcycle_steps(coarse);
+
+    // 遍历细网格覆盖的粗格范围（以粗格本地索引表示）。
+    // 注意：cx_lo = (fine.extent.x_start - coarse.extent.x_start) * coarse_cum_scale
+    // 确保多层嵌套时（coarse_cum_scale > 1）能正确访问所有粗格，
+    // 而非仅访问根整数坐标处的子集。
+    const int cx_lo = (fine.extent.x_start - coarse.extent.x_start) * coarse_cum_scale;
+    const int cy_lo = (fine.extent.y_start - coarse.extent.y_start) * coarse_cum_scale;
+    const int cx_hi = (fine.extent.x_end   - coarse.extent.x_start) * coarse_cum_scale;
+    const int cy_hi = (fine.extent.y_end   - coarse.extent.y_start) * coarse_cum_scale;
 
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
@@ -354,11 +372,17 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
     const int fnx = fg.nx;
     const int fny = fg.ny;
 
-    // 粗网格累积空间加密比：根节点到 coarse 节点所有 refine_ratio 的乘积。
+    // 粗网格累积空间加密比（根到 coarse 所有 refine_ratio 之积）。
     // 例：root(r=1)→L1(r=2)→L2(r=2)，L1 as coarse → coarse_scale=2，L2 as coarse → 4。
-    // 用于将根坐标系下的整数坐标映射到 coarse 本地数组索引：
+    // 用于将根坐标映射到 coarse 本地数组索引：
     //   coarse_local = (root_coord − coarse.extent.x_start) * coarse_scale
     const int coarse_scale = mg_total_subcycle_steps(coarse);
+
+    // 细网格累积空间加密比（根到 fine 所有 refine_ratio 之积）。
+    // 用于将细节点本地索引映射到根坐标：px = fine.extent.x_start + ix / fine_cum_scale。
+    // 对于单层（fine 直接为 L0 子节点）：fine_cum_scale = fine.refine_ratio（等价于原公式）。
+    // 对于多层嵌套（L1→L2）：fine_cum_scale = r_L1 * r_L2，保证 L2 间距为 1/(r_L1*r_L2)。
+    const int fine_cum_scale = mg_total_subcycle_steps(fine);
 
     // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
     const double omega_f = mg_omega_rescale(omega_c);
@@ -389,10 +413,13 @@ void mg_apply_fringe_bc(const MgNode& coarse, MgNode& fine,
                              || (skip_north && jy >= fny - fringe_width);
             if (on_dom) continue;
 
-            // 细节点在根坐标系中的浮点位置
-            // fine.extent.x_start 为根坐标（所有层的 extent 均以根坐标存储）
-            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
-            const double py = fine.extent.y_start + static_cast<double>(jy) / r;
+            // 细节点在根坐标系中的浮点位置。
+            // 使用 fine_cum_scale（而非 fine.refine_ratio）以支持多层嵌套：
+            //   px = fine.extent.x_start + ix / fine_cum_scale
+            // 单层：fine_cum_scale == r，等价于原公式。
+            // 多层（如 L1→L2，fine_cum_scale=4）：L2 间距 = 0.25 根坐标单位。
+            const double px = fine.extent.x_start + static_cast<double>(ix) / fine_cum_scale;
+            const double py = fine.extent.y_start + static_cast<double>(jy) / fine_cum_scale;
 
             const int i0 = static_cast<int>(std::floor(px));
             const int j0 = static_cast<int>(std::floor(py));
@@ -519,8 +546,9 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
     const double alpha1 = 1.0 - t_alpha;   // weight for t (prev)
     const double alpha2 = t_alpha;           // weight for t+δtc (next)
 
-    // 粗网格累积空间加密比（同 mg_apply_fringe_bc 注释）
-    const int coarse_scale = mg_total_subcycle_steps(coarse);
+    // 粗/细网格累积空间加密比（同 mg_apply_fringe_bc 注释）
+    const int coarse_scale   = mg_total_subcycle_steps(coarse);
+    const int fine_cum_scale = mg_total_subcycle_steps(fine);
 
     // 松弛频率缩放（Eq. 4），C→F 缩放比 = ωc / (2ωf)
     const double omega_f = mg_omega_rescale(omega_c);
@@ -550,9 +578,9 @@ void mg_apply_fringe_bc_temporal(const MgNode& coarse_prev,
                              || (skip_north && jy >= fny - fringe_width);
             if (on_dom) continue;
 
-            // 细节点在根坐标系中的浮点位置
-            const double px = fine.extent.x_start + static_cast<double>(ix) / r;
-            const double py = fine.extent.y_start + static_cast<double>(jy) / r;
+            // 细节点在根坐标系中的浮点位置（使用 fine_cum_scale，原理同 mg_apply_fringe_bc）
+            const double px = fine.extent.x_start + static_cast<double>(ix) / fine_cum_scale;
+            const double py = fine.extent.y_start + static_cast<double>(jy) / fine_cum_scale;
 
             const int i0 = static_cast<int>(std::floor(px));
             const int j0 = static_cast<int>(std::floor(py));
@@ -699,39 +727,49 @@ void mg_couple_fine_to_coarse(const MgNode& fine, MgNode& coarse,
     const bool skip_south = fine.south_is_domain_wall;
     const bool skip_north = fine.north_is_domain_wall;
 
-    // 循环计数（闭区间 [fx_s, fx_e] 转为 0-based 以支持 OpenMP collapse）
-    const int nx_count = fx_e - fx_s + 1;
-    const int ny_count = fy_e - fy_s + 1;
+    // 以粗网格本地索引为循环变量，覆盖细网格根坐标范围内的所有粗格。
+    // 关键修复：使用 coarse_scale 将根坐标差转换为粗格本地索引范围，
+    // 确保多层嵌套时（coarse_scale > 1）能处理所有粗格，而非仅根整数坐标处的粗格。
+    //
+    // 例（L1↔L2, coarse_scale=2）：
+    //   OLD（按根整数 ic_g=140..180 循环）→ 仅处理 L1 偶数格(80,82,...,160)，L1 奇数格被跳过
+    //   NEW（按粗格 ci=80..160 循环）     → 处理所有 L1 格(80,81,...,160)，覆盖全部 F→C 耦合
+    const int cx_lo = (fx_s - coarse.extent.x_start) * coarse_scale;
+    const int cx_hi = (fx_e - coarse.extent.x_start) * coarse_scale;
+    const int cy_lo = (fy_s - coarse.extent.y_start) * coarse_scale;
+    const int cy_hi = (fy_e - coarse.extent.y_start) * coarse_scale;
+    const int nx_c  = cx_hi - cx_lo + 1;  // 粗格数（含两端）
+    const int ny_c  = cy_hi - cy_lo + 1;
 
 #ifdef LBM_ENABLE_OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
-    for (int jj = 0; jj < ny_count; ++jj) {
-        for (int ii = 0; ii < nx_count; ++ii) {
-            const int jc_g = fy_s + jj;   // 根坐标
-            const int ic_g = fx_s + ii;   // 根坐标
-            // 粗网格本地数组索引：乘以 coarse_scale 以适应空间加密后的粗层
-            const int jc_l = (jc_g - coarse.extent.y_start) * coarse_scale;
-            const int ic_l = (ic_g - coarse.extent.x_start) * coarse_scale;
+    for (int jj = 0; jj < ny_c; ++jj) {
+        for (int ii = 0; ii < nx_c; ++ii) {
+            // 粗网格本地数组索引
+            const int ic_l = cx_lo + ii;
+            const int jc_l = cy_lo + jj;
 
-            // 判断是否在 fringe 内
-            const bool in_j_fringe = (jc_g <= fy_s + coarse_fringe - 1 ||
-                                       jc_g >= fy_e - coarse_fringe + 1);
-            const bool in_i_fringe = (ic_g <= fx_s + coarse_fringe - 1 ||
-                                       ic_g >= fx_e - coarse_fringe + 1);
+            // 相对于细网格边界的粗格偏移（0-based，用于 fringe 判断和细格起始索引）
+            const int ii_rel = ii;
+            const int jj_rel = jj;
+
+            // 判断是否在 fringe 内（粗格级别：与细网格边界距离 < coarse_fringe）
+            const bool in_i_fringe = (ii_rel < coarse_fringe || ii_rel >= nx_c - coarse_fringe);
+            const bool in_j_fringe = (jj_rel < coarse_fringe || jj_rel >= ny_c - coarse_fringe);
             if (!in_i_fringe && !in_j_fringe) continue;
 
             // 若该粗 fringe 节点对应细网格的域边界侧，跳过 F→C 写回。
             // 粗网格在该侧的域 BC 在下一次 coarse.solver->step() 中重新施加。
-            const bool on_dom = (skip_west  && ic_g <= fx_s + coarse_fringe - 1)
-                             || (skip_east  && ic_g >= fx_e - coarse_fringe + 1)
-                             || (skip_south && jc_g <= fy_s + coarse_fringe - 1)
-                             || (skip_north && jc_g >= fy_e - coarse_fringe + 1);
+            const bool on_dom = (skip_west  && ii_rel < coarse_fringe)
+                             || (skip_east  && ii_rel >= nx_c - coarse_fringe)
+                             || (skip_south && jj_rel < coarse_fringe)
+                             || (skip_north && jj_rel >= ny_c - coarse_fringe);
             if (on_dom) continue;
 
-            // 本粗节点在细网格中的本地索引
-            const int if_loc = (ic_g - fx_s) * r;
-            const int jf_loc = (jc_g - fy_s) * r;
+            // 本粗节点在细网格中的起始本地索引（每粗格对应 r 个细格）
+            const int if_loc = ii_rel * r;
+            const int jf_loc = jj_rel * r;
 
             // 越界保护（正常配置不应触发）
             if (if_loc < 0 || if_loc >= fg.nx || jf_loc < 0 || jf_loc >= fg.ny) continue;

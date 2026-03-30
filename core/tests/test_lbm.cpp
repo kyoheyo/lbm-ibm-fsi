@@ -2195,20 +2195,20 @@ static int test_mg_step_recursive()
     // -----------------------------------------------------------------
     {
         // 网格尺寸（使用较小尺寸以保证测试速度）
-        // 粗网格：16×16，lv1 的细网格覆盖粗网格中心：r=2 → lv1 尺寸 = 2*(8) = 16×16
-        // lv2 覆盖 lv1 中心：r=2 → lv2 尺寸 = 2*(4) = 8×8
+        // 粗网格：16×16，lv1 的细网格覆盖粗网格中心：r=2 → lv1 尺寸 = (11-4)*2+1 = 15×15
+        // lv2 覆盖 lv1 中心（根坐标 [6,9]×[6,9]）：累积 cum_scale=4 → lv2 尺寸 = (9-6)*4+1 = 13×13
         const int cnx = 16, cny = 16;
 
-        // lv1 的粗格范围：粗坐标 [4,11]×[4,11]，r=2 → 细网格尺寸 = (11-4+1)*2 = 16
+        // lv1 的根坐标范围：[4,11]×[4,11]，r=2 → 细网格尺寸 = (11-4)*2+1 = 15
         const int lv1_x0 = 4, lv1_x1 = 11, lv1_y0 = 4, lv1_y1 = 11;
-        const int fnx1 = (lv1_x1 - lv1_x0 + 1) * 2;  // = 16
-        const int fny1 = (lv1_y1 - lv1_y0 + 1) * 2;  // = 16
+        const int fnx1 = (lv1_x1 - lv1_x0) * 2 + 1;  // = 15
+        const int fny1 = (lv1_y1 - lv1_y0) * 2 + 1;  // = 15
 
-        // lv2 的 lv1 坐标范围（lv1 本地坐标 → 粗格）：
-        // 在 lv1 粗坐标 [6,9]×[6,9]，r=2 → lv2 细网格尺寸 = (9-6+1)*2 = 8
+        // lv2 的根坐标范围：[6,9]×[6,9]（直接使用根坐标），r=2 per step，累积 cum_scale=4
+        // lv2 尺寸 = root_span * cum_scale + 1 = (9-6)*4+1 = 13
         const int lv2_x0 = 6, lv2_x1 = 9, lv2_y0 = 6, lv2_y1 = 9;
-        const int fnx2 = (lv2_x1 - lv2_x0 + 1) * 2;  // = 8
-        const int fny2 = (lv2_y1 - lv2_y0 + 1) * 2;  // = 8
+        const int fnx2 = (lv2_x1 - lv2_x0) * 4 + 1;  // = 13 (cum_scale = 2*2 = 4)
+        const int fny2 = (lv2_y1 - lv2_y0) * 4 + 1;  // = 13
 
         lbm::LatticeGrid g0(cnx, cny, 1, lbm::LatticeModel::D2Q9);
         lbm::LatticeGrid g1(fnx1, fny1, 1, lbm::LatticeModel::D2Q9);
