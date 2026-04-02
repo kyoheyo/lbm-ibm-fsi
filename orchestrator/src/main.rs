@@ -921,7 +921,7 @@ fn write_step_snapshot(
 /// 多重网格时间步主循环。
 ///
 /// - `root_grid` / `root_solver`：最粗层（L0）网格与求解器，已完成 MPI 附加和 BC 注册。
-/// - `ibm_entries`：IBM 体集合，力展布在每步 mg_step_recursive **之前**施加于根网格。
+/// - `ibm_entries`：IBM 体集合，力展布在每步 [`mg_step_recursive`] **之前**施加于分配的网格层级。
 /// - 细化层的 LatticeGrid + Solver 在本函数内按 `mg_cfg.levels` 自动创建并绑定到树节点。
 ///
 /// ## Omega 递推公式（Yu 2002 Eq.4）
@@ -930,8 +930,9 @@ fn write_step_snapshot(
 ///
 /// ## IBM 策略
 ///
-/// IBM 力当前施加于根（粗）网格；mg_step_recursive 内部通过 fringe 耦合将力效应
-/// 传播到各细化层。如需在最细层施加 IBM，可扩展为选取覆盖圆柱的最细节点。
+/// IBM 力施加于包含该体的最细网格层级（由启动时的 `ibm_level_assign` 向量确定）。
+/// 静止体的 Lagrangian 标记点坐标在分配时已从根坐标系缩放到细网格本地坐标系。
+/// 运动体（RigidFree / Prescribed）暂时保留在根网格（跨层级速度缩放尚未支持）。
 fn run_multigrid_loop(
     cfg: &Config,
     mg_cfg: &crate::config::MultigridConfig,
@@ -1347,6 +1348,86 @@ fn run_multigrid_loop(
     }
 
     // -----------------------------------------------------------------------
+    // Step 4.5a: Solid BB level assignment (serial / independent MG mode only).
+    //
+    // For each solid BB/IBB body, find the finest MG level whose root-coord
+    // extent fully contains the body bounding box.  Force statistics will be
+    // computed from that fine grid for better accuracy (the root grid is
+    // coarser but still has the body marked; using the fine grid gives a more
+    // resolved momentum-exchange sum).
+    //
+    // Force scaling (2-D momentum exchange method):
+    //   The fine grid has cum_scale times more boundary cells per unit length
+    //   than the root grid.  Raw fine-grid force sum ≈ cum_scale × root sum.
+    //   Therefore:  F_root_equivalent = F_fine_lattice / cum_scale.
+    //
+    // `solid_level_assign[k]` = index into fine_grids for body k, or -1 for root.
+    // -----------------------------------------------------------------------
+    let solid_level_assign: Vec<i32> = if !is_block_mpi && !cfg.solid.bodies.is_empty() {
+        let mut assign: Vec<i32> = vec![-1i32; cfg.solid.bodies.len()];
+        for (body_idx, body) in cfg.solid.bodies.iter().enumerate() {
+            let bc_str = body.bc_type.as_deref().unwrap_or(&cfg.solid.bc_type);
+            let bc_mode: i32 = match bc_str.to_lowercase().as_str() {
+                "bounce_back" | "bb" => 1,
+                "interpolated_bounce_back" | "ibb" | "bouzidi" => 2,
+                _ => 0,
+            };
+            if bc_mode == 0 { continue; }
+
+            let (bb_x0, bb_x1, bb_y0, bb_y1): (f64, f64, f64, f64) =
+                match body.shape.to_lowercase().as_str() {
+                    "cylinder" | "circle" => (
+                        body.cx - body.radius, body.cx + body.radius,
+                        body.cy - body.radius, body.cy + body.radius,
+                    ),
+                    "rectangle" => (
+                        body.i0 as f64, body.i1 as f64,
+                        body.j0 as f64, body.j1 as f64,
+                    ),
+                    _ => continue,
+                };
+
+            let dom_x1 = cfg.fluid.nx as f64 - 1.0;
+            let dom_y1 = cfg.fluid.ny as f64 - 1.0;
+            let bb_xc0 = bb_x0.max(0.0).min(dom_x1);
+            let bb_xc1 = bb_x1.max(0.0).min(dom_x1);
+            let bb_yc0 = bb_y0.max(0.0).min(dom_y1);
+            let bb_yc1 = bb_y1.max(0.0).min(dom_y1);
+
+            // Iterate from finest level (last) to coarsest (first).
+            for li in (0..mg_cfg.levels.len()).rev() {
+                if level_extents[li].is_none() { continue; }
+                let (lx0, lx1, ly0, ly1, _) = level_root_info[li];
+                let (lx0f, lx1f, ly0f, ly1f) =
+                    (lx0 as f64, lx1 as f64, ly0 as f64, ly1 as f64);
+                let contained = bb_xc0 >= lx0f && bb_xc1 <= lx1f
+                             && bb_yc0 >= ly0f && bb_yc1 <= ly1f;
+                if contained {
+                    assign[body_idx] = li as i32;
+                    if rank == 0 {
+                        let (_, _, _, _, cum_scale) = level_root_info[li];
+                        let label = if body.label.is_empty() {
+                            format!("solid[{}]", body_idx)
+                        } else {
+                            body.label.clone()
+                        };
+                        println!(
+                            "  [solid-MG] body[{}] '{}' → fine level {} \
+                             (cum_scale={}, force scale=1/{})",
+                            body_idx, label, li + 1, cum_scale, cum_scale
+                        );
+                    }
+                    break; // finest found
+                }
+            }
+        }
+        assign
+    } else {
+        // MPI block mode or no solid bodies: all bodies use root grid.
+        vec![-1i32; cfg.solid.bodies.len()]
+    };
+
+    // -----------------------------------------------------------------------
     // Step 4.5: IBM level assignment (serial / independent MG mode only).
     //
     // For each IBM body:
@@ -1610,27 +1691,48 @@ fn run_multigrid_loop(
 
         // -----------------------------------------------------------------------
         // Output: per-body solid BB/IBB force.
+        //
+        // In non-MPI MG mode, if a body is assigned to a fine grid level
+        // (solid_level_assign[k] >= 0), the force is computed from that fine
+        // grid and divided by cum_scale (2-D momentum exchange normalisation:
+        // fine grid has cum_scale more boundary cells per unit length, so the
+        // raw sum is cum_scale × root-equivalent).  In all other modes the
+        // root grid is used directly.
         // -----------------------------------------------------------------------
-        for entry in solid_entries.iter() {
+        for (body_idx, entry) in solid_entries.iter().enumerate() {
             if entry.force_cfg.enabled
                 && (step % entry.force_cfg.interval == 0
                     || step + 1 == cfg.simulation.n_steps)
             {
-                let (pi0, pj0, pi1, pj1) = if is_block_mpi {
-                    if let Some(p) = partition {
-                        (p.phys_x0 as i32, p.phys_y0 as i32,
-                         (p.phys_x0 + p.local_nx - 1) as i32,
-                         (p.phys_y0 + p.local_ny - 1) as i32)
+                let lvl = solid_level_assign.get(body_idx).copied().unwrap_or(-1);
+                let (raw_fx, raw_fy, cum_scale_f) = if !is_block_mpi && lvl >= 0 {
+                    let li = lvl as usize;
+                    let (_, _, _, _, cum_scale) = level_root_info[li];
+                    let (fxi, fyi) = lbm_bindings::compute_solid_force(
+                        &fine_grids[li],
+                        0, 0,
+                        fine_grids[li].nx() as i32 - 1,
+                        fine_grids[li].ny() as i32 - 1,
+                    );
+                    (fxi, fyi, cum_scale as f64)
+                } else {
+                    let (pi0, pj0, pi1, pj1) = if is_block_mpi {
+                        if let Some(p) = partition {
+                            (p.phys_x0 as i32, p.phys_y0 as i32,
+                             (p.phys_x0 + p.local_nx - 1) as i32,
+                             (p.phys_y0 + p.local_ny - 1) as i32)
+                        } else {
+                            (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                        }
                     } else {
                         (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
-                    }
-                } else {
-                    (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                    };
+                    let (fxi, fyi) =
+                        lbm_bindings::compute_solid_force(root_grid, pi0, pj0, pi1, pj1);
+                    (fxi, fyi, 1.0_f64)
                 };
-                let (local_fx, local_fy) =
-                    lbm_bindings::compute_solid_force(root_grid, pi0, pj0, pi1, pj1);
-                let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
-                let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+                let global_fx = lbm_bindings::mpi_allreduce_sum_f64(raw_fx) / cum_scale_f;
+                let global_fy = lbm_bindings::mpi_allreduce_sum_f64(raw_fy) / cum_scale_f;
                 if rank == 0 {
                     let force_csv = format!("{}/{}.csv", output_dir, entry.force_cfg.filename);
                     output::append_monitor_csv(
