@@ -212,6 +212,10 @@ mod ffi {
         pub fn lbm_mg_node_north_is_domain_wall(h: *const MgNodeHandle) -> c_int;
         /// 将 Solver 绑定到多重网格节点（mg_step_recursive 需要每层均设置 solver）。
         pub fn lbm_mg_node_set_solver(node: *mut MgNodeHandle, solver: *mut SolverHandle);
+        /// 延拓算子（含平衡态重建）：从粗节点双线性插值 ρ/u 到细节点并重建 f。
+        /// 用于多重网格冷启动/热启动前的细网格初始化。
+        /// 返回 0=成功, -1=参数错误。
+        pub fn lbm_mg_prolong_f(coarse: *const MgNodeHandle, fine: *mut MgNodeHandle) -> c_int;
         /// 递归多重网格时间步推进（Lagrava 2012 五步算法）。
         /// 返回 0=成功, -1=参数错误（node 为 nullptr 或节点未绑定 solver/grid）。
         pub fn lbm_mg_step_recursive(node: *mut MgNodeHandle, fringe_width: c_int) -> c_int;
@@ -1200,6 +1204,24 @@ impl LbmMgTree {
     pub fn mg_step_recursive(&mut self, fringe_width: i32) -> i32 {
         let root = unsafe { ffi::lbm_mg_tree_root(self.ptr) };
         unsafe { ffi::lbm_mg_step_recursive(root, fringe_width) }
+    }
+
+    /// 延拓（Prolongation）：从 `coarse_idx` 节点双线性插值 ρ/u 到 `fine_idx` 节点，
+    /// 并重建细网格平衡分布函数 f。
+    ///
+    /// 用于多重网格冷启动时的细网格初始化：在时间步循环开始前，按从粗到细的顺序依次
+    /// 调用此函数，将父节点的初始宏观量传播到子节点，避免界面处密度/速度不连续。
+    ///
+    /// 两个节点均必须已通过 [`set_grid_by_idx`] 绑定 `LatticeGrid`。
+    ///
+    /// 返回 `0` 表示成功，`-1` 表示参数错误（节点索引越界或未绑定 grid）。
+    pub fn mg_prolong_f(&mut self, coarse_idx: usize, fine_idx: usize) -> i32 {
+        if coarse_idx >= self.nodes.len() || fine_idx >= self.nodes.len() {
+            return -1;
+        }
+        let coarse = self.nodes[coarse_idx] as *const ffi::MgNodeHandle;
+        let fine   = self.nodes[fine_idx];
+        unsafe { ffi::lbm_mg_prolong_f(coarse, fine) }
     }
 }
 

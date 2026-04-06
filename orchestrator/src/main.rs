@@ -932,7 +932,18 @@ fn write_step_snapshot(
 ///
 /// IBM 力施加于包含该体的最细网格层级（由启动时的 `ibm_level_assign` 向量确定）。
 /// 静止体的 Lagrangian 标记点坐标在分配时已从根坐标系缩放到细网格本地坐标系。
-/// 运动体（RigidFree / Prescribed）暂时保留在根网格（跨层级速度缩放尚未支持）。
+/// 运动 IBM 体（RigidFree / Prescribed）暂时保留在根网格（跨层级速度缩放尚未支持）。
+///
+/// ## 运动固体 BB/IBB 策略
+///
+/// 移动壁面 Ladd 修正通过每步调用 `step_solid_moving()` 施加于根网格，
+/// 在 `mg_step_recursive` 之后执行（与单网格流程一致）。
+/// 移动体目前仅限根网格处理；细网格上的移动体细划暂未支持。
+///
+/// ## 冷启动初始化（`rho0 ≠ 1.0`）
+///
+/// 当 `fluid.rho0 ≠ 1.0` 时，细网格在创建 `LbmSolver` 之前会调用 `fill_rho(rho0)`，
+/// 使细网格平衡分布函数 f 以正确的初始密度初始化，与根网格保持一致，避免界面处密度跳变。
 fn run_multigrid_loop(
     cfg: &Config,
     mg_cfg: &crate::config::MultigridConfig,
@@ -1106,6 +1117,15 @@ fn run_multigrid_loop(
 
         level_extents.push(extent_local);
         fine_grids.push(LbmGrid::new(fine_nx, fine_ny, 1, model));
+        // Cold-start fix: if rho0 ≠ 1.0 the fine grid must be initialised with
+        // the same density as the root grid before LbmSolver::new, because the
+        // solver constructor writes f = f_eq(rho, u=0) using whatever rho is in
+        // the grid at construction time.  Without this, fine grids start at
+        // rho=1.0 while the root grid has rho=rho0, creating a discontinuity at
+        // the coarse-fine interface on the very first time step.
+        if (cfg.fluid.rho0 - 1.0).abs() > 1e-15 {
+            fine_grids.last_mut().unwrap().fill_rho(cfg.fluid.rho0);
+        }
         let fs = LbmSolver::new(fine_grids.last_mut().unwrap(), omega_fine, cm);
         fine_solvers.push(fs);
 
@@ -1604,6 +1624,33 @@ fn run_multigrid_loop(
         let rc = tree.mg_step_recursive(mg_cfg.fringe_width);
         if rc != 0 && rank == 0 {
             eprintln!("[MG] mg_step_recursive failed (rc={}) at step {}", rc, step);
+        }
+
+        // Moving solid BB/IBB on root grid.
+        //
+        // mg_step_recursive calls solver->step() for each level which does NOT
+        // apply solid BCs when has_moving=true (bc_mode=0).  The Ladd-corrected
+        // moving-wall bounce-back must therefore be applied manually here, just
+        // as run_single_grid_loop does after solver.step().
+        //
+        // Moving bodies are confined to the root grid (fine-grid remapping at
+        // each step is not yet implemented).
+        if !solid_entries.is_empty() {
+            let has_moving_solid = solid_entries.iter().any(|e| e.is_moving());
+            if has_moving_solid {
+                let (pi0, pj0, pi1, pj1) = if is_block_mpi {
+                    if let Some(p) = partition {
+                        (p.phys_x0 as i32, p.phys_y0 as i32,
+                         (p.phys_x0 + p.local_nx - 1) as i32,
+                         (p.phys_y0 + p.local_ny - 1) as i32)
+                    } else {
+                        (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                    }
+                } else {
+                    (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
+                };
+                step_solid_moving(cfg, root_grid, solid_entries, step, pi0, pj0, pi1, pj1);
+            }
         }
 
         let time = (step + 1) as f64 * cfg.simulation.dt;

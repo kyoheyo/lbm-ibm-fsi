@@ -753,6 +753,26 @@ int lbm_mg_prolong_rho_u(const MgNodeHandle* coarse, MgNodeHandle* fine)
     }
 }
 
+/// 延拓算子（含平衡态重建）：从粗网格双线性插值 ρ/u 到细网格，并重建细网格平衡分布 f。
+///
+/// 用途：多重网格冷启动时（非均匀初始条件或 rho0 ≠ 1.0 的热启动），在时间步循环开始
+/// 前对每一细化层从其父层调用此函数，确保细网格 f 与父网格宏观量一致。
+///
+/// 两个节点必须均已绑定 LatticeGrid（通过 lbm_mg_node_set_grid 设置）。
+/// 返回 0 表示成功，-1 表示参数错误（节点为空或未绑定 grid）。
+int lbm_mg_prolong_f(const MgNodeHandle* coarse, MgNodeHandle* fine)
+{
+    if (!coarse || !fine) return -1;
+    try {
+        lbm::mg_prolong_f(
+            *reinterpret_cast<const lbm::MgNode*>(coarse),
+            *reinterpret_cast<lbm::MgNode*>(fine));
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 /// 限制算子：从细网格体积平均 ρ/u 到粗网格。
 /// 两个节点必须均已绑定 LatticeGrid（通过 lbm_mg_node_set_grid 设置）。
 /// 返回 0 表示成功，-1 表示参数错误。
