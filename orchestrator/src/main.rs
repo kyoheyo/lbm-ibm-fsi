@@ -936,9 +936,13 @@ fn write_step_snapshot(
 ///
 /// ## 运动固体 BB/IBB 策略
 ///
-/// 移动壁面 Ladd 修正通过每步调用 `step_solid_moving()` 施加于根网格，
-/// 在 `mg_step_recursive` 之后执行（与单网格流程一致）。
-/// 移动体目前仅限根网格处理；细网格上的移动体细划暂未支持。
+/// 移动体（RigidFree / Prescribed）在 **最细包含层级** 上处理：
+/// 1. 初始化时在对应的细网格上标记（与静止体相同）。
+/// 2. 每步在 `mg_step_recursive` 之后：
+///    a. 对分配到细网格的运动体，在细网格（缩放坐标）上施加 Ladd 移动壁面修正；
+///    b. 调用 `step_solid_moving(root_grid)` 在根网格上施加修正并推进刚体位置；
+///    c. 对含运动体的细网格：清除旧标记，按新位置（缩放坐标）重新标记所有体。
+/// 根网格始终保留该体（供 C→F fringe 插值使用），细网格以细分辨率处理边界。
 ///
 /// ## 冷启动初始化（`rho0 ≠ 1.0`）
 ///
@@ -1247,15 +1251,13 @@ fn run_multigrid_loop(
                 let sf = cum_scale as f64;
 
                 for body in &cfg.solid.bodies {
-                    // Moving bodies (RigidFree / Prescribed) are handled exclusively
-                    // on the root grid via step_solid_moving(); do NOT mark them on
-                    // fine grids.  Marking a moving body on a fine grid would freeze
-                    // it at its initial position while the root-grid copy moves,
-                    // creating a phantom solid obstacle that corrupts the fine-grid
-                    // solution and the C↔F fringe coupling.
-                    if matches!(body.motion_type, MotionType::RigidFree | MotionType::Prescribed) {
-                        continue;
-                    }
+                    // Moving bodies (RigidFree / Prescribed) ARE now marked on the
+                    // finest containing fine grid at their initial position.
+                    // step_solid_moving_fine() re-clears and re-marks them every step
+                    // (together with apply_solid_bb/ibb_moving_rigid for the Ladd
+                    // correction), so the fine grid always holds the current position.
+                    // The root grid also keeps the body (needed for C↔F fringe
+                    // coupling) and is handled by the existing step_solid_moving().
 
                     // Per-body bc_type overrides global solid.bc_type.
                     let bc_str = body.bc_type.as_deref()
@@ -1350,14 +1352,22 @@ fn run_multigrid_loop(
                 }
 
                 // Activate solid BC on this fine solver.
-                // Moving bodies are excluded from fine grids (see the `continue`
-                // above), so fine grids only ever contain static bodies.
+                // Moving bodies are now also marked on fine grids (at their initial
+                // position; re-marked each step by the post-mg_step_recursive Ladd
+                // logic).  The fine solver must apply STATIC BB/IBB in solver.step()
+                // (the per-node solid_bc_node values set by assign_solid_bc_unmarked
+                // already handle this), and the velocity-dependent Ladd correction
+                // is applied manually afterwards.
                 // Use the global bc_type as the solver's fallback mode so that
-                // static bodies on fine grids are processed by solver.step().
-                let has_any_static = cfg.solid.bodies.iter().any(|b| {
-                    !matches!(b.motion_type, MotionType::RigidFree | MotionType::Prescribed)
+                // both static and moving bodies on fine grids are processed by
+                // solver.step() with the correct per-node bc scheme.
+                let has_any_body_with_bc = cfg.solid.bodies.iter().any(|b| {
+                    let bc_str = b.bc_type.as_deref().unwrap_or(&cfg.solid.bc_type);
+                    matches!(bc_str.to_lowercase().as_str(),
+                        "bounce_back" | "bb" |
+                        "interpolated_bounce_back" | "ibb" | "bouzidi")
                 });
-                let global_bc_mode: i32 = if has_any_static {
+                let global_bc_mode: i32 = if has_any_body_with_bc {
                     match cfg.solid.bc_type.to_lowercase().as_str() {
                         "bounce_back" | "bb" => 1,
                         "interpolated_bounce_back" | "ibb" | "bouzidi" => 2,
@@ -1639,15 +1649,18 @@ fn run_multigrid_loop(
             eprintln!("[MG] mg_step_recursive failed (rc={}) at step {}", rc, step);
         }
 
-        // Moving solid BB/IBB on root grid.
+        // Moving solid BB/IBB: apply Ladd correction on finest containing fine
+        // grid (if any), then on root grid; re-mark fine grids at new position.
         //
-        // mg_step_recursive calls solver->step() for each level which does NOT
-        // apply solid BCs when has_moving=true (bc_mode=0).  The Ladd-corrected
-        // moving-wall bounce-back must therefore be applied manually here, just
-        // as run_single_grid_loop does after solver.step().
-        //
-        // Moving bodies are confined to the root grid (fine-grid remapping at
-        // each step is not yet implemented).
+        // For each moving body assigned to a fine level (solid_level_assign >= 0):
+        //   1. Apply moving-wall Ladd correction on fine grid (scaled coords) at
+        //      the CURRENT position (before rigid-body position advance).
+        // Then for all moving bodies:
+        //   2. step_solid_moving(root_grid) — Ladd on root + advance position +
+        //      re-mark root grid at new position (same as non-MG behaviour).
+        // Then:
+        //   3. Re-mark all fine grids that have at least one moving body at the
+        //      NEW position (clear + remark all bodies assigned to that level).
         if !solid_entries.is_empty() {
             let has_moving_solid = solid_entries.iter().any(|e| e.is_moving());
             if has_moving_solid {
@@ -1662,7 +1675,93 @@ fn run_multigrid_loop(
                 } else {
                     (0, 0, root_grid.nx() as i32 - 1, root_grid.ny() as i32 - 1)
                 };
+
+                // --- Step (1): Ladd correction on fine grids at current position ---
+                if !is_block_mpi {
+                    let t_ladd = (step + 1) as f64 * cfg.simulation.dt;
+                    for (body_idx, entry) in solid_entries.iter().enumerate() {
+                        if !entry.is_moving() { continue; }
+                        let lv = solid_level_assign[body_idx];
+                        if lv < 0 { continue; }
+                        let lv = lv as usize;
+                        let (root_xs, _, root_ys, _, cum_scale) = level_root_info[lv];
+                        let sf = cum_scale as f64;
+                        let (ux_cm, uy_cm, omega) = entry.wall_velocity_at(t_ladd);
+                        let cx_f    = (entry.cx     - root_xs as f64) * sf;
+                        let cy_f    = (entry.cy     - root_ys as f64) * sf;
+                        // Angular velocity scales inversely with dt_fine = dt_root / sf.
+                        let omega_f = omega / sf;
+                        let fnx     = fine_grids[lv].nx() as i32;
+                        let fny     = fine_grids[lv].ny() as i32;
+                        match entry.bc_mode {
+                            2 => lbm_bindings::apply_solid_ibb_moving_rigid(
+                                &mut fine_grids[lv], cx_f, cy_f,
+                                ux_cm, uy_cm, omega_f,
+                                0, 0, fnx - 1, fny - 1),
+                            _ => lbm_bindings::apply_solid_bb_moving_rigid(
+                                &mut fine_grids[lv], cx_f, cy_f,
+                                ux_cm, uy_cm, omega_f,
+                                0, 0, fnx - 1, fny - 1),
+                        }
+                    }
+                }
+
+                // --- Step (2): Root grid — Ladd + position advance + re-mark ---
                 step_solid_moving(cfg, root_grid, solid_entries, step, pi0, pj0, pi1, pj1);
+
+                // --- Step (3): Re-mark fine grids at NEW position ---
+                if !is_block_mpi {
+                    // Collect unique fine levels that contain at least one moving body.
+                    let mut fine_remark_levels: Vec<usize> = vec![];
+                    for (body_idx, entry) in solid_entries.iter().enumerate() {
+                        if !entry.is_moving() { continue; }
+                        let lv = solid_level_assign[body_idx];
+                        if lv >= 0 {
+                            let lv = lv as usize;
+                            if !fine_remark_levels.contains(&lv) {
+                                fine_remark_levels.push(lv);
+                            }
+                        }
+                    }
+                    for lv in fine_remark_levels {
+                        let (root_xs, _, root_ys, _, cum_scale) = level_root_info[lv];
+                        let sf = cum_scale as f64;
+                        // Clear ALL solid marks on this fine grid, then re-mark every
+                        // body assigned to this level (static at fixed pos, moving at
+                        // updated pos) so fine solver.step() uses the correct marks
+                        // next step.
+                        lbm_bindings::clear_solid(&mut fine_grids[lv]);
+                        for (body_idx, entry) in solid_entries.iter().enumerate() {
+                            if solid_level_assign[body_idx] != lv as i32 { continue; }
+                            match entry.shape.as_str() {
+                                "cylinder" | "circle" => {
+                                    let cx_f = (entry.cx - root_xs as f64) * sf;
+                                    let cy_f = (entry.cy - root_ys as f64) * sf;
+                                    let r_f  = entry.radius * sf;
+                                    lbm_bindings::mark_solid_cylinder(
+                                        &mut fine_grids[lv], cx_f, cy_f, r_f);
+                                    lbm_bindings::assign_solid_bc_unmarked(
+                                        &mut fine_grids[lv], entry.bc_mode);
+                                }
+                                "rectangle" => {
+                                    let fnx = fine_grids[lv].nx();
+                                    let fny = fine_grids[lv].ny();
+                                    let fi0 = ((entry.i0 - root_xs) * cum_scale).max(0);
+                                    let fj0 = ((entry.j0 - root_ys) * cum_scale).max(0);
+                                    let fi1 = ((entry.i1 - root_xs) * cum_scale).min(fnx - 1);
+                                    let fj1 = ((entry.j1 - root_ys) * cum_scale).min(fny - 1);
+                                    if fi0 <= fi1 && fj0 <= fj1 {
+                                        lbm_bindings::mark_solid_rectangle(
+                                            &mut fine_grids[lv], fi0, fj0, fi1, fj1);
+                                        lbm_bindings::assign_solid_bc_unmarked(
+                                            &mut fine_grids[lv], entry.bc_mode);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
 
