@@ -1247,6 +1247,16 @@ fn run_multigrid_loop(
                 let sf = cum_scale as f64;
 
                 for body in &cfg.solid.bodies {
+                    // Moving bodies (RigidFree / Prescribed) are handled exclusively
+                    // on the root grid via step_solid_moving(); do NOT mark them on
+                    // fine grids.  Marking a moving body on a fine grid would freeze
+                    // it at its initial position while the root-grid copy moves,
+                    // creating a phantom solid obstacle that corrupts the fine-grid
+                    // solution and the C↔F fringe coupling.
+                    if matches!(body.motion_type, MotionType::RigidFree | MotionType::Prescribed) {
+                        continue;
+                    }
+
                     // Per-body bc_type overrides global solid.bc_type.
                     let bc_str = body.bc_type.as_deref()
                         .unwrap_or(&cfg.solid.bc_type);
@@ -1340,18 +1350,21 @@ fn run_multigrid_loop(
                 }
 
                 // Activate solid BC on this fine solver.
-                // Determine the global (non-moving) BC mode for this solver.
-                let has_moving = cfg.solid.bodies.iter().any(|b| {
-                    matches!(b.motion_type, MotionType::RigidFree | MotionType::Prescribed)
+                // Moving bodies are excluded from fine grids (see the `continue`
+                // above), so fine grids only ever contain static bodies.
+                // Use the global bc_type as the solver's fallback mode so that
+                // static bodies on fine grids are processed by solver.step().
+                let has_any_static = cfg.solid.bodies.iter().any(|b| {
+                    !matches!(b.motion_type, MotionType::RigidFree | MotionType::Prescribed)
                 });
-                let global_bc_mode: i32 = if has_moving {
-                    0
-                } else {
+                let global_bc_mode: i32 = if has_any_static {
                     match cfg.solid.bc_type.to_lowercase().as_str() {
                         "bounce_back" | "bb" => 1,
                         "interpolated_bounce_back" | "ibb" | "bouzidi" => 2,
                         _ => 0,
                     }
+                } else {
+                    0
                 };
                 if global_bc_mode != 0 {
                     lbm_bindings::mark_solid_bc(&mut fine_solvers[i], global_bc_mode);
