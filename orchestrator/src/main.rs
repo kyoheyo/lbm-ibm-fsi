@@ -349,7 +349,7 @@ fn run_time_loop(
             } else {
                 (0, 0, grid.nx() as i32 - 1, grid.ny() as i32 - 1)
             };
-            step_solid_moving(cfg, grid, solid_entries, step, pi0, pj0, pi1, pj1);
+            step_solid_moving(cfg, grid, solid_entries, step, pi0, pj0, pi1, pj1, None);
         }
 
         // IBM 力展布（step() 之后；力写入 grid.force，下一步 collide 时通过 Guo 格式加入）
@@ -817,6 +817,13 @@ fn step_ibm(cfg: &Config, grid: &mut LbmGrid, ibm_entries: &mut [fsi::IbmEntry],
 ///
 /// 对静止体（`motion_type != RigidFree`）调用移动版本但传零速度，
 /// 结果等价于标准半步长反弹（Ladd correction 为 0）。
+///
+/// ## MG 模式过滤（`fine_assigned`）
+///
+/// 在多重网格模式下，`fine_assigned[k] >= 0` 的体已由调用者在其最细包含层级上
+/// 完成了 Ladd 修正和位置推进，此函数跳过它们的 Ladd（Step A）、位置推进
+/// （Step B / B'）以及根网格重标记（Step D）。
+/// 传入 `None`（单层模式）时对所有体生效，行为与旧版本完全一致。
 fn step_solid_moving(
     cfg: &Config,
     grid: &mut LbmGrid,
@@ -824,13 +831,25 @@ fn step_solid_moving(
     step: u64,
     phys_i0: i32, phys_j0: i32,
     phys_i1: i32, phys_j1: i32,
+    // MG mode: bodies with fine_assigned[k] >= 0 are handled on fine grids;
+    // skip their Ladd correction and position advance here.
+    // Pass None for single-grid (non-MG) mode.
+    fine_assigned: Option<&[i32]>,
 ) {
     let dt = cfg.simulation.dt;
     // 当前格子时刻（step 已完成流体推进；t = (step+1)*dt 为施加 Ladd 修正的时刻）
     let t = (step + 1) as f64 * dt;
 
+    // Helper: returns true when body k is assigned to a fine level.
+    let is_fine = |k: usize| -> bool {
+        fine_assigned.map_or(false, |fa| k < fa.len() && fa[k] >= 0)
+    };
+
     // --- Step A：对每个固体施加移动壁面 BB/IBB ---
-    for entry in solid_entries.iter() {
+    // Fine-assigned bodies are handled on their respective fine grid before
+    // this function is called; skip them here to avoid double-application.
+    for (k, entry) in solid_entries.iter().enumerate() {
+        if is_fine(k) { continue; }
         let (ux_cm, uy_cm, omega) = entry.wall_velocity_at(t);
         let cx = entry.cx;
         let cy = entry.cy;
@@ -845,19 +864,23 @@ fn step_solid_moving(
     }
 
     // --- Step B + C：对运动刚体求力并推进状态 ---
-    let any_rigid_free = solid_entries.iter().any(|e| e.motion_type == MotionType::RigidFree);
+    // Only root-assigned RigidFree bodies use root-grid force for advance;
+    // fine-assigned ones were already advanced with fine-grid force before this call.
+    let any_rigid_free_root = solid_entries.iter().enumerate()
+        .any(|(k, e)| e.motion_type == MotionType::RigidFree && !is_fine(k));
 
-    if any_rigid_free {
-        // 计算全局 MEA 合力（所有固体的总受力，通过 MPI_Allreduce 求和）
-        let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
-            grid, phys_i0, phys_j0, phys_i1, phys_j1);
+    if any_rigid_free_root {
+        // 计算全局 MEA 合力（根网格仅含根分配体，细分配体已在初始化时从根网格移除）
         // Note: 若多个刚体共存，目前简化为所有体共用总力；单体情形正确。
         // 多体场景的精确 MEA 需要逐体 mask，此处不作区分。
+        let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
+            grid, phys_i0, phys_j0, phys_i1, phys_j1);
         let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
         let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
 
-        for entry in solid_entries.iter_mut() {
+        for (k, entry) in solid_entries.iter_mut().enumerate() {
             if entry.motion_type != MotionType::RigidFree { continue; }
+            if is_fine(k) { continue; } // already advanced with fine-grid force
             if let Some(rb) = &mut entry.rigid_body {
                 // 固体所受流体合力 = MEA 合力（MEA 返回的是固体给流体的力，取负）
                 rb.advance(-global_fx, -global_fy, 0.0, dt);
@@ -869,8 +892,10 @@ fn step_solid_moving(
     }
 
     // --- Step B'：对主动 Prescribed 圆柱积分位置 ---
-    for entry in solid_entries.iter_mut() {
+    // Fine-assigned Prescribed bodies are advanced before this call.
+    for (k, entry) in solid_entries.iter_mut().enumerate() {
         if entry.motion_type != MotionType::Prescribed { continue; }
+        if is_fine(k) { continue; }
         if entry.shape == "cylinder" {
             let (ux, uy, _omega) = entry.wall_velocity_at(t);
             entry.cx += ux * dt;
@@ -879,10 +904,15 @@ fn step_solid_moving(
     }
 
     // --- Step D：清除标记并在新位置重新标记 ---
-    let any_moving = solid_entries.iter().any(|e| e.is_moving());
-    if any_moving {
+    // Only re-mark root-assigned bodies (fine-assigned bodies are NOT on the
+    // root grid after init-time cleanup, and are re-marked on their fine grids
+    // by the caller after this function returns).
+    let any_moving_root = solid_entries.iter().enumerate()
+        .any(|(k, e)| e.is_moving() && !is_fine(k));
+    if any_moving_root {
         lbm_bindings::clear_solid(grid);
-        for entry in solid_entries.iter() {
+        for (k, entry) in solid_entries.iter().enumerate() {
+            if is_fine(k) { continue; } // not on root grid
             if entry.shape == "cylinder" {
                 lbm_bindings::mark_solid_cylinder(grid, entry.cx, entry.cy, entry.radius);
                 lbm_bindings::assign_solid_bc_unmarked(grid, entry.bc_mode);
@@ -936,13 +966,17 @@ fn write_step_snapshot(
 ///
 /// ## 运动固体 BB/IBB 策略
 ///
-/// 移动体（RigidFree / Prescribed）在 **最细包含层级** 上处理：
-/// 1. 初始化时在对应的细网格上标记（与静止体相同）。
+/// 移动体（RigidFree / Prescribed）在 **最细包含层级** 上处理，根网格完全不涉及
+/// 细分配体的固体节点：
+/// 1. 初始化时在对应的细网格上标记，同时从根网格移除（初始化后清除根网格上细分配体标记）。
 /// 2. 每步在 `mg_step_recursive` 之后：
 ///    a. 对分配到细网格的运动体，在细网格（缩放坐标）上施加 Ladd 移动壁面修正；
-///    b. 调用 `step_solid_moving(root_grid)` 在根网格上施加修正并推进刚体位置；
-///    c. 对含运动体的细网格：清除旧标记，按新位置（缩放坐标）重新标记所有体。
-/// 根网格始终保留该体（供 C→F fringe 插值使用），细网格以细分辨率处理边界。
+///    b. 对细分配 RigidFree 体，从细网格 MEA 合力推进刚体位置；
+///       对细分配 Prescribed 体，运动学积分位置；
+///    c. 调用 `step_solid_moving(root_grid, fine_assigned)` 仅处理根分配体
+///       （细分配体被跳过：无 Ladd 修正、无根网格重标记）；
+///    d. 对含运动体的细网格：清除旧标记，按新位置（缩放坐标）重新标记所有体。
+/// 细网格覆盖区域内的根网格节点不做固体处理；根网格通过 C↔F fringe 获取细区域信息。
 ///
 /// ## 冷启动初始化（`rho0 ≠ 1.0`）
 ///
@@ -1471,6 +1505,52 @@ fn run_multigrid_loop(
     };
 
     // -----------------------------------------------------------------------
+    // Step 4.6: Init-time cleanup — remove fine-assigned body marks from root.
+    //
+    // `setup_solid_bodies` (called before this function) marks ALL bodies on
+    // root_grid unconditionally.  Now that we know which bodies belong to fine
+    // grids (solid_level_assign >= 0), we clear those marks from the root grid
+    // so that:
+    //   - Root solver only applies BB/IBB to root-assigned bodies.
+    //   - `compute_solid_force(root_grid)` in step_solid_moving reflects only
+    //     root-assigned momentum exchange.
+    //   - Root grid cells inside the fine region are treated as fluid; their
+    //     physically incorrect values cannot escape to the exterior because the
+    //     C↔F fringe coupling overwrites the fringe cells before any erroneous
+    //     streaming reaches outside the fine region.
+    //
+    // Applies only in serial / independent MG mode (not block-MPI).
+    // -----------------------------------------------------------------------
+    if !is_block_mpi && solid_level_assign.iter().any(|&l| l >= 0) {
+        // Clear all marks on root grid, then re-mark only root-assigned bodies.
+        lbm_bindings::clear_solid(root_grid);
+        for (body_idx, entry) in solid_entries.iter().enumerate() {
+            if solid_level_assign[body_idx] >= 0 { continue; }
+            match entry.shape.as_str() {
+                "cylinder" | "circle" => {
+                    lbm_bindings::mark_solid_cylinder(
+                        root_grid, entry.cx, entry.cy, entry.radius);
+                    lbm_bindings::assign_solid_bc_unmarked(root_grid, entry.bc_mode);
+                }
+                "rectangle" => {
+                    lbm_bindings::mark_solid_rectangle(
+                        root_grid, entry.i0, entry.j0, entry.i1, entry.j1);
+                    lbm_bindings::assign_solid_bc_unmarked(root_grid, entry.bc_mode);
+                }
+                _ => {}
+            }
+        }
+        if rank == 0 {
+            let n_fine = solid_level_assign.iter().filter(|&&l| l >= 0).count();
+            println!(
+                "  [solid-MG] root grid: removed {} fine-assigned body mark(s); \
+                 root grid now handles only root-assigned bodies.",
+                n_fine
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Step 4.5: IBM level assignment (serial / independent MG mode only).
     //
     // For each IBM body:
@@ -1650,17 +1730,24 @@ fn run_multigrid_loop(
         }
 
         // Moving solid BB/IBB: apply Ladd correction on finest containing fine
-        // grid (if any), then on root grid; re-mark fine grids at new position.
+        // grid (fine-assigned) or root grid (root-assigned), advance body
+        // positions, and re-mark fine grids at new position.
         //
-        // For each moving body assigned to a fine level (solid_level_assign >= 0):
-        //   1. Apply moving-wall Ladd correction on fine grid (scaled coords) at
-        //      the CURRENT position (before rigid-body position advance).
-        // Then for all moving bodies:
-        //   2. step_solid_moving(root_grid) — Ladd on root + advance position +
-        //      re-mark root grid at new position (same as non-MG behaviour).
-        // Then:
-        //   3. Re-mark all fine grids that have at least one moving body at the
-        //      NEW position (clear + remark all bodies assigned to that level).
+        // Design principle: bodies fully inside a fine region are handled ONLY
+        // on that fine grid.  The coarse (root) grid in the fine-covered area
+        // is treated as fluid; it receives correct field values via the C↔F
+        // fringe coupling at the fine region boundary.
+        //
+        // Step (1): Ladd correction for fine-assigned bodies on their fine grid
+        //           at the CURRENT position (before position advance).
+        // Step (2): Position advance for fine-assigned bodies:
+        //           - RigidFree → fine-grid MEA force;
+        //           - Prescribed → kinematic advance.
+        // Step (3): step_solid_moving(root_grid, Some(&solid_level_assign)) —
+        //           Ladd + root MEA force + advance + re-mark for root-assigned
+        //           bodies only (fine-assigned are skipped).
+        // Step (4): Re-mark all fine grids that have moving bodies at the NEW
+        //           position (clear + remark all bodies assigned to that level).
         if !solid_entries.is_empty() {
             let has_moving_solid = solid_entries.iter().any(|e| e.is_moving());
             if has_moving_solid {
@@ -1706,10 +1793,63 @@ fn run_multigrid_loop(
                     }
                 }
 
-                // --- Step (2): Root grid — Ladd + position advance + re-mark ---
-                step_solid_moving(cfg, root_grid, solid_entries, step, pi0, pj0, pi1, pj1);
+                // --- Step (2): Advance positions of fine-assigned moving bodies ---
+                // Must happen AFTER fine-grid Ladd (which needs CURRENT position)
+                // and BEFORE root step_solid_moving (which writes new positions to
+                // root grid via clear+re-mark, and must not overwrite fine-assigned
+                // advances with a stale root-grid force).
+                if !is_block_mpi {
+                    let t_adv = (step + 1) as f64 * cfg.simulation.dt;
+                    let n_levels = mg_cfg.levels.len();
 
-                // --- Step (3): Re-mark fine grids at NEW position ---
+                    // RigidFree fine-assigned: compute fine-grid MEA force, advance.
+                    // Bodies on the same fine level share the total force (same
+                    // simplification as in the single-grid case for multiple bodies).
+                    for li in 0..n_levels {
+                        let any_rf = solid_entries.iter().enumerate().any(|(k, e)| {
+                            e.motion_type == MotionType::RigidFree
+                                && solid_level_assign.get(k).copied().unwrap_or(-1) == li as i32
+                        });
+                        if !any_rf { continue; }
+
+                        let fnx = fine_grids[li].nx() as i32;
+                        let fny = fine_grids[li].ny() as i32;
+                        let (local_fx, local_fy) = lbm_bindings::compute_solid_force(
+                            &fine_grids[li], 0, 0, fnx - 1, fny - 1);
+                        let global_fx = lbm_bindings::mpi_allreduce_sum_f64(local_fx);
+                        let global_fy = lbm_bindings::mpi_allreduce_sum_f64(local_fy);
+
+                        for (k, entry) in solid_entries.iter_mut().enumerate() {
+                            if entry.motion_type != MotionType::RigidFree { continue; }
+                            if solid_level_assign.get(k).copied().unwrap_or(-1)
+                                != li as i32 { continue; }
+                            if let Some(rb) = &mut entry.rigid_body {
+                                rb.advance(-global_fx, -global_fy, 0.0, cfg.simulation.dt);
+                                let (cx, cy, _, _, _, _) = rb.state();
+                                entry.cx = cx;
+                                entry.cy = cy;
+                            }
+                        }
+                    }
+
+                    // Prescribed fine-assigned: kinematic position advance.
+                    for (k, entry) in solid_entries.iter_mut().enumerate() {
+                        if entry.motion_type != MotionType::Prescribed { continue; }
+                        if solid_level_assign.get(k).copied().unwrap_or(-1) < 0 { continue; }
+                        if entry.shape == "cylinder" {
+                            let (ux, uy, _) = entry.wall_velocity_at(t_adv);
+                            entry.cx += ux * cfg.simulation.dt;
+                            entry.cy += uy * cfg.simulation.dt;
+                        }
+                    }
+                }
+
+                // --- Step (3): Root grid — Ladd + advance + re-mark (root-assigned only) ---
+                step_solid_moving(cfg, root_grid, solid_entries, step,
+                    pi0, pj0, pi1, pj1,
+                    Some(&solid_level_assign));
+
+                // --- Step (4): Re-mark fine grids at NEW position ---
                 if !is_block_mpi {
                     // Collect unique fine levels that contain at least one moving body.
                     let mut fine_remark_levels: Vec<usize> = vec![];
