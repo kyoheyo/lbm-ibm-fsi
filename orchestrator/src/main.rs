@@ -1577,13 +1577,16 @@ fn run_multigrid_loop(
     // -----------------------------------------------------------------------
     if !is_block_mpi && solid_level_assign.iter().any(|&l| l >= 0) {
         let n_levels = mg_cfg.levels.len();
+        // Compute maximum assigned fine-level index once (O(n_bodies)).
+        // Levels lj >= max_assigned need no cleanup because no body can be
+        // assigned to a finer index than max_assigned.
+        let max_assigned = solid_level_assign.iter().copied()
+            .fold(-1i32, i32::max);
         let mut cleaned_levels: Vec<usize> = vec![];
         for lj in 0..n_levels {
             // Only clean fine grid `lj` when some body is assigned to a
             // *finer* level (> lj), meaning it was incorrectly marked here.
-            let any_assigned_finer = solid_level_assign.iter()
-                .any(|&la| la > lj as i32);
-            if !any_assigned_finer { continue; }
+            if max_assigned <= lj as i32 { continue; }
 
             let (root_xs, _, root_ys, _, cum_scale) = level_root_info[lj];
             let fine_nx = fine_grids[lj].nx();
