@@ -1551,6 +1551,89 @@ fn run_multigrid_loop(
     }
 
     // -----------------------------------------------------------------------
+    // Step 4.7: Init-time cleanup — remove fine-assigned body marks from
+    //           intermediate fine levels (3+ level setups).
+    //
+    // The init loop (lines 1281-1416 above) marks ALL solid bodies on every
+    // fine grid they overlap.  In a nested hierarchy:
+    //
+    //   root (L0) → L1 → L2  (3-level example)
+    //
+    // A body assigned to L2 (`solid_level_assign[k] = 1`) also overlaps L1
+    // (`fine_grids[0]`) because L2 ⊂ L1, so it was marked on L1 during init.
+    //
+    // Step 4.6 already removed fine-assigned bodies from the root grid.
+    // This step extends that cleanup to intermediate fine levels: for each
+    // fine level `lj`, if any body is assigned to a *finer* level than `lj`,
+    // we clear `fine_grids[lj]` and re-mark only bodies assigned to exactly
+    // level `lj`.  This ensures:
+    //   - BB/IBB is applied on a body ONLY at its finest containing level.
+    //   - Intermediate coarser levels receive the correct field values via
+    //     the C↔F fringe coupling (F→C: child→parent at every mg_step_recursive
+    //     call).
+    //
+    // For 2-level setups (root + L1, n_levels = 1) this loop is a no-op
+    // because no body can be assigned to a level finer than index 0.
+    // -----------------------------------------------------------------------
+    if !is_block_mpi && solid_level_assign.iter().any(|&l| l >= 0) {
+        let n_levels = mg_cfg.levels.len();
+        let mut cleaned_levels: Vec<usize> = vec![];
+        for lj in 0..n_levels {
+            // Only clean fine grid `lj` when some body is assigned to a
+            // *finer* level (> lj), meaning it was incorrectly marked here.
+            let any_assigned_finer = solid_level_assign.iter()
+                .any(|&la| la > lj as i32);
+            if !any_assigned_finer { continue; }
+
+            let (root_xs, _, root_ys, _, cum_scale) = level_root_info[lj];
+            let fine_nx = fine_grids[lj].nx();
+            let fine_ny = fine_grids[lj].ny();
+            let sf = cum_scale as f64;
+
+            // Clear ALL solid marks, then re-mark only bodies assigned here.
+            lbm_bindings::clear_solid(&mut fine_grids[lj]);
+            for (body_idx, entry) in solid_entries.iter().enumerate() {
+                if solid_level_assign[body_idx] != lj as i32 { continue; }
+                match entry.shape.as_str() {
+                    "cylinder" | "circle" => {
+                        let cx_f = (entry.cx - root_xs as f64) * sf;
+                        let cy_f = (entry.cy - root_ys as f64) * sf;
+                        let r_f  = entry.radius * sf;
+                        lbm_bindings::mark_solid_cylinder(
+                            &mut fine_grids[lj], cx_f, cy_f, r_f);
+                        lbm_bindings::assign_solid_bc_unmarked(
+                            &mut fine_grids[lj], entry.bc_mode);
+                    }
+                    "rectangle" => {
+                        let fi0 = ((entry.i0 - root_xs) * cum_scale).max(0);
+                        let fj0 = ((entry.j0 - root_ys) * cum_scale).max(0);
+                        let fi1 = ((entry.i1 - root_xs) * cum_scale)
+                            .min(fine_nx - 1);
+                        let fj1 = ((entry.j1 - root_ys) * cum_scale)
+                            .min(fine_ny - 1);
+                        if fi0 <= fi1 && fj0 <= fj1 {
+                            lbm_bindings::mark_solid_rectangle(
+                                &mut fine_grids[lj],
+                                fi0, fj0, fi1, fj1);
+                            lbm_bindings::assign_solid_bc_unmarked(
+                                &mut fine_grids[lj], entry.bc_mode);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cleaned_levels.push(lj);
+        }
+        if rank == 0 && !cleaned_levels.is_empty() {
+            println!(
+                "  [solid-MG] cleared {} intermediate fine level(s) {:?}: \
+                 each now handles only its directly-assigned bodies.",
+                cleaned_levels.len(), cleaned_levels
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Step 4.5: IBM level assignment (serial / independent MG mode only).
     //
     // For each IBM body:
